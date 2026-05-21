@@ -20,7 +20,7 @@ const colors = {
 };
 
 const pageTitles = {
-  overview: "홈",
+  overview: "Ontology Command",
   decision: "매매 판단",
   market: "차트",
   data: "데이터·이벤트",
@@ -110,6 +110,11 @@ const valueLabels = {
   RULE_BASED_READY_PREDICTION_DISPLAY_ONLY: "기본 규칙은 가능, 예측은 참고용",
   PREDICTION_PAPER_ALPHA_READY: "예측 기반 가상 alpha 준비",
   NO_LIVE_BROKER_BY_DESIGN: "실거래 브로커 미사용 설계",
+  LIVE_DISABLED_BY_DESIGN: "설계상 비활성",
+  DATA_NOT_TRUSTED: "데이터 확인 먼저",
+  DECISION_SUPPORT_BLOCKED: "근거 보강 대기",
+  PAPER_TRACKING_ALLOWED: "Paper 추적 가능",
+  STRICT_LIVE_ENTRY_CANDIDATE: "엄격 기준 실전 후보",
   PREDICTION_CONFIRMED: "예측 확인됨",
   PREDICTION_NEUTRAL: "예측 중립",
   PREDICTION_FILTERED: "예측 기준 미달",
@@ -1531,6 +1536,12 @@ function setTextIfPresent(id, value) {
   if (element) element.textContent = value;
 }
 
+function latestManifestStatus(data) {
+  const rows = data?.tables?.manifest || [];
+  if (!rows.length) return "";
+  return rows.some((row) => String(row.status || "").toUpperCase() === "FAIL") ? "FAIL" : "PASS";
+}
+
 function renderWorkspaceHeader(data) {
   const snapshots = data.snapshots || {};
   const decision = snapshots.decision || {};
@@ -1538,6 +1549,8 @@ function renderWorkspaceHeader(data) {
   const summary = snapshots.integrated_price || snapshots.summary || {};
   const risk = snapshots.risk || {};
   const prediction = snapshots.pooled_prediction || snapshots.prediction || {};
+  const dataQuality = snapshots.data_quality || {};
+  const system = snapshots.system || {};
   const close = snapshotValue(decision, ["close", "latest_close", "latest_close_usd"])
     || snapshotValue(latestPrice, ["close", "adj_close"])
     || snapshotValue(summary, ["latest_close_usd", "end_adj_close", "latest_close"]);
@@ -1566,6 +1579,9 @@ function renderWorkspaceHeader(data) {
     isBlankSnapshotValue(predictionValue) ? labelValue(prediction.prediction_use_status || prediction.prediction_status || "DISPLAY_ONLY") : fmtMaybePct(predictionValue, 1)
   );
   setTextIfPresent("tickerRisk", labelValue(riskText));
+  setTextIfPresent("tickerDataTrust", labelValue(dataQuality.data_quality_status || "MISSING"));
+  setTextIfPresent("tickerRunStatus", labelValue(latestManifestStatus(data) || data.run?.status || "IDLE"));
+  setTextIfPresent("tickerLiveStatus", labelValue(system.live_trading_status || "LIVE_DISABLED_BY_DESIGN"));
   setTextIfPresent("tickerUpdated", shortDate(updated));
 
   const changeElement = $("tickerChange");
@@ -1608,16 +1624,20 @@ function renderAll() {
 }
 
 function renderOverview(data) {
-  renderOntologyCommand("ontologyCommand", data);
-  renderOverviewSystemMap("overviewSystemMap", data);
-  renderOntologyMap("ontologyMap", data);
-  renderOntologyLinkedCharts("ontologyLinkedCharts", data);
-  renderOntologyRelationMatrix("ontologyRelationMatrix", data);
-  renderOntologyPriorityStack("ontologyPriorityStack", data);
-  renderOntologyRiskReward("ontologyRiskReward", data);
-  renderOntologyEvidenceRail("ontologyEvidenceRail", data);
-  renderOntologyBlockGraph("ontologyBlockGraph", data);
-  renderOntologyNewsCausal("ontologyNewsCausal", data);
+  const ontology = window.TsmOntology?.buildModel ? window.TsmOntology.buildModel(data) : null;
+  if (!ontology) {
+    renderOntologyLinkedCharts("ontologyLinkedCharts", data);
+    return;
+  }
+  window.renderOntologyDecisionHero?.("ontologyDecisionHero", ontology);
+  window.renderOntologyObjectCards?.("ontologyObjectCards", ontology);
+  window.renderOntologyObjectGraph?.("ontologyObjectGraph", ontology);
+  window.renderOntologyInsightPanel?.("ontologyInsightPanel", ontology);
+  window.renderOntologyRootCausePanel?.("ontologyRootCausePanel", ontology);
+  window.renderOntologyExecutionLadder?.("ontologyExecutionLadder", ontology);
+  renderOntologyLinkedCharts("ontologyLinkedCharts", data, ontology);
+  window.renderOntologyTradingPlanCompact?.("ontologyTradingPlanCompact", ontology);
+  window.renderOntologyPipelineLineage?.("ontologyPipelineLineage", ontology);
 }
 
 function renderPageSynthesis(id, synthesis) {
@@ -3042,6 +3062,31 @@ function renderOntologyLinkedCharts(id, data) {
   const blockRows = blockReasonRows(data).slice(0, 6);
   const best = bestBacktestStrategy(data.tables.backtest_summary || []);
   const equityRows = (data.series.equity || []).filter((row) => !best.strategy_id || String(row.strategy_id) === String(best.strategy_id)).slice(-260);
+  const passRateFor = (rows, key) => {
+    const usable = (rows || []).filter((row) => row[key] !== undefined && row[key] !== null && row[key] !== "");
+    if (!usable.length) return null;
+    return (usable.filter((row) => isTruthy(row[key])).length / usable.length) * 100;
+  };
+  const validationBars = [
+    { label: "WF", value: passRateFor(data.tables.validation_walk_forward || [], "test_positive"), color: colors.green },
+    { label: "Causal", value: passRateFor(data.tables.validation_causal_walk_forward || [], "test_positive"), color: colors.teal },
+    { label: "CPCV 전략", value: passRateFor(data.tables.cpcv_strategy_distribution || [], "cpcv_median_uplift_pass"), color: colors.blue },
+    { label: "CPCV 모델", value: passRateFor(data.tables.cpcv_model_distribution || [], "cpcv_model_median_uplift_pass"), color: colors.violet },
+    { label: "DSR", value: passRateFor(data.tables.deflated_sharpe || [], "dsr_pass"), color: colors.amber },
+  ];
+  const overlayBest = (data.tables.ml_overlay_summary || [])
+    .filter((row) => toNumber(row.cumulative_weighted_return_pct ?? row.mean_net_return_pct) !== null)
+    .slice()
+    .sort((a, b) => (toNumber(b.cumulative_weighted_return_pct ?? b.mean_net_return_pct) || 0) - (toNumber(a.cumulative_weighted_return_pct ?? a.mean_net_return_pct) || 0))[0] || {};
+  const overlayEquityRows = (data.series.ml_overlay_equity || [])
+    .filter((row) => {
+      if (!overlayBest.policy) return true;
+      return String(row.policy || "") === String(overlayBest.policy || "")
+        && String(row.model_name || "") === String(overlayBest.model_name || "")
+        && String(row.candidate_scope || "") === String(overlayBest.candidate_scope || "")
+        && String(row.horizon_days || "") === String(overlayBest.horizon_days || "");
+    })
+    .slice(-220);
 
   const breakout20 = moneyNumber(planValue(planRows, "진입", "20일 고점 돌파 기준가"));
   const breakout60 = moneyNumber(planValue(planRows, "진입", "60일 고점 돌파 기준가"));
@@ -3131,6 +3176,14 @@ function renderOntologyLinkedCharts(id, data) {
       ),
     },
     {
+      label: "검증 강건성 객체",
+      title: `WF ${fmtNumber(validationBars[0].value, 0)}% · Causal ${fmtNumber(validationBars[1].value, 0)}%`,
+      note: `CPCV 전략 ${fmtNumber(validationBars[2].value, 0)}% · 모델 ${fmtNumber(validationBars[3].value, 0)}% · DSR ${fmtNumber(validationBars[4].value, 0)}%`,
+      tone: (validationBars[1].value || 0) >= 60 && (validationBars[3].value || 0) >= 60 ? "good" : "warn",
+      links: ["백테스트", "WF", "CPCV", "게이트"],
+      chart: miniBarsSvg(validationBars),
+    },
+    {
       label: "검증·성과 객체",
       title: best.strategy_id ? `${labelValue(best.strategy_id)} · CAGR ${fmtMaybePct(best.cagr_pct, 1)}` : "성과 데이터 없음",
       note: `MDD ${fmtMaybePct(best.max_drawdown_pct, 1)} · PF ${fmtNumber(best.profit_factor, 2)} · 차단 ${fmtNumber(blockRows.length, 0)}개`,
@@ -3139,6 +3192,20 @@ function renderOntologyLinkedCharts(id, data) {
       chart: equityRows.length
         ? miniLineSvg(equityRows, [{ key: "equity", label: "자산곡선", color: colors.green }], { yFormat: (v) => fmtNumber(v, 1) })
         : miniReasonBarsSvg(blockRows),
+    },
+    {
+      label: "ML Overlay 객체",
+      title: overlayBest.policy ? `${labelValue(overlayBest.policy)} · ${fmtMaybePct(overlayBest.cumulative_weighted_return_pct, 1)}` : "Overlay 데이터 없음",
+      note: `선택률 ${fmtMaybePct(overlayBest.selection_rate_pct, 1)} · 평균 ${fmtMaybePct(overlayBest.mean_net_return_pct, 2)} · stop ${fmtMaybePct(overlayBest.stop_rate_pct, 1)}`,
+      tone: overlayBest.policy ? "neutral" : "warn",
+      links: ["룰 전체", "ML 선택", "성과", "게이트"],
+      chart: overlayEquityRows.length
+        ? miniLineSvg(overlayEquityRows, [{ key: "equity", label: "overlay equity", color: colors.violet }], { yFormat: (v) => fmtNumber(v, 1) })
+        : miniBarsSvg([
+            { label: "선택률", value: toNumber(overlayBest.selection_rate_pct), color: colors.blue },
+            { label: "성공률", value: toNumber(overlayBest.success_rate_pct), color: colors.green },
+            { label: "손절률", value: toNumber(overlayBest.stop_rate_pct), color: colors.red },
+          ]),
     },
   ];
 

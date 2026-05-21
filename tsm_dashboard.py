@@ -2122,6 +2122,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/app.js":
                 self.send_static(STATIC_DIR / "app.js")
                 return
+            if path == "/ontology.js":
+                self.send_static(STATIC_DIR / "ontology.js")
+                return
+            if path == "/ontology_renderers.js":
+                self.send_static(STATIC_DIR / "ontology_renderers.js")
+                return
             if path == "/api/summary":
                 self.send_json(build_summary())
                 return

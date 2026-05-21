@@ -15,8 +15,8 @@
             <svg viewBox="0 0 24 24"><path d="M4 19V5h16v14H4Zm2-2h12V7H6v10Zm2-2 2.4-3.1 2.2 1.9 3.2-4.8 1.7 1.1-4.4 6.5-2.3-2L9.6 16 8 15Z" /></svg>
           </span>
           <div>
-            <strong>TSM Workspace</strong>
-            <span>시세 · 판단 · 리스크</span>
+            <strong>TSM Ontology</strong>
+            <span>Command Center</span>
           </div>
         </div>
 
@@ -89,6 +89,18 @@
               <span>리스크</span>
               <strong id="tickerRisk">-</strong>
             </div>
+            <div class="market-tile">
+              <span>데이터</span>
+              <strong id="tickerDataTrust">-</strong>
+            </div>
+            <div class="market-tile">
+              <span>실행</span>
+              <strong id="tickerRunStatus">-</strong>
+            </div>
+            <div class="market-tile muted-tile">
+              <span>Live</span>
+              <strong id="tickerLiveStatus">-</strong>
+            </div>
             <div class="market-tile muted-tile">
               <span>기준일</span>
               <strong id="tickerUpdated">-</strong>
@@ -101,7 +113,7 @@
           </div>
           <div class="topbar">
             <div>
-              <h1 id="pageTitle">홈</h1>
+              <h1 id="pageTitle">Ontology Command</h1>
               <p id="asOfText">로딩 중</p>
             </div>
             <nav class="view-tabs" aria-label="빠른 화면 이동">
@@ -118,67 +130,66 @@
         </header>
 
         <main>
-          <section id="view-overview" class="view active">
-            <div class="overview-tier-label">오늘의 종합 판단</div>
-            <div id="ontologyCommand" class="ontology-command"></div>
+          <section id="view-overview" class="view active ontology-command-center-view">
+            <div class="overview-tier-label">TSM Ontology Command Center</div>
+            <div id="ontologyDecisionHero" class="ontology-decision-hero"></div>
 
-            <div class="overview-tier-label">객체 맵 · 시스템 관계</div>
-            <div id="overviewSystemMap" class="overview-system-map"></div>
-            <div id="ontologyMap" class="ontology-map"></div>
+            <div class="overview-tier-label">핵심 객체</div>
+            <div id="ontologyObjectCards" class="ontology-object-cards"></div>
 
-            <div class="overview-tier-label">근거 · 관계 · 우선순위</div>
+            <div class="overview-tier-label">객체 그래프</div>
             <section class="panel ontology-panel ontology-graph-panel">
               <div class="panel-head">
-                <div><h2>근거 그래프 레이어</h2><p>합성 보드가 만든 결론을 가격, 점수, 리스크, 예측, 뉴스 그래프로 역추적</p></div>
+                <div><h2>Ontology Object Graph</h2><p>데이터에서 매매 계획까지 이어지는 객체와 관계를 클릭해 추적</p></div>
               </div>
-              <div id="ontologyLinkedCharts" class="ontology-linked-charts"></div>
+              <div id="ontologyObjectGraph" class="ontology-object-graph"></div>
             </section>
-            <div class="ontology-grid">
-              <section class="panel ontology-panel wide">
+
+            <div class="overview-tier-label">새로 합성한 의미</div>
+            <div class="ontology-two-column">
+              <section class="panel ontology-panel">
                 <div class="panel-head">
-                  <div><h2>객체 관계 매트릭스</h2><p>각 객체가 오늘 판단에 어떤 방향으로 영향을 주는지 요약</p></div>
+                  <div><h2>오늘 새로 생성한 Insight</h2><p>가격, 모델, 리스크, 뉴스, 운영 상태를 섞어서 만든 문장형 판단</p></div>
                 </div>
-                <div id="ontologyRelationMatrix" class="ontology-relation-matrix"></div>
+                <div id="ontologyInsightPanel" class="ontology-insight-panel"></div>
               </section>
-              <section class="panel ontology-panel priority-panel">
+              <section class="panel ontology-panel">
                 <div class="panel-head">
-                  <div><h2>지금 먼저 볼 것</h2><p>오늘 판단에 영향을 주는 객체를 우선순위로 압축</p></div>
+                  <div><h2>Root Cause / First Action</h2><p>지금 먼저 볼 차단 객체와 다음 확인 행동</p></div>
                 </div>
-                <div id="ontologyPriorityStack" class="priority-stack"></div>
+                <div id="ontologyRootCausePanel" class="ontology-root-cause-panel"></div>
               </section>
             </div>
 
-            <details class="overview-aux panel detail-panel">
-              <summary>
-                <div><h2>객체 상세: 위험 · 판단 흐름 · 차단 · 뉴스 원인</h2><p>위험·기대값 계기판, 판단 흐름, 차단 원인 네트워크, 뉴스 원인 객체를 한 번에 펼쳐 확인</p></div>
-              </summary>
-              <div class="ontology-grid">
-                <section class="panel ontology-panel">
-                  <div class="panel-head">
-                    <div><h2>위험·기대값 계기판</h2><p>점수, 성공 가능성, 손절 위험, 허용 비중을 한 묶음으로 확인</p></div>
-                  </div>
-                  <div id="ontologyRiskReward" class="risk-reward-board"></div>
-                </section>
-                <section class="panel ontology-panel wide">
-                  <div class="panel-head">
-                    <div><h2>판단 흐름</h2><p>데이터에서 행동까지 이어지는 통과·차단 경로</p></div>
-                  </div>
-                  <div id="ontologyEvidenceRail" class="evidence-rail"></div>
-                </section>
-                <section class="panel ontology-panel">
-                  <div class="panel-head">
-                    <div><h2>차단 원인 네트워크</h2><p>반복 실패 기준을 원인 객체로 묶어 표시</p></div>
-                  </div>
-                  <div id="ontologyBlockGraph" class="block-graph"></div>
-                </section>
-                <section class="panel ontology-panel">
-                  <div class="panel-head">
-                    <div><h2>뉴스 원인 객체</h2><p>원인 매칭이 룰 점수와 예측 피처로 연결되는 상태</p></div>
-                  </div>
-                  <div id="ontologyNewsCausal" class="causal-object"></div>
-                </section>
+            <div class="overview-tier-label">권한 사다리 · 근거 차트</div>
+            <section class="panel ontology-panel">
+              <div class="panel-head">
+                <div><h2>Execution Ladder</h2><p>데이터 적재부터 매매 계획까지 통과, 관찰, 차단 위치를 단계별로 표시</p></div>
               </div>
-            </details>
+              <div id="ontologyExecutionLadder" class="ontology-execution-ladder"></div>
+            </section>
+            <section class="panel ontology-panel ontology-graph-panel">
+              <div class="panel-head">
+                <div><h2>Evidence Chart Layer</h2><p>가격·트리거·손절, 점수, 리스크, 예측, 검증, 뉴스, 성과, ML overlay를 한 화면에서 역추적</p></div>
+              </div>
+              <div id="ontologyLinkedCharts" class="ontology-linked-charts"></div>
+            </section>
+
+            <div class="overview-tier-label">매매 계획 · 판단 계보</div>
+            <div class="ontology-two-column">
+              <section class="panel ontology-panel">
+                <div class="panel-head">
+                  <div><h2>Daily Trading Plan Compact</h2><p>오늘 실제로 확인할 가격, 손절, 비중, Paper/Live 권한</p></div>
+                </div>
+                <div id="ontologyTradingPlanCompact" class="ontology-trading-plan"></div>
+              </section>
+              <section class="panel ontology-panel">
+                <div class="panel-head">
+                  <div><h2>Pipeline Lineage</h2><p>이 판단이 어떤 실행, 파일, 품질 점검에서 왔는지 확인</p></div>
+                </div>
+                <div id="ontologyPipelineLineage" class="ontology-pipeline-lineage"></div>
+              </section>
+            </div>
           </section>
 
           <section id="view-decision" class="view">
@@ -906,6 +917,8 @@
       </div>
     </div>
 
+    <script src="/ontology.js"></script>
+    <script src="/ontology_renderers.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
