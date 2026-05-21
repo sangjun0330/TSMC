@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsm-price-algorithm-rule-engine-package"
+version = "0.1.0"
+description = "Conservative TSMC research and paper trading rule engine."
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "requests>=2.31",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.2",
+    "lightgbm>=4.3",
+    "xgboost>=2.0",
+    "optuna>=4.0",
+]
+
+[project.optional-dependencies]
+desktop = [
+    "pywebview>=6.2",
+]
+dev = [
+    "pytest",
+    "ruff",
+    "pandera",
+]
+
+[tool.setuptools]
+packages = ["tsm_core"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 180
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]

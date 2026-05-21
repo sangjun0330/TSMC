@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+from enum import Enum
+
+
+class PredictionUseStatus(str, Enum):
+    DECISION_SUPPORT_ALLOWED = "DECISION_SUPPORT_ALLOWED"
+    DISPLAY_ONLY_QUALITY_NOT_PASSED = "DISPLAY_ONLY_QUALITY_NOT_PASSED"
+    DISPLAY_ONLY_NO_ENTRY_TRIGGER = "DISPLAY_ONLY_NO_ENTRY_TRIGGER"
+    DISPLAY_ONLY_RULE_FILTERED = "DISPLAY_ONLY_RULE_FILTERED"
+    DISPLAY_ONLY_NO_MODEL_CANDIDATE = "DISPLAY_ONLY_NO_MODEL_CANDIDATE"
+    DISPLAY_ONLY_INSUFFICIENT_DATA = "DISPLAY_ONLY_INSUFFICIENT_DATA"
+    DISPLAY_ONLY_INSUFFICIENT_OOS_EVIDENCE = "DISPLAY_ONLY_INSUFFICIENT_OOS_EVIDENCE"
+
+
+class DecisionPermission(str, Enum):
+    DECISION_SUPPORT_ONLY = "DECISION_SUPPORT_ONLY"
+    PAPER_ONLY_RULE_BASED = "PAPER_ONLY_RULE_BASED"
+    DISPLAY_ONLY = "DISPLAY_ONLY"
+
+
+class FinalTradeDecision(str, Enum):
+    ALPHA_RESEARCH_LONG_ALLOWED = "ALPHA_RESEARCH_LONG_ALLOWED"
+    ALPHA_RESEARCH_SMALL_LONG_ALLOWED = "ALPHA_RESEARCH_SMALL_LONG_ALLOWED"
+    NO_TRADE_NO_TRIGGER = "NO_TRADE_NO_TRIGGER"
+    RULE_BASED_SMALL_OR_PAPER_ONLY = "RULE_BASED_SMALL_OR_PAPER_ONLY"
+    NO_TRADE_MODEL_NOT_TRUSTED = "NO_TRADE_MODEL_NOT_TRUSTED"
+    NO_TRADE_STOP_RISK = "NO_TRADE_STOP_RISK"
+    NO_TRADE_LOW_EXPECTANCY = "NO_TRADE_LOW_EXPECTANCY"
+    NO_TRADE_BELOW_PROBABILITY_THRESHOLD = "NO_TRADE_BELOW_PROBABILITY_THRESHOLD"
+
+
+class PaperAction(str, Enum):
+    NO_SIGNAL = "NO_SIGNAL"
+    DISPLAY_ONLY_NO_PAPER_TRADE = "DISPLAY_ONLY_NO_PAPER_TRADE"
+    RULE_ONLY_QUALITY_BLOCKED = "RULE_ONLY_QUALITY_BLOCKED"
+    PAPER_LONG_CONFIRMED = "PAPER_LONG_CONFIRMED"
+    PAPER_WATCH_CONFIRMED = "PAPER_WATCH_CONFIRMED"
+    PAPER_FILTERED = "PAPER_FILTERED"
+
+
+DECISION_SUPPORT_PERMISSION_ALIASES = {
+    DecisionPermission.DECISION_SUPPORT_ONLY.value,
+    "DECISION_SUPPORT",
+}
+
+LONG_ALLOWED_DECISIONS = {
+    FinalTradeDecision.ALPHA_RESEARCH_LONG_ALLOWED.value,
+    FinalTradeDecision.ALPHA_RESEARCH_SMALL_LONG_ALLOWED.value,
+    "NORMAL_LONG_ALLOWED",
+    "SMALL_LONG_ALLOWED",
+}
+
+
+def normalize_decision_permission(value: object) -> str:
+    text = "" if value is None else str(value).strip()
+    if text in DECISION_SUPPORT_PERMISSION_ALIASES:
+        return DecisionPermission.DECISION_SUPPORT_ONLY.value
+    if text == DecisionPermission.PAPER_ONLY_RULE_BASED.value:
+        return DecisionPermission.PAPER_ONLY_RULE_BASED.value
+    return DecisionPermission.DISPLAY_ONLY.value
+
+
+def is_decision_support_permission(value: object) -> bool:
+    return normalize_decision_permission(value) == DecisionPermission.DECISION_SUPPORT_ONLY.value
+
+
+def is_prediction_decision_support(value: object) -> bool:
+    return str(value).strip() == PredictionUseStatus.DECISION_SUPPORT_ALLOWED.value
+
+
+def is_long_allowed_decision(value: object) -> bool:
+    return str(value).strip() in LONG_ALLOWED_DECISIONS

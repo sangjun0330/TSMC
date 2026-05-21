@@ -1,0 +1,30 @@
+[cost]
+commission_bps = 1.0
+slippage_bps = 5.0
+stop_multiple = 2.0
+
+[prediction]
+policy = "conservative"
+train_days = 756
+validation_days = 63
+test_days = 126
+step_days = 63
+gap_days = 20
+thresholds = "0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70"
+default_threshold = 0.55
+min_validation_trades = 20
+calibration_bins = 5
+
+[validation]
+schema_strict = false
+baseline_score_threshold = 75.0
+
+[news]
+enabled = true
+direct_web_only = true
+sources = "tsmc_press,tsmc_investor,google_news_rss,yahoo_finance"
+daily_lookback_days = 14
+backfill_start = "2016-05-12"
+politeness_delay_sec = 1.0
+market_timezone = "America/New_York"
+schedule_local_time = "07:30"

@@ -1,0 +1,32 @@
+column,formula_or_definition,why_it_matters
+Date,Trading date,Daily backtest index and event-window alignment
+Open/High/Low/Close/Volume,Raw OHLCV from source,Base price and liquidity data
+Adj_Close,Dividend/split adjusted close if source provides it; otherwise Close,Primary series for returns and backtests
+Daily_Return_Pct,Adj_Close / previous Adj_Close - 1,Core daily return
+Daily_Change_USD,Close - previous Close,Absolute daily price move
+Log_Return,ln(Adj_Close / previous Adj_Close),Statistical volatility and compounding
+Gap_Open_Pct,Open / previous Close - 1,Overnight/event gap risk
+Open_to_Close_Pct,Close / Open - 1,Intraday buying/selling pressure
+Intraday_Range_Pct,(High - Low) / previous Close,Daily high-low volatility
+High_From_PrevClose_Pct,High / previous Close - 1,Maximum same-day upside excursion
+Low_From_PrevClose_Pct,Low / previous Close - 1,Maximum same-day downside excursion
+Close_Position_In_Range_Pct,(Close - Low) / (High - Low),Whether close finished near high or low
+Cumulative_Return_Pct,Adj_Close / first Adj_Close - 1,10-year cumulative performance path
+Running_Peak_Adj_Close,cummax(Adj_Close),Used for drawdown calculation
+Drawdown_Pct,Adj_Close / Running_Peak_Adj_Close - 1,Current drawdown from peak
+MA_20/50/100/200,Rolling mean of Adj_Close,Trend filters and pullback levels
+Price_vs_MA*_Pct,Adj_Close / MA_* - 1,Distance from trend support/resistance
+Ret_20D/60D/120D/252D,Adj_Close / shifted Adj_Close - 1,1/3/6/12 month momentum
+Momentum_12_1M,Adj_Close shifted 21 trading days / Adj_Close shifted 252 trading days - 1,12-month momentum excluding most recent month
+Vol_*D_Ann,rolling std(Log_Return) * sqrt(252),Annualized realized volatility
+DownsideVol_*D_Ann,rolling std of negative Log_Return * sqrt(252),Downside risk used for Sortino-type control
+True_Range,max(High-Low, abs(High-prevClose), abs(Low-prevClose)),Gap-aware daily range
+ATR_14/20,Rolling mean of True_Range,Stop loss and position sizing
+ATR_20_Pct,ATR_20 / Close,Normalized daily risk
+ParkinsonVol_20D_Ann,sqrt(252/(4ln2) * rolling mean(ln(High/Low)^2)),High-low based volatility
+GarmanKlassVol_20D_Ann,sqrt(252 * rolling mean(0.5 ln(H/L)^2 - (2ln2-1) ln(C/O)^2)),OHLC-based volatility estimator
+Dollar_Volume,Close * Volume,Liquidity and market impact estimate
+Volume_Ratio_20D,Volume / rolling mean Volume(20),Breakout/event participation
+Breakout_20D/60D,Close > prior 20/60 day high,Trend-following entry signal
+ATR_Stop_Long_2x,Close - 2 * ATR_20,Default long stop level
+Risk_Shares_100k_1pct_2ATR,floor(100000*0.01/(2*ATR_20)),Example risk-based position size

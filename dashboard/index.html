@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TSMC 대시보드</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell trading-workspace">
+      <aside class="sidebar" aria-label="대시보드 메뉴">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 19V5h16v14H4Zm2-2h12V7H6v10Zm2-2 2.4-3.1 2.2 1.9 3.2-4.8 1.7 1.1-4.4 6.5-2.3-2L9.6 16 8 15Z" /></svg>
+          </span>
+          <div>
+            <strong>TSM Workspace</strong>
+            <span>시세 · 판단 · 리스크</span>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <div class="nav-section">
+            <span class="nav-section-label">요약</span>
+            <button class="nav-item active" data-view="overview" type="button">메인</button>
+            <button class="nav-item" data-view="decision" type="button">매매 판단</button>
+          </div>
+	          <div class="nav-section">
+	            <span class="nav-section-label">시장·데이터</span>
+	            <button class="nav-item" data-view="market" type="button">가격</button>
+	            <button class="nav-item" data-view="data" type="button">데이터·이벤트</button>
+	            <button class="nav-item" data-view="news" type="button">뉴스 원인</button>
+	          </div>
+          <div class="nav-section">
+            <span class="nav-section-label">예측·모델</span>
+            <button class="nav-item" data-view="prediction" type="button">예측 요약</button>
+            <button class="nav-item" data-view="models" type="button">모델·성과</button>
+            <button class="nav-item" data-view="diagnostics" type="button">원본 진단</button>
+          </div>
+          <div class="nav-section">
+            <span class="nav-section-label">성과·위험</span>
+            <button class="nav-item" data-view="backtest" type="button">백테스트</button>
+            <button class="nav-item" data-view="risk" type="button">위험</button>
+            <button class="nav-item" data-view="quality" type="button">검증</button>
+          </div>
+          <div class="nav-section">
+            <span class="nav-section-label">운영</span>
+            <button class="nav-item" data-view="system" type="button">시스템</button>
+            <button class="nav-item" data-view="outputs" type="button">자료실</button>
+            <button class="nav-item" data-view="run" type="button">실행</button>
+          </div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span id="runPill" class="status-pill">대기</span>
+          <button id="themeToggle" class="utility-button" type="button" aria-label="다크모드 전환">
+            <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-.5 0-1-.1-1.4A6 6 0 0 1 12 3Z" /></svg>
+            <span>다크모드</span>
+          </button>
+        </div>
+      </aside>
+
+      <div class="main-shell">
+        <header class="workspace-header">
+          <div class="market-strip" aria-label="시장 요약">
+            <div class="symbol-summary">
+              <span class="symbol-logo" aria-hidden="true">TSM</span>
+              <div>
+                <strong>TSMC</strong>
+                <span>NYSE · Rule Engine</span>
+              </div>
+              <b id="tickerPrice">로딩 중</b>
+              <em id="tickerChange">-</em>
+            </div>
+            <div class="market-tile">
+              <span>점수</span>
+              <strong id="tickerScore">-</strong>
+            </div>
+            <div class="market-tile">
+              <span>신호</span>
+              <strong id="tickerSignal">-</strong>
+            </div>
+            <div class="market-tile">
+              <span>예측</span>
+              <strong id="tickerPrediction">-</strong>
+            </div>
+            <div class="market-tile">
+              <span>리스크</span>
+              <strong id="tickerRisk">-</strong>
+            </div>
+            <div class="market-tile muted-tile">
+              <span>기준일</span>
+              <strong id="tickerUpdated">-</strong>
+            </div>
+            <div class="top-actions">
+              <button id="refreshBtn" class="icon-button" type="button" title="새로고침" aria-label="새로고침">
+                <svg viewBox="0 0 24 24"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z" /></svg>
+              </button>
+            </div>
+          </div>
+          <div class="topbar">
+            <div>
+              <h1 id="pageTitle">홈</h1>
+              <p id="asOfText">로딩 중</p>
+            </div>
+            <nav class="view-tabs" aria-label="빠른 화면 이동">
+              <button class="view-tab active" data-view="overview" type="button">홈</button>
+              <button class="view-tab" data-view="decision" type="button">판단</button>
+              <button class="view-tab" data-view="market" type="button">차트</button>
+              <button class="view-tab" data-view="data" type="button">데이터</button>
+              <button class="view-tab" data-view="prediction" type="button">예측</button>
+              <button class="view-tab" data-view="backtest" type="button">성과</button>
+              <button class="view-tab" data-view="risk" type="button">위험</button>
+              <button class="view-tab" data-view="run" type="button">실행</button>
+            </nav>
+          </div>
+        </header>
+
+        <main>
+          <section id="view-overview" class="view active">
+            <div class="overview-tier-label">오늘의 종합 판단</div>
+            <div id="ontologyCommand" class="ontology-command"></div>
+
+            <div class="overview-tier-label">객체 맵 · 시스템 관계</div>
+            <div id="overviewSystemMap" class="overview-system-map"></div>
+            <div id="ontologyMap" class="ontology-map"></div>
+
+            <div class="overview-tier-label">근거 · 관계 · 우선순위</div>
+            <section class="panel ontology-panel ontology-graph-panel">
+              <div class="panel-head">
+                <div><h2>근거 그래프 레이어</h2><p>합성 보드가 만든 결론을 가격, 점수, 리스크, 예측, 뉴스 그래프로 역추적</p></div>
+              </div>
+              <div id="ontologyLinkedCharts" class="ontology-linked-charts"></div>
+            </section>
+            <div class="ontology-grid">
+              <section class="panel ontology-panel wide">
+                <div class="panel-head">
+                  <div><h2>객체 관계 매트릭스</h2><p>각 객체가 오늘 판단에 어떤 방향으로 영향을 주는지 요약</p></div>
+                </div>
+                <div id="ontologyRelationMatrix" class="ontology-relation-matrix"></div>
+              </section>
+              <section class="panel ontology-panel priority-panel">
+                <div class="panel-head">
+                  <div><h2>지금 먼저 볼 것</h2><p>오늘 판단에 영향을 주는 객체를 우선순위로 압축</p></div>
+                </div>
+                <div id="ontologyPriorityStack" class="priority-stack"></div>
+              </section>
+            </div>
+
+            <details class="overview-aux panel detail-panel">
+              <summary>
+                <div><h2>객체 상세: 위험 · 판단 흐름 · 차단 · 뉴스 원인</h2><p>위험·기대값 계기판, 판단 흐름, 차단 원인 네트워크, 뉴스 원인 객체를 한 번에 펼쳐 확인</p></div>
+              </summary>
+              <div class="ontology-grid">
+                <section class="panel ontology-panel">
+                  <div class="panel-head">
+                    <div><h2>위험·기대값 계기판</h2><p>점수, 성공 가능성, 손절 위험, 허용 비중을 한 묶음으로 확인</p></div>
+                  </div>
+                  <div id="ontologyRiskReward" class="risk-reward-board"></div>
+                </section>
+                <section class="panel ontology-panel wide">
+                  <div class="panel-head">
+                    <div><h2>판단 흐름</h2><p>데이터에서 행동까지 이어지는 통과·차단 경로</p></div>
+                  </div>
+                  <div id="ontologyEvidenceRail" class="evidence-rail"></div>
+                </section>
+                <section class="panel ontology-panel">
+                  <div class="panel-head">
+                    <div><h2>차단 원인 네트워크</h2><p>반복 실패 기준을 원인 객체로 묶어 표시</p></div>
+                  </div>
+                  <div id="ontologyBlockGraph" class="block-graph"></div>
+                </section>
+                <section class="panel ontology-panel">
+                  <div class="panel-head">
+                    <div><h2>뉴스 원인 객체</h2><p>원인 매칭이 룰 점수와 예측 피처로 연결되는 상태</p></div>
+                  </div>
+                  <div id="ontologyNewsCausal" class="causal-object"></div>
+                </section>
+              </div>
+            </details>
+          </section>
+
+          <section id="view-decision" class="view">
+            <div id="decisionSynthesis" class="page-synthesis"></div>
+            <div class="layout-grid">
+              <section class="panel wide run-control-panel">
+                <div class="panel-head"><div><h2>최신 판단</h2><p>오늘 시스템이 내린 기본 판단</p></div></div>
+                <div id="decisionFacts" class="facts"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>매매 계획</h2><p>오늘 확인할 가격, 신호, 주의사항</p></div></div>
+                <div id="tradingPlanTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>점수 흐름</h2><p>75점을 넘으면 매수 후보로 보는 기준</p></div></div>
+                <div id="signalChart" class="chart"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-market" class="view">
+            <div id="marketSynthesis" class="page-synthesis"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>가격과 평균선</h2><p>최근 주가와 20일·50일·200일 평균선</p></div></div>
+                <div id="priceChart" class="chart chart-large"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>고점에서 얼마나 빠졌는지</h2><p>최고가 이후 내려온 비율</p></div></div>
+                <div id="drawdownChart" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>가격 흔들림</h2><p>최근 가격이 얼마나 크게 움직였는지</p></div></div>
+                <div id="volChart" class="chart"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>저장된 차트</h2><p>시스템이 자동으로 만든 이미지 자료</p></div></div>
+                <div id="imageGallery" class="image-gallery"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-data" class="view">
+            <div id="dataSynthesis" class="page-synthesis"></div>
+            <div id="timeframeCards" class="timeframe-grid"></div>
+            <div class="layout-grid">
+              <section class="panel">
+                <div class="panel-head"><div><h2>가격 요약</h2><p>일봉 기준 전체 기간 수익률과 현재 흐름</p></div></div>
+                <div id="priceSummaryFacts" class="facts"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>데이터 출처 확인</h2><p>시간봉·분봉 데이터가 어디까지 확보됐는지</p></div></div>
+                <div id="sourceAuditTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>시간봉 가격</h2><p>시간 단위로 본 최근 가격 흐름</p></div></div>
+                <div id="hourlyPriceChart" class="chart"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>분봉 가격</h2><p>분 단위로 본 최근 가격 흐름</p></div></div>
+                <div id="minutePriceChart" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>연간 수익률</h2><p>연도별 가격 성과</p></div></div>
+                <div id="yearlyPriceBars" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>뉴스·이벤트 영향</h2><p>주요 이벤트 뒤 가격이 어떻게 움직였는지</p></div></div>
+                <div id="eventImpactBars" class="chart"></div>
+              </section>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>연도별 가격 상태</h2><p>수익률, 흔들림, 하락폭, 상승/하락일</p></div></summary>
+                <div id="yearlyPriceTable" class="table-shell"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>월별 가격 상태</h2><p>최근 월별 수익률과 크게 움직인 날</p></div></summary>
+                <div id="monthlyPriceTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>이벤트별 반응</h2><p>이벤트 당일과 이후 20일·60일 움직임</p></div></summary>
+                <div id="eventAnalysisTable" class="table-shell"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>크게 움직인 날</h2><p>급등, 급락, 장중 큰 움직임, 갭 사례</p></div></summary>
+                <div id="extremeMovesTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>가격 급등락 원인</h2><p>공개 웹 뉴스와 공식 이벤트를 가격 변동일에 매칭한 결과</p></div></summary>
+                <div id="newsCauseTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>원인 카테고리별 결과</h2><p>같은 유형의 뉴스 뒤 가격 흐름</p></div></summary>
+                <div id="newsCauseForwardTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>조건별 이후 수익률</h2><p>각 조건이 나온 뒤 가격이 어떻게 움직였는지</p></div></summary>
+                <div id="ruleForwardTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>시장 상태별 이후 수익률</h2><p>상승장·하락장·고변동 상태별 결과</p></div></summary>
+                <div id="regimeForwardTable" class="table-shell table-tall"></div>
+              </details>
+            </div>
+	          </section>
+
+	          <section id="view-news" class="view">
+	            <div id="newsSynthesis" class="page-synthesis"></div>
+	            <div id="newsHero" class="news-hero"></div>
+	            <div class="layout-grid">
+	              <section class="panel">
+	                <div class="panel-head"><div><h2>최신 뉴스 피처</h2><p>오늘 신호에 들어간 뉴스 원인 값</p></div></div>
+	                <div id="newsFeatureFacts" class="facts"></div>
+	              </section>
+	              <section class="panel">
+	                <div class="panel-head"><div><h2>원인 처리 규칙</h2><p>HIGH만 대표 원인, MEDIUM은 가능성으로 표시</p></div></div>
+	                <div id="newsPipeline" class="pipeline-grid"></div>
+	              </section>
+	              <section class="panel wide">
+	                <div class="panel-head"><div><h2>뉴스 위험 감점 이력</h2><p>최근 화면에 0만 보일 때 전체 기간 감점 발생일을 확인</p></div></div>
+	                <div id="newsPenaltyFacts" class="facts"></div>
+	                <div id="newsPenaltyTable" class="table-shell compact-table"></div>
+	              </section>
+	              <section class="panel wide">
+	                <div class="panel-head"><div><h2>가격 급등락 원인</h2><p>고신뢰 원인과 큰 가격 변동일을 함께 표시</p></div></div>
+	                <div id="newsFocusTable" class="table-shell table-tall compact-table"></div>
+	              </section>
+	              <section class="panel">
+	                <div class="panel-head"><div><h2>원인 카테고리별 이후 결과</h2><p>같은 유형 뉴스 뒤 수익률과 승률</p></div></div>
+	                <div id="newsForwardTable" class="table-shell table-tall compact-table"></div>
+	              </section>
+	              <section class="panel">
+	                <div class="panel-head"><div><h2>고신뢰 원인 분포</h2><p>예측 카테고리에 들어간 HIGH 원인</p></div></div>
+	                <div id="newsCauseBars" class="chart"></div>
+	              </section>
+	              <section class="panel wide">
+	                <div class="panel-head"><div><h2>뉴스 피처 행렬</h2><p>예측 모델 입력에 들어간 뉴스·카테고리 히스토리 값</p></div></div>
+	                <div id="newsFeatureMatrixTable" class="table-shell table-tall compact-table"></div>
+	              </section>
+	              <details class="panel wide detail-panel">
+	                <summary><div><h2>상세: 뉴스 사건 묶음</h2><p>같은 사건으로 묶인 기사 클러스터</p></div></summary>
+	                <div id="newsClusterTable" class="table-shell table-tall compact-table"></div>
+	              </details>
+	              <details class="panel wide detail-panel">
+	                <summary><div><h2>상세: 뉴스 피처 계약</h2><p>뉴스 피처의 사용 시점과 누수 방지 기준</p></div></summary>
+	                <div id="newsFeatureContractTable" class="table-shell table-tall compact-table"></div>
+	              </details>
+	              <details class="panel wide detail-panel">
+	                <summary><div><h2>상세: 일별 뉴스 피처</h2><p>룰 엔진에 병합되는 일별 뉴스 파일</p></div></summary>
+	                <div id="newsDailyTable" class="table-shell table-tall compact-table"></div>
+	              </details>
+	            </div>
+	          </section>
+
+          <section id="view-prediction" class="view">
+            <div id="predictionSynthesis" class="page-synthesis"></div>
+            <div id="predictionHero" class="prediction-hero"></div>
+            <div id="predictionNotice" class="notice"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>20D Paper Gate</h2><p>strict, paper, live 상태를 분리해서 확인</p></div></div>
+                <div id="paperGateBoard" class="sample-overview-grid"></div>
+              </section>
+	              <section class="panel wide">
+	                <div class="panel-head"><div><h2>뉴스 원인 피처 연결</h2><p>원인 매칭이 예측 행렬과 룰 점수에 반영된 상태</p></div></div>
+	                <div id="predictionNewsBoard" class="news-connection-grid"></div>
+	              </section>
+	              <section class="panel wide">
+	                <div class="panel-head"><div><h2>전체 예측값</h2><p>매매에 못 쓰는 예측도 참고용으로 모두 표시</p></div></div>
+                <div id="predictionAllTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>확률 나눠 보기</h2><p>손절을 피할 가능성과 수익으로 끝날 가능성</p></div></div>
+                <div id="stageProbChart" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>예측 방식 점검</h2><p>예측을 믿고 참고할 수 있는지 확인</p></div></div>
+                <div id="auditBars" class="chart"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>예측 방식 비교</h2><p>어떤 예측 방식이 더 나았는지 비교</p></div></div>
+                <div id="predictionComparisonTable" class="table-shell table-tall"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>과거 결과 확인</h2><p>성공률, 손절 회피, 목표 도달 비율</p></div></div>
+                <div id="labelDiagnosticsTable" class="table-shell"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>예측 확률이 맞았는지</h2><p>예상 확률과 실제 성공률 비교</p></div></div>
+                <div id="calibrationChart" class="chart"></div>
+              </section>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 사용한 데이터 항목</h2><p>예측에 쓴 항목과 제외한 항목</p></div></summary>
+                <div id="featureSelectionTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 신호 종류별 결과</h2><p>각 신호 종류의 사례 수, 기대수익, 손절률</p></div></summary>
+                <div id="candidateScopeTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>상세: 선택 기준</h2><p>어느 확률 이상일 때 좋은 신호로 보는지</p></div></summary>
+                <div id="thresholdPolicyTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>상세: 시간 순서 검증</h2><p>과거를 먼저 학습하고 이후 구간에서 확인한 결과</p></div></summary>
+                <div id="predictionWalkMetricsTable" class="table-shell table-tall"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 예측 기록과 실제 결과</h2><p>과거에 예측한 값과 실제 결과 비교</p></div></summary>
+                <div id="predictionOosTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>상세: 확률 오차 요약</h2><p>예상 확률이 실제와 얼마나 달랐는지</p></div></summary>
+                <div id="calibrationSummaryTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel detail-panel">
+                <summary><div><h2>상세: 예측 사용 기준</h2><p>예측을 판단에 참고해도 되는지 확인</p></div></summary>
+                <div id="policyAuditTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 데이터 사용 규칙</h2><p>미래 정보가 섞이지 않게 막는 기준</p></div></summary>
+                <div id="featureContractTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 검증 구간 구성</h2><p>학습, 검증, 테스트를 나눈 기간</p></div></summary>
+                <div id="foldManifestTable" class="table-shell compact-table"></div>
+              </details>
+            </div>
+          </section>
+
+          <section id="view-models" class="view">
+            <div id="modelsSynthesis" class="page-synthesis"></div>
+            <div id="modelOpsHero" class="prediction-hero"></div>
+            <div id="sampleExpansionHero" class="sample-hero"></div>
+            <div id="researchExpansionHero" class="sample-hero"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>유니버스 표본 상태</h2><p>그룹별 loaded, strict eligible, 20D trade-ready 표본</p></div></div>
+                <div id="sampleGroupChart" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>TSM-like Calibration</h2><p>TSM 직접 표본 부족을 보완하는 weighted pool</p></div></div>
+                <div id="tsmLikeFacts" class="facts"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>Paper Gate</h2><p>완화 게이트가 live를 열지 않는지 확인</p></div></div>
+                <div id="paperGateFacts" class="facts"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>Learning Curve</h2><p>유니버스 크기별 표본 수와 현재 품질 비교</p></div></div>
+                <div id="pooledLearningCurveTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>그룹별 표본 감사</h2><p>각 그룹이 목표 trade-ready 표본을 채웠는지 확인</p></div></div>
+                <div id="sampleAuditTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>차단 원인 우선순위</h2><p>반복된 실패 기준을 원인별로 묶어 먼저 볼 항목부터 표시</p></div></div>
+                <div id="modelRootCauseTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>자동 연구 후보</h2><p>Brier, uplift, calibration, CPCV, PBO, DSR을 함께 반영한 trial 결과</p></div></div>
+                <div id="autoResearchBestTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>CPCV 모델 분포</h2><p>워크포워드 OOF 경로별 선택 신호 uplift 분포</p></div></div>
+                <div id="cpcvModelDistributionTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>CPCV 전략 분포</h2><p>여러 OOS 경로의 전략 성과 중앙값과 하위 25%</p></div></div>
+                <div id="cpcvStrategyDistributionTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>피드백 피처 점검</h2><p>prefix-only self-test와 산출물 상태</p></div></div>
+                <div id="feedbackQualityGrid" class="quality-grid"></div>
+              </section>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 모델 통과 기준 점검</h2><p>어떤 기준 때문에 예측이 막혔는지 항목별로 확인</p></div></summary>
+                <div id="modelGateAuditTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 백테스트 이벤트 원장</h2><p>체결, 필터링, near-miss 후보와 실패 이유를 모두 기록</p></div></summary>
+                <div id="backtestEventLedgerTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 백테스트 피드백 피처</h2><p>각 행 이전 데이터만 사용해 만든 성공률, stop-rate, uplift 피처</p></div></summary>
+                <div id="backtestFeedbackFeatureTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: CPCV 경로 원장</h2><p>조합형 purged OOS 경로별 수익률, drawdown, purge 수</p></div></summary>
+                <div id="cpcvPathSummaryTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 자동 연구 Trial 원장</h2><p>Optuna 또는 fallback sampler가 기록한 목적함수와 해시</p></div></summary>
+                <div id="autoResearchTrialTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 연구 확장 실행 기록</h2><p>run_research_expansion_update.py 단계별 실행 결과</p></div></summary>
+                <div id="researchExpansionManifestTable" class="table-shell compact-table"></div>
+              </details>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>여러 종목 모델 비교</h2><p>반도체 종목들을 함께 써서 만든 예측 결과</p></div></div>
+                <div id="pooledModelTable" class="table-shell compact-table"></div>
+              </section>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: Bootstrap uplift 검증</h2><p>선택 신호가 전체·점수 기준보다 실제로 나았는지 보수적으로 확인</p></div></summary>
+                <div id="pooledUpliftBootstrapTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <section class="panel">
+                <div class="panel-head"><div><h2>TSMC 맞춤 확률 조정</h2><p>TSMC에 맞게 확률을 다시 맞춘 상태</p></div></div>
+                <div id="pooledCalibrationTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>여러 종목 모델 상태</h2><p>핵심 기준을 통과했는지 확인</p></div></div>
+                <div id="pooledQualityGrid" class="quality-grid"></div>
+              </section>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 반도체 유니버스 업데이트</h2><p>종목별 데이터·룰·백테스트·위험 계산 실행 결과</p></div></summary>
+                <div id="pooledUniverseManifestTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 유니버스 구성</h2><p>여러 종목 모델에 들어가는 종목과 입력 파일</p></div></summary>
+                <div id="pooledUniverseConfigTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 유니버스 검증 원본</h2><p>strict eligible 제외 사유와 row/date 품질 점검</p></div></summary>
+                <div id="universeValidationTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: TSM-like Calibration Metrics</h2><p>route 후보별 train/validation 선택 기준과 test/holdout 진단</p></div></summary>
+                <div id="tsmLikeMetricsTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: TSM-like Pool Rows</h2><p>row별 similarity weight와 effective sample contribution</p></div></summary>
+                <div id="tsmLikePoolTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 여러 종목 데이터 분할</h2><p>학습, 검증, 테스트, 마지막 확인 구간의 종목 수와 행 수</p></div></summary>
+                <div id="pooledSplitManifestTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 여러 종목 신호 통계</h2><p>종목·신호 종류별 표본 수, 성공률, 수익률, 손절률</p></div></summary>
+                <div id="pooledScopeStatsTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 여러 종목 입력 실패</h2><p>누락된 종목별 입력 파일이 있으면 표시</p></div></summary>
+                <div id="pooledInputFailuresTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 여러 종목 데이터 형식</h2><p>모델 입력 컬럼, 역할, 결측률</p></div></summary>
+                <div id="pooledSchemaTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 여러 종목 선택 기준</h2><p>어떤 신호를 고를지 정한 기준과 결과</p></div></summary>
+                <div id="pooledThresholdTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 구간별 모델 진단</h2><p>후보군, 종목, 트리거, 레짐별 확률 오차와 선택 결과</p></div></summary>
+                <div id="pooledSliceDiagnosticsTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 워크포워드 테스트 기록</h2><p>각 fold의 calibration, threshold 이후 테스트 결과</p></div></summary>
+                <div id="pooledOofPredictionsTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>예측을 붙였을 때 성과</h2><p>기본 규칙만 썼을 때와 예측으로 걸렀을 때 비교</p></div></div>
+                <div id="mlOverlayEquityChart" class="chart chart-large"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>예측 적용 결과 요약</h2><p>선택률, 기대수익, 손절률을 기준별로 확인</p></div></div>
+                <div id="mlOverlayTable" class="table-shell table-tall compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>예측 적용 점검</h2><p>과거 테스트 요약이 제대로 만들어졌는지</p></div></div>
+                <div id="mlOverlayQualityGrid" class="quality-grid"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>가상 기록 상태</h2><p>실제 주문 없이 기록만 하는 장부 상태</p></div></div>
+                <div id="shadowQualityGrid" class="quality-grid"></div>
+              </section>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 모델 목록</h2><p>사용 후보와 기준을 못 넘은 이유</p></div></summary>
+                <div id="registryTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 모델 실험 기록</h2><p>각 실험의 상태와 막힌 이유</p></div></summary>
+                <div id="experimentLogTable" class="table-shell table-tall compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 가상 매매 기록</h2><p>실제 주문 없이 저장한 최신 판단</p></div></summary>
+                <div id="shadowPaperTable" class="table-shell compact-table"></div>
+              </details>
+              <details class="panel wide detail-panel">
+                <summary><div><h2>상세: 여러 종목 예측 기록</h2><p>반도체 종목 데이터를 함께 쓴 예측 기록</p></div></summary>
+                <div id="pooledOosTable" class="table-shell table-tall compact-table"></div>
+              </details>
+            </div>
+          </section>
+
+          <section id="view-diagnostics" class="view">
+            <div id="diagnosticsSynthesis" class="page-synthesis"></div>
+            <div id="diagnosticHero" class="prediction-hero"></div>
+            <div id="diagnosticNotice" class="notice"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>예측 종류별 전체 수치</h2><p>최종 판단, 매수 준비, 매수 신호, 관찰, 여러 종목 예측을 기준 통과 여부와 상관없이 표시</p></div></div>
+                <div id="diagnosticPredictionCards" class="diagnostic-grid"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>기준 미달 분포</h2><p>어떤 점검 묶음과 기준에서 많이 막혔는지 요약</p></div></div>
+                <div id="diagnosticGateSummary" class="diagnostic-grid compact"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>차단 원인 우선순위</h2><p>반복된 실패 기준을 원인별로 묶고 먼저 볼 조치를 표시</p></div></div>
+                <div id="diagnosticRootCauseTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>막힌 기준의 실제 값</h2><p>실제 값, 기준값, 막힌 이유를 모두 표시</p></div></div>
+                <div id="diagnosticFailedGateTable" class="table-shell table-tall compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>최신 예측 원본값</h2><p>최신 예측 파일의 모든 항목과 값</p></div></div>
+                <div id="diagnosticPredictionSnapshotTable" class="table-shell table-tall compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>여러 종목 예측 원본값</h2><p>여러 종목 예측 파일의 모든 항목과 값</p></div></div>
+                <div id="diagnosticPooledSnapshotTable" class="table-shell table-tall compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>모델 기준 요약</h2><p>모델 기준 상태와 미통과 개수</p></div></div>
+                <div id="diagnosticModelGateSnapshotTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>시스템 상태 원본값</h2><p>분석, 수익 가능성, 가상 기록, 실거래 상태</p></div></div>
+                <div id="diagnosticSystemSnapshotTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>단독 예측 방식 전체 비교</h2><p>사용 가능 여부와 과거 테스트 결과</p></div></div>
+                <div id="diagnosticLocalModelTable" class="table-shell table-tall compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>여러 종목 모델 전체 비교</h2><p>반도체 비교 종목을 함께 쓴 모델 결과</p></div></div>
+                <div id="diagnosticPooledModelTable" class="table-shell compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>여러 종목 모델 구간별 진단</h2><p>모델 오차가 생긴 후보군과 시장 구간을 분리해서 확인</p></div></div>
+                <div id="diagnosticPooledSliceDiagnosticsTable" class="table-shell table-tall compact-table"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>확률 오차와 선택 기준</h2><p>예상 확률이 실제와 얼마나 달랐는지, 어떤 기준으로 신호를 고르는지</p></div></div>
+                <div id="diagnosticCalibrationPolicyTable" class="table-shell table-tall compact-table"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-backtest" class="view">
+            <div id="backtestSynthesis" class="page-synthesis"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>전략별 자산 흐름</h2><p>과거에 적용했다면 자산이 어떻게 변했는지</p></div></div>
+                <div id="equityChart" class="chart chart-large"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>전략별 총수익률</h2><p>각 전략의 전체 누적 성과</p></div></div>
+                <div id="backtestBars" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>연도별 수익률</h2><p>해마다 성과 확인</p></div></div>
+                <div id="yearlyTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>전략 요약</h2><p>수익률, 최대 하락폭, 거래 결과</p></div></div>
+                <div id="backtestTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>최근 거래 기록</h2><p>전략별 매수·매도 시점과 순수익률</p></div></div>
+                <div id="tradeLogTable" class="table-shell table-tall"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-risk" class="view">
+            <div id="riskSynthesis" class="page-synthesis"></div>
+            <div class="layout-grid">
+              <section class="panel">
+                <div class="panel-head"><div><h2>위험 요약</h2><p>얼마나 살 수 있는지와 제한 이유</p></div></div>
+                <div id="riskFacts" class="facts"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>큰 하락 가정</h2><p>현재 비중에서 크게 빠지면 얼마나 영향이 있는지</p></div></div>
+                <div id="stressFacts" class="facts"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>권장 최대 매수 비중</h2><p>위험 기준이 허용하는 최대 비중</p></div></div>
+                <div id="riskWeightChart" class="chart"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>하락 시나리오</h2><p>가격이 급하게 움직일 때 계좌 영향</p></div></div>
+                <div id="stressTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>전략별 위험</h2><p>각 전략의 최악 수익률과 최근 하락폭</p></div></div>
+                <div id="strategyStressTable" class="table-shell"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-quality" class="view">
+            <div id="qualitySynthesis" class="page-synthesis"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>시간 순서 검증</h2><p>학습에 쓰지 않은 뒤쪽 기간의 수익률</p></div></div>
+                <div id="walkForwardChart" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>점검 결과</h2><p>문제 없는 항목과 문제가 있는 항목</p></div></div>
+                <div id="qualityDetailGrid" class="quality-grid"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>최근 실행 기록</h2><p>각 계산 단계가 성공했는지</p></div></div>
+                <div id="manifestTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>기준을 바꿨을 때</h2><p>손절폭과 점수 기준을 바꾸면 결과가 어떻게 달라지는지</p></div></div>
+                <div id="sensitivityTable" class="table-shell table-tall"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>더 엄격한 시간 순서 검증</h2><p>각 기간 안에서 신호를 다시 계산해 확인한 결과</p></div></div>
+                <div id="causalWalkForwardChart" class="chart"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>엄격 검증 상세</h2><p>전략별, 기간별 과거 테스트 결과</p></div></div>
+                <div id="causalWalkForwardTable" class="table-shell table-tall"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>시장 구간별 검증</h2><p>정해진 시장 구간마다 성과 확인</p></div></div>
+                <div id="validationSegmentsTable" class="table-shell table-tall"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>과하게 맞춘 전략인지</h2><p>과거 데이터에만 너무 잘 맞춘 위험 확인</p></div></div>
+                <div id="pboTable" class="table-shell"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>수익 대비 위험 검증</h2><p>여러 실험을 감안해 수익이 의미 있는지 확인</p></div></div>
+                <div id="deflatedSharpeTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>전략 실험 기록</h2><p>전략별 기준값 실험 기록</p></div></div>
+                <div id="modelTrialsTable" class="table-shell table-tall"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-system" class="view">
+            <div id="systemSynthesis" class="page-synthesis"></div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>시스템 상태</h2><p>전체 준비 상태, 가상 기록 상태, 데이터 범위</p></div></div>
+                <div id="systemFacts" class="facts"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>준비 점수</h2><p>영역별로 얼마나 준비됐는지</p></div></div>
+                <div id="systemReadinessBars" class="chart"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>점검 요약</h2><p>운영, 데이터, 검증, 예측, 모델 상태</p></div></div>
+                <div id="systemQualityGrid" class="quality-grid"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>준비 점수 상세</h2><p>어떤 이유로 점수가 나왔는지</p></div></div>
+                <div id="systemScorecardTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>막힌 이유</h2><p>어떤 부분이 기준을 못 넘었는지</p></div></div>
+                <div id="systemBlockTable" class="table-shell"></div>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>데이터 상태 점검</h2><p>최신 데이터를 판단에 써도 되는지 확인</p></div></div>
+                <div id="dataQualityTable" class="table-shell table-tall"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>원본과 가공 데이터 비교</h2><p>가격과 거래량이 서로 맞는지 확인</p></div></div>
+                <div id="dataValidationTable" class="table-shell"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>문제 항목 상세</h2><p>문제가 있는 점검 항목만 표시</p></div></div>
+                <div id="failedChecks" class="table-shell"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-outputs" class="view">
+            <div id="outputsSynthesis" class="page-synthesis"></div>
+            <div class="outputs-layout">
+              <aside class="panel file-list-panel">
+                <div class="panel-head"><div><h2>산출물</h2><p><span id="fileCount">0</span>개 파일</p></div></div>
+                <div class="filters">
+                  <input id="fileSearch" type="search" placeholder="파일 검색" />
+                  <select id="fileScope">
+                    <option value="core" selected>핵심</option>
+                    <option value="universe">유니버스</option>
+                    <option value="">전체</option>
+                  </select>
+                  <select id="fileKind">
+                    <option value="">전체</option>
+                    <option value="csv">CSV</option>
+                    <option value="report">리포트</option>
+                    <option value="image">이미지</option>
+                  </select>
+                </div>
+                <div id="fileList" class="file-list"></div>
+              </aside>
+              <section class="panel file-preview-panel">
+                <div class="panel-head">
+                  <div><h2 id="previewTitle">미리보기</h2><p>표, 설명 파일, 차트 이미지 확인</p></div>
+                  <a id="downloadLink" class="ghost-link" href="#" target="_blank" rel="noreferrer">원본 열기</a>
+                </div>
+                <div id="filePreview" class="preview"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="view-run" class="view">
+            <div class="layout-grid">
+              <section class="panel wide run-control-panel">
+                <div class="panel-head"><div><h2>계산 실행</h2><p>전체 계산 또는 필요한 계산만 다시 실행</p></div></div>
+                <form id="runForm" class="run-form">
+                  <label>
+                    <span>작업</span>
+                    <select name="mode" id="runMode">
+                      <option value="downstream">데이터 유지 후 전체 재계산</option>
+                      <option value="full">전체 업데이트</option>
+                      <option value="research_expansion_update">연구 확장 업데이트</option>
+                      <option value="hourly">시간봉 데이터 갱신</option>
+                      <option value="intraday">분봉 데이터 갱신</option>
+                      <option value="data_pipeline">일봉 데이터/차트</option>
+                      <option value="news_causal_engine">뉴스 원인 수집</option>
+                      <option value="rule_engine">룰 엔진</option>
+                      <option value="backtest_engine">백테스트</option>
+                      <option value="backtest_event_ledger">백테스트 이벤트 원장</option>
+                      <option value="risk_engine">리스크 정책</option>
+                      <option value="validation_engine">검증</option>
+                      <option value="stress_engine">스트레스</option>
+                      <option value="integrity_engine">무결성</option>
+                      <option value="prediction_engine">예측 계산</option>
+                      <option value="external_feature_engine">외부 피처 계산</option>
+                      <option value="ml_overlay_backtest">예측 적용 성과 계산</option>
+                      <option value="pooled_dataset_builder">여러 종목 데이터 만들기</option>
+                      <option value="pooled_model_engine">여러 종목 예측 모델</option>
+                      <option value="backtest_feedback_feature_engine">백테스트 피드백 피처</option>
+                      <option value="auto_research_engine">자동 연구 Trial</option>
+                      <option value="data_quality_engine">데이터 품질</option>
+                      <option value="model_gate_engine">모델 통과 기준 점검</option>
+                      <option value="model_registry_engine">모델 목록 관리</option>
+                      <option value="shadow_paper_engine">가상 기록</option>
+                      <option value="pooled_universe_update">반도체 비교 종목 업데이트</option>
+                      <option value="system_state_engine">시스템 준비 상태</option>
+                      <option value="daily_trading_report">매매 계획</option>
+                      <option value="daily_health_report">오늘 시스템 점검</option>
+                    </select>
+                  </label>
+                  <div class="form-row">
+                    <label><span>설정 파일</span><input name="config" type="text" value="config/tsm_research.toml" /></label>
+                    <label><span>예측 사용 방식</span><select name="prediction_policy"><option value="conservative">보수적으로 사용</option><option value="research">분석용으로 넓게 보기</option></select></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>유니버스 설정 CSV</span><input name="universe_config" type="text" value="config/semiconductor_universe_expanded.csv" /></label>
+                    <label><span>외부 피처 CSV</span><input name="external_features" type="text" value="tsm_price_rule_output/tsm_external_daily_features.csv" /></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>시작일</span><input name="start" id="startInput" type="date" value="2016-05-12" /></label>
+                    <label><span>종료일</span><input name="end" id="endInput" type="date" /></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>뉴스 수집 범위</span><select name="news_mode"><option value="daily">최근 뉴스만</option><option value="backfill">과거까지 백필</option></select></label>
+                    <label><span>최근 뉴스 조회일</span><input name="news_lookback_days" type="number" min="1" max="90" step="1" value="14" /></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>일봉 소스</span><select name="preferred_source"><option value="stooq">Stooq</option><option value="yahoo">Yahoo</option></select></label>
+                    <label><span>시간봉 소스</span><select name="provider"><option value="auto">자동</option><option value="yahoo">Yahoo</option><option value="polygon">Polygon</option></select></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>분봉 간격</span><select name="interval"><option value="1m">1분</option><option value="2m">2분</option><option value="5m">5분</option><option value="15m">15분</option><option value="30m">30분</option><option value="60m">60분</option><option value="1h">1시간</option></select></label>
+                    <label><span>매수 후보 점수 기준</span><input name="score_threshold" type="number" step="1" value="75" /></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>수수료</span><input name="commission_bps" type="number" step="0.1" value="1.0" /></label>
+                    <label><span>매매 체결 불리함</span><input name="slippage_bps" type="number" step="0.1" value="5.0" /></label>
+                  </div>
+                  <div class="form-row">
+                    <label><span>손절폭 기준</span><input name="stop_multiple" type="number" step="0.1" value="2.0" /></label>
+                    <label><span>자동 연구 Trial 수</span><input name="max_trials" type="number" min="1" max="1000" step="1" value="100" /></label>
+                  </div>
+                  <div class="check-row">
+                    <label><input name="skip_charts" type="checkbox" /> 차트 생략</label>
+                    <label><input name="skip_benchmarks" type="checkbox" /> 벤치마크 생략</label>
+                    <label><input name="skip_data_refresh" type="checkbox" /> 데이터 갱신 생략</label>
+                    <label><input name="skip_external_web" type="checkbox" /> 외부 웹 생략</label>
+                    <label><input name="schema_strict" type="checkbox" /> 데이터 형식 엄격 확인</label>
+                    <label><input name="continue_on_error" type="checkbox" /> 오류 후 계속</label>
+                    <label><input name="skip_symbol_build" type="checkbox" /> 종목별 재계산 생략</label>
+                    <label><input name="skip_news_refresh" type="checkbox" /> 뉴스 새 수집 생략</label>
+                    <label><input name="enable_feedback_features" type="checkbox" checked /> 피드백 피처 생성</label>
+                    <label><input name="enable_auto_research" type="checkbox" checked /> 자동 연구 Trial</label>
+                  </div>
+                  <div class="button-row">
+                    <button id="runBtn" class="primary-button" type="submit">
+                      <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5Z" /></svg>
+                      실행
+                    </button>
+                    <button id="stopBtn" class="secondary-button" type="button">
+                      <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6V6Z" /></svg>
+                      중지
+                    </button>
+                  </div>
+                </form>
+              </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>실행 로그</h2><p id="runStatusText">대기</p></div></div>
+                <pre id="runLog" class="run-log"></pre>
+              </section>
+            </div>
+            <div id="runSynthesis" class="page-synthesis"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
