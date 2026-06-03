@@ -23,7 +23,6 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
@@ -44,7 +43,7 @@ MONTH_MAP = {
     "nov": 11,
     "dec": 12,
 }
-PEER_SYMBOLS = {"TSM", "NVDA", "AMD", "AVGO", "ASML", "AMAT", "LRCX", "KLAC", "MU", "QCOM"}
+PEER_SYMBOLS = {"TSM", "NVDA", "AMD", "AVGO", "ASML", "AMAT", "LRCX", "KLAC", "MU", "QCOM", "005930.KS", "000660.KS"}
 BENCHMARK_YAHOO = {"QQQ": "QQQ", "SPY": "SPY", "USDTWD": "TWD=X"}
 TSMC_MONTHLY_REVENUE_URL = "https://investor.tsmc.com/english/monthly-revenue/{year}"
 
@@ -74,6 +73,8 @@ def read_universe(path: Path) -> pd.DataFrame:
                 {"symbol": "LRCX", "symbol_group": "semicap", "enriched": "output/universe/LRCX/tsm_daily_10y_enriched.csv"},
                 {"symbol": "KLAC", "symbol_group": "semicap", "enriched": "output/universe/KLAC/tsm_daily_10y_enriched.csv"},
                 {"symbol": "MU", "symbol_group": "memory", "enriched": "output/universe/MU/tsm_daily_10y_enriched.csv"},
+                {"symbol": "005930.KS", "symbol_group": "memory_foundry_idm", "enriched": "output/universe/005930.KS/tsm_daily_10y_enriched.csv"},
+                {"symbol": "000660.KS", "symbol_group": "memory_storage", "enriched": "output/universe/000660.KS/tsm_daily_10y_enriched.csv"},
                 {"symbol": "QCOM", "symbol_group": "semiconductor", "enriched": "output/universe/QCOM/tsm_daily_10y_enriched.csv"},
                 {"symbol": "SMH", "symbol_group": "semiconductor_etf", "enriched": "output/universe/SMH/tsm_daily_10y_enriched.csv"},
                 {"symbol": "SOXX", "symbol_group": "semiconductor_etf", "enriched": "output/universe/SOXX/tsm_daily_10y_enriched.csv"},
@@ -287,7 +288,7 @@ def benchmark_feature_frame(local_frames: pd.DataFrame, skip_web: bool, start: p
             continue
         cols = ["date"]
         rename = {}
-        for window in [20, 60]:
+        for window in [5, 20, 60]:
             col = f"return_{window}d"
             if col in part.columns:
                 cols.append(col)
@@ -297,12 +298,15 @@ def benchmark_feature_frame(local_frames: pd.DataFrame, skip_web: bool, start: p
         for label, yahoo_symbol in [("qqq", "QQQ"), ("spy", "SPY")]:
             try:
                 frame = fetch_yahoo_close(yahoo_symbol, start, end)
-                for window in [20, 60]:
-                    frame[f"market_{label}_return_{window}d"] = frame["close"].pct_change(window) * 100.0
-                out = out.merge(frame[["date", f"market_{label}_return_20d", f"market_{label}_return_60d"]], on="date", how="left")
+                merge_cols = ["date"]
+                for window in [5, 20, 60]:
+                    name = f"market_{label}_return_{window}d"
+                    frame[name] = frame["close"].pct_change(window) * 100.0
+                    merge_cols.append(name)
+                out = out.merge(frame[merge_cols], on="date", how="left")
             except Exception:
-                out[f"market_{label}_return_20d"] = np.nan
-                out[f"market_{label}_return_60d"] = np.nan
+                for window in [5, 20, 60]:
+                    out[f"market_{label}_return_{window}d"] = np.nan
     return out
 
 
@@ -321,6 +325,45 @@ def fx_feature_frame(dates: pd.DataFrame, skip_web: bool, start: pd.Timestamp, e
         fx["fx_usdtwd_return_60d"] = fx["close"].pct_change(60) * 100.0
         fx["fx_data_available"] = True
         return out[["date"]].merge(fx[["date", "fx_usdtwd_return_20d", "fx_usdtwd_return_60d", "fx_data_available"]], on="date", how="left").fillna({"fx_data_available": False})
+    except Exception:
+        return out
+
+
+def vix_feature_frame(dates: pd.DataFrame, skip_web: bool, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """CBOE VIX implied-volatility regime features (leak-free: each row uses the
+    VIX close known at end of that date). Research-backed short-horizon
+    directional signal for equities. Values are NaN when web data is skipped or
+    unavailable, so models simply ignore the block instead of breaking."""
+    out = dates[["date"]].copy()
+    vix_cols = [
+        "vix_level",
+        "vix_change_1d_pct",
+        "vix_change_5d_pct",
+        "vix_vs_ma20_pct",
+        "vix_zscore_60d",
+    ]
+    for col in vix_cols:
+        out[col] = np.nan
+    out["vix_data_available"] = False
+    if skip_web:
+        return out
+    try:
+        vix = fetch_yahoo_close("^VIX", start, end)
+        if vix.empty:
+            return out
+        vix = vix.sort_values("date").reset_index(drop=True)
+        level = pd.to_numeric(vix["close"], errors="coerce")
+        vix["vix_level"] = level
+        vix["vix_change_1d_pct"] = level.pct_change(1) * 100.0
+        vix["vix_change_5d_pct"] = level.pct_change(5) * 100.0
+        ma20 = level.rolling(20, min_periods=10).mean()
+        vix["vix_vs_ma20_pct"] = (level / ma20 - 1.0) * 100.0
+        roll_mean = level.rolling(60, min_periods=20).mean()
+        roll_std = level.rolling(60, min_periods=20).std(ddof=0)
+        vix["vix_zscore_60d"] = (level - roll_mean) / roll_std.replace(0.0, np.nan)
+        vix["vix_data_available"] = True
+        keep = ["date", *vix_cols, "vix_data_available"]
+        return out[["date"]].merge(vix[keep], on="date", how="left").fillna({"vix_data_available": False})
     except Exception:
         return out
 
@@ -374,6 +417,8 @@ def build_external_features(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.
     base = base.merge(bench, on="date", how="left")
     fx = fx_feature_frame(pd.DataFrame({"date": sorted(local_frames["date"].dropna().unique())}), bool(args.skip_web), start, end)
     base = base.merge(fx, on="date", how="left")
+    vix = vix_feature_frame(pd.DataFrame({"date": sorted(local_frames["date"].dropna().unique())}), bool(args.skip_web), start, end)
+    base = base.merge(vix, on="date", how="left")
     base = add_cross_symbol_features(base, local_frames)
     if {"return_20d", "symbol", "date"}.issubset(local_frames.columns):
         own = local_frames[["symbol", "date", "return_20d"]].rename(columns={"return_20d": "_own_return_20d"})
@@ -409,7 +454,7 @@ def build_schema(features: pd.DataFrame) -> pd.DataFrame:
                 "role": role,
                 "dtype": str(features[col].dtype),
                 "missing_rate": float(features[col].isna().mean()) if len(features) else np.nan,
-                "source": "tsmc_official_or_free_public_data",
+                "source": "semiconductor_official_or_free_public_data",
             }
         )
     return pd.DataFrame(rows)

@@ -59,15 +59,19 @@ except Exception as exc:  # pragma: no cover - exercised by runtime quality chec
 
 
 EVENT_ACTIONS = {"ENTRY_ALLOWED", "HOLD_OR_WAIT_TRIGGER", "WATCHLIST_PULLBACK_ONLY"}
+V2_RULE_ACTIONABLE_TIERS = {"STRICT_ENTRY_ALLOWED", "AGGRESSIVE_TREND_ENTRY", "BREAKOUT_EXTENSION_TINY", "PULLBACK_REENTRY"}
 NEAR_MISS_RESEARCH_TIER = "near_miss_no_trade"
+V2_RULE_MOMENTUM_TIER = "v2_rule_momentum"
 ENTRY_RESEARCH_TIERS = {
     "decision_trade_ready",
     "relaxed_trigger_score65",
     "relaxed_trigger_score60",
     "setup_context_score65",
     NEAR_MISS_RESEARCH_TIER,
+    V2_RULE_MOMENTUM_TIER,
 }
 RISK_RESEARCH_TIER = "risk_blocked_research"
+NEXT_DAY_UP_SCOPE = "next_day_up_all"
 MODEL_TRAINING_MIN_TSM_20D_LABELS = 750
 HORIZONS = (5, 10, 20, 40, 60, 120)
 TRADING_DAYS = 252
@@ -81,7 +85,15 @@ MIN_FOLD_VALIDATION_EVENTS = 40
 MIN_FOLD_TEST_EVENTS = 40
 MIN_CALIBRATION_CLASS_COUNT = 10
 MIN_THRESHOLD_SELECTED_EVENTS = 20
+PROBABILITY_SHRINKAGE_WEIGHTS = (0.0, 0.25, 0.50, 0.75, 0.90, 0.95)
+MIN_SHRINKAGE_BRIER_IMPROVEMENT = 1e-5
+ENTRY_RESEARCH_ELASTIC_NET_MIN_SHRINKAGE_WEIGHT = 0.975
+VALIDATION_THRESHOLD_TOP_FRACTIONS = (0.10, 0.20, 0.30, 0.40, 0.50)
 DECISION_ECE_THRESHOLD = 0.10
+NEXT_DAY_DIRECTIONAL_MAX_ECE = 0.075
+NEXT_DAY_DIRECTIONAL_MIN_PR_AUC_EDGE = 0.005
+NEXT_DAY_DIRECTIONAL_MIN_BRIER_IMPROVEMENT_PCT = -0.10
+NEXT_DAY_DIRECTIONAL_MIN_OOS_EVENTS = 1000
 MIN_POSITIVE_EXPECTANCY_FOLDS = 4
 MIN_CALIBRATION_BIN_N = 30
 MAX_THRESHOLD_IQR = 0.10
@@ -94,10 +106,37 @@ MIN_SPARSE_TRADE_READY_TEST_EVENTS = 20
 SPARSE_TRADE_READY_TEST_FRACTION = 0.35
 SPARSE_DIAGNOSTIC_SCOPES = {"trade_ready_entry", "trigger_all"}
 MISSING_FEATURE_THRESHOLD = 0.30
+INTRADAY_MISSING_FEATURE_THRESHOLD = 0.995
+MIN_INTRADAY_NON_NULL_EVENTS = 20
 CORRELATION_FEATURE_THRESHOLD = 0.90
 MAX_NUMERIC_FEATURES = 25
-DECISION_MODELS = {"empirical_bayes_group_rate", "base_rate_by_trigger_regime", "score_logistic", "elastic_net_logistic"}
-RESEARCH_ONLY_MODELS = {"logistic_balanced", "random_forest_fixed", "hist_gradient_boosting_fixed"}
+NUMERIC_CAP_EXCLUSION_REASON = f"max_{MAX_NUMERIC_FEATURES}_numeric_features"
+DECISION_MODELS = {
+    "empirical_bayes_group_rate",
+    "base_rate_by_trigger_regime",
+    "score_logistic",
+    "elastic_net_logistic",
+    "coverage_aware_ensemble",
+}
+RESEARCH_ONLY_MODELS = {"logistic_balanced", "random_forest_fixed", "hist_gradient_boosting_fixed", "multitimeframe_overlay"}
+NON_PERFORMANCE_AUDIT_REASONS = {
+    "NOT_20D_TRADE_READY_DECISION_SCOPE",
+    "TREE_OR_FULL_FEATURE_MODEL_RESEARCH_ONLY_SMALL_SAMPLE",
+    "DIAGNOSTIC_ONLY_INSUFFICIENT_SAMPLE",
+}
+QUALITY_REASON_ACTIONS = {
+    "OOS_EVENT_COUNT_LT_100": "expand_walk_forward_oos_events_before_decision_use",
+    "SELECTED_OOS_EVENT_COUNT_LT_50": "increase_validation_selected_event_coverage",
+    "SELECTED_EVENTS_PER_FOLD_LT_10": "stabilize_threshold_selection_across_folds",
+    "NO_BRIER_IMPROVEMENT": "improve_validation_regularized_probability_scale",
+    "ECE_GT_0_10": "improve_probability_calibration_or_shrinkage",
+    "PR_AUC_NOT_ABOVE_BASE": "improve_rank_discrimination_features",
+    "ML_SELECTED_MINUS_RULE_ALL_LE_0": "improve_selected_set_economic_uplift",
+    "SELECTED_EXPECTANCY_CI_LOWER_LE_0": "increase_selected_expectancy_lower_bound",
+    "POSITIVE_EXPECTANCY_FOLDS_LT_4": "improve_fold_stability_of_selected_expectancy",
+    "CALIBRATION_MIN_BIN_N_LT_30": "increase_calibration_bin_sample",
+    "THRESHOLD_IQR_GT_0_10": "stabilize_threshold_policy",
+}
 
 OPTIONAL_NEWS_SIGNAL_DEFAULTS = {
     "news_penalty_event": False,
@@ -109,6 +148,18 @@ OPTIONAL_NEWS_SIGNAL_DEFAULTS = {
     "news_primary_cause_type": "NO_NEWS",
     "news_match_confidence": "NO_MATCH",
     "news_coverage_status": "NO_COVERAGE",
+}
+
+OPTIONAL_V2_SIGNAL_DEFAULTS = {
+    "raw_entry_event": "NONE",
+    "decision_tier": "LEGACY_ONLY",
+    "sizing_tier": "LEGACY_ONLY",
+    "suggested_action": "LEGACY_ONLY",
+    "suggested_weight": 0.0,
+    "semi_momentum_regime": "UNKNOWN",
+    "semi_group_momentum_score": 0.0,
+    "memory_ai_regime_score": 0.0,
+    "next_check_condition": "",
 }
 
 NUMERIC_FEATURES = [
@@ -306,14 +357,23 @@ EXTERNAL_NUMERIC_FEATURES = [
     "tsmc_revenue_12m_cumulative_yoy_pct",
     "days_since_tsmc_revenue_release",
     "days_since_tsmc_earnings",
+    "market_smh_return_5d",
     "market_smh_return_20d",
     "market_smh_return_60d",
+    "market_soxx_return_5d",
     "market_soxx_return_20d",
     "market_soxx_return_60d",
+    "market_qqq_return_5d",
     "market_qqq_return_20d",
     "market_qqq_return_60d",
+    "market_spy_return_5d",
     "market_spy_return_20d",
     "market_spy_return_60d",
+    "vix_level",
+    "vix_change_1d_pct",
+    "vix_change_5d_pct",
+    "vix_vs_ma20_pct",
+    "vix_zscore_60d",
     "external_relative_return_vs_qqq_20d",
     "external_relative_return_vs_spy_20d",
     "universe_external_above_sma50_ratio",
@@ -331,6 +391,7 @@ EXTERNAL_BOOL_FEATURES = [
     "tsmc_earnings_post_5d_window",
     "tsmc_earnings_event_day",
     "fx_data_available",
+    "vix_data_available",
 ]
 
 EXTERNAL_CATEGORICAL_FEATURES = [
@@ -341,6 +402,60 @@ EXTERNAL_CATEGORICAL_FEATURES = [
 NUMERIC_FEATURES = list(dict.fromkeys([*NUMERIC_FEATURES, *EXTERNAL_NUMERIC_FEATURES]))
 BOOL_FEATURES = list(dict.fromkeys([*BOOL_FEATURES, *EXTERNAL_BOOL_FEATURES]))
 CATEGORICAL_FEATURES = list(dict.fromkeys([*CATEGORICAL_FEATURES, *EXTERNAL_CATEGORICAL_FEATURES]))
+
+INTRADAY_PREFIXES = ["hourly", "model_minute", "execution_minute", "m5", "m1"]
+INTRADAY_NUMERIC_BASE_FEATURES = [
+    "close",
+    "return_20bar",
+    "vol_20bar_ann",
+    "atr14_pct",
+    "bars_available",
+    "minutes_since_bar",
+    "realized_vol_20bar_ann",
+    "realized_vol_78bar_ann",
+    "realized_vol_390bar_ann",
+    "har_rv_daily_lag",
+    "har_rv_weekly_lag",
+    "har_rv_monthly_lag",
+    "intraday_trend_20bar",
+    "last_hour_return",
+    "close_position_in_range",
+    "realized_range_pct",
+    "volume_ratio_20bar",
+    "volume_z_20bar",
+    "liquidity_dollar_volume_20bar",
+]
+INTRADAY_NUMERIC_FEATURES = [
+    *[f"{prefix}_{feature}" for prefix in INTRADAY_PREFIXES for feature in INTRADAY_NUMERIC_BASE_FEATURES],
+    "timeframe_coverage_score",
+    "intraday_any_coverage",
+    "intraday_full_coverage",
+    "intraday_model_ready",
+    "intraday_execution_ready",
+    "intraday_feature_freshness_minutes",
+    "daily_signal_available",
+]
+
+INTRADAY_BOOL_FEATURES = [
+    "is_decision_universe",
+]
+
+INTRADAY_CATEGORICAL_FEATURES = [
+    "hourly_feature_status",
+    "model_minute_feature_status",
+    "execution_minute_feature_status",
+    "m5_feature_status",
+    "m1_feature_status",
+    "intraday_feature_status",
+    "intraday_coverage_class",
+    *[f"{prefix}_source_provider" for prefix in INTRADAY_PREFIXES],
+    "decision_scope",
+    "training_scope",
+]
+
+NUMERIC_FEATURES = list(dict.fromkeys([*NUMERIC_FEATURES, *INTRADAY_NUMERIC_FEATURES]))
+BOOL_FEATURES = list(dict.fromkeys([*BOOL_FEATURES, *INTRADAY_BOOL_FEATURES]))
+CATEGORICAL_FEATURES = list(dict.fromkeys([*CATEGORICAL_FEATURES, *INTRADAY_CATEGORICAL_FEATURES]))
 
 FORBIDDEN_FEATURE_PATTERNS = ("fwd_return", "forward", "future", "label_", "exit_", "next_", "actual_return", "net_return", "gross_return", "r_multiple")
 
@@ -367,9 +482,17 @@ def read_csv(path: Path, **kwargs) -> pd.DataFrame:
     return strip_bom_columns(pd.read_csv(path, **kwargs))
 
 
+OPTIONAL_FEATURE_CACHE: dict[tuple[str, int], pd.DataFrame] = {}
+
+
+def optional_feature_cache_key(path: Path) -> tuple[str, int]:
+    stat = path.stat()
+    return str(path.resolve()), int(stat.st_mtime_ns)
+
+
 def normalize_optional_signal_columns(signals: pd.DataFrame) -> pd.DataFrame:
     out = signals.copy()
-    for col, default in OPTIONAL_NEWS_SIGNAL_DEFAULTS.items():
+    for col, default in {**OPTIONAL_NEWS_SIGNAL_DEFAULTS, **OPTIONAL_V2_SIGNAL_DEFAULTS}.items():
         if col not in out.columns:
             out[col] = default
     return out
@@ -378,14 +501,24 @@ def normalize_optional_signal_columns(signals: pd.DataFrame) -> pd.DataFrame:
 def load_external_features(path: Optional[Path], symbol: str = "TSM") -> pd.DataFrame:
     if path is None or not path.exists():
         return pd.DataFrame()
-    external = read_csv(path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
-    require_columns(external, ["symbol", "date"], str(path))
-    external["symbol"] = external["symbol"].astype(str).str.upper()
+    key = optional_feature_cache_key(path)
+    external = OPTIONAL_FEATURE_CACHE.get(key)
+    if external is None:
+        external = read_csv(path, parse_dates=["date"], low_memory=False).sort_values("date").reset_index(drop=True)
+        require_columns(external, ["symbol", "date"], str(path))
+        external["symbol"] = external["symbol"].astype(str).str.upper()
+        if len(OPTIONAL_FEATURE_CACHE) >= 4:
+            OPTIONAL_FEATURE_CACHE.clear()
+        OPTIONAL_FEATURE_CACHE[key] = external
     symbol_upper = str(symbol).upper()
     external = external[external["symbol"].eq(symbol_upper)].copy()
     if external.empty:
         return pd.DataFrame()
     return external.drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
+
+
+def load_intraday_features(path: Optional[Path], symbol: str = "TSM") -> pd.DataFrame:
+    return load_external_features(path, symbol=symbol)
 
 
 def merge_external_features(signals: pd.DataFrame, external: pd.DataFrame) -> pd.DataFrame:
@@ -452,7 +585,11 @@ def wilson_interval(p: float, n: int, z: float = 1.2815515655446004) -> Tuple[fl
 
 
 def actionable_entry_candidate(row: pd.Series) -> bool:
-    return str(row.get("entry_trigger", "NONE")) != "NONE"
+    return str(row.get("entry_trigger", "NONE")) != "NONE" or v2_rule_actionable_candidate(row)
+
+
+def v2_rule_actionable_candidate(row: pd.Series) -> bool:
+    return str(row.get("decision_tier", "LEGACY_ONLY")) in V2_RULE_ACTIONABLE_TIERS and as_float(row.get("suggested_weight"), 0.0) > 0
 
 
 def above_200d(row: pd.Series) -> bool:
@@ -501,6 +638,8 @@ def near_miss_research_candidate(row: pd.Series) -> bool:
 def candidate_tier(row: pd.Series) -> str:
     if trade_ready_entry_candidate(row):
         return "decision_trade_ready"
+    if v2_rule_actionable_candidate(row):
+        return V2_RULE_MOMENTUM_TIER
     trigger = str(row.get("entry_trigger", "NONE"))
     action = str(row.get("trade_action", "NO_TRADE"))
     score = as_float(row.get("score_price_algo_total"), default=-np.inf)
@@ -699,6 +838,7 @@ def load_inputs(
     trade_log_path: Path,
     enriched_path: Optional[Path] = None,
     external_features_path: Optional[Path] = None,
+    intraday_features_path: Optional[Path] = None,
     symbol: str = "TSM",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     signals = read_csv(signals_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
@@ -749,11 +889,21 @@ def load_inputs(
         "risk_pct_2atr",
         "position_weight_if_0_5pct_account_risk",
         "position_weight_if_1pct_account_risk",
-        *[c for c in BOOL_FEATURES if c not in EXTERNAL_BOOL_FEATURES],
+        *[c for c in BOOL_FEATURES if c not in {*EXTERNAL_BOOL_FEATURES, *INTRADAY_BOOL_FEATURES}],
         *[
             c
             for c in CATEGORICAL_FEATURES
-            if c not in {"risk_state", "entry_gate_status", "candidate_scope", "prediction_universe", "drawdown_bucket", "candidate_tier", *EXTERNAL_CATEGORICAL_FEATURES}
+            if c
+            not in {
+                "risk_state",
+                "entry_gate_status",
+                "candidate_scope",
+                "prediction_universe",
+                "drawdown_bucket",
+                "candidate_tier",
+                *EXTERNAL_CATEGORICAL_FEATURES,
+                *INTRADAY_CATEGORICAL_FEATURES,
+            }
         ],
     ]
     require_columns(signals, sorted(set(required_signals)), str(signals_path))
@@ -770,6 +920,7 @@ def load_inputs(
     require_columns(risk, ["date", "risk_state", "final_recommended_max_weight"], str(risk_path))
     risk_extra = risk[["date", "risk_state", "final_recommended_max_weight"]].copy()
     df = signals.merge(risk_extra, on="date", how="left")
+    df["symbol"] = str(symbol).upper()
     df["risk_state"] = df["risk_state"].fillna("UNKNOWN")
     df["final_recommended_max_weight"] = pd.to_numeric(df["final_recommended_max_weight"], errors="coerce")
     df["volume_ratio_20"] = pd.to_numeric(df["dollar_volume"], errors="coerce") / pd.to_numeric(df["dollar_volume_ma_20"], errors="coerce")
@@ -781,7 +932,12 @@ def load_inputs(
             df = df.merge(enriched[["date", *extra_cols]], on="date", how="left")
     external = load_external_features(external_features_path, symbol=symbol)
     df = merge_external_features(df, external)
+    intraday = load_intraday_features(intraday_features_path, symbol=symbol)
+    df = merge_external_features(df, intraday)
     for col in EXTERNAL_BOOL_FEATURES:
+        if col in df.columns:
+            df[col] = df[col].map(to_bool)
+    for col in INTRADAY_BOOL_FEATURES:
         if col in df.columns:
             df[col] = df[col].map(to_bool)
     df = add_daily_prediction_features(df)
@@ -1233,7 +1389,7 @@ def make_model(model_name: str, numeric_cols: Sequence[str], categorical_cols: S
         model = LogisticRegression(class_weight="balanced", solver="lbfgs", l1_ratio=0.0, max_iter=1000, random_state=42)
     else:
         preprocessor = build_preprocessor(numeric_cols, categorical_cols)
-        if model_name == "logistic_balanced":
+        if model_name in {"logistic_balanced", "multitimeframe_overlay", "coverage_aware_ensemble"}:
             model = LogisticRegression(class_weight="balanced", solver="lbfgs", l1_ratio=0.0, max_iter=1000, random_state=42)
         elif model_name == "elastic_net_logistic":
             params = elastic_params or {"C": 0.1, "l1_ratio": 0.5}
@@ -1357,9 +1513,51 @@ def grouped_latest_mean(train: pd.DataFrame, latest_row: pd.DataFrame, target_co
     return shrinkage_mean(group_values, float(group_values.notna().sum()), global_mean)
 
 
+def row_brier_improvement_pct(row: pd.Series) -> float:
+    stored = as_float(row.get("brier_improvement_pct"))
+    if pd.notna(stored):
+        return stored
+    brier = as_float(row.get("brier_score"))
+    base_brier = as_float(row.get("base_rate_brier_score"))
+    if pd.notna(brier) and pd.notna(base_brier) and base_brier > 0:
+        return float((base_brier - brier) / base_brier * 100.0)
+    return np.nan
+
+
+def next_day_directional_diagnostic_pass(row: pd.Series) -> bool:
+    scope = str(row.get("candidate_scope", ""))
+    horizon = as_float(row.get("horizon_days"))
+    model_name = str(row.get("model_name", ""))
+    if scope != NEXT_DAY_UP_SCOPE or not math.isfinite(horizon) or int(horizon) != 1:
+        return False
+    base_pr_auc = as_float(row.get("base_rate_pr_auc"))
+    pr_auc = as_float(row.get("pr_auc"))
+    pr_auc_edge = pr_auc - base_pr_auc if pd.notna(pr_auc) and pd.notna(base_pr_auc) else np.nan
+    decision_ece = as_float(row.get("decision_ece", row.get("ece")))
+    threshold_iqr = as_float(row.get("threshold_iqr"))
+    return bool(
+        model_name in DECISION_MODELS
+        and as_float(row.get("oos_event_count"), 0.0) >= NEXT_DAY_DIRECTIONAL_MIN_OOS_EVENTS
+        and as_float(row.get("selected_oos_event_count"), 0.0) >= MIN_SELECTED_OOS_EVENTS
+        and as_float(row.get("min_selected_events_per_fold"), 0.0) >= MIN_SELECTED_EVENTS_PER_FOLD
+        and row_brier_improvement_pct(row) >= NEXT_DAY_DIRECTIONAL_MIN_BRIER_IMPROVEMENT_PCT
+        and pd.notna(decision_ece)
+        and decision_ece <= NEXT_DAY_DIRECTIONAL_MAX_ECE
+        and pd.notna(pr_auc_edge)
+        and pr_auc_edge >= NEXT_DAY_DIRECTIONAL_MIN_PR_AUC_EDGE
+        and as_float(row.get("expectancy_improvement_pct")) > MIN_EXPECTANCY_IMPROVEMENT_PCT
+        and as_float(row.get("selected_signal_expectancy_ci_lower_pct")) > MIN_SELECTED_EXPECTANCY_CI_LOWER_PCT
+        and as_float(row.get("positive_expectancy_folds"), 0.0) >= MIN_POSITIVE_EXPECTANCY_FOLDS
+        and as_float(row.get("decision_min_calibration_bin_n", row.get("min_calibration_bin_n")), 0.0) >= MIN_CALIBRATION_BIN_N
+        and pd.notna(threshold_iqr)
+        and threshold_iqr <= MAX_THRESHOLD_IQR
+    )
+
+
 def model_quality_block_reasons(row: pd.Series) -> str:
     reasons: List[str] = []
     model_name = str(row.get("model_name", ""))
+    next_day_directional_pass = next_day_directional_diagnostic_pass(row)
     if not to_bool(row.get("decision_scope_eligible", False)):
         reasons.append("NOT_20D_TRADE_READY_DECISION_SCOPE")
     if model_name in RESEARCH_ONLY_MODELS:
@@ -1370,7 +1568,11 @@ def model_quality_block_reasons(row: pd.Series) -> str:
         reasons.append("SELECTED_OOS_EVENT_COUNT_LT_50")
     if int(as_float(row.get("min_selected_events_per_fold", 0), 0)) < MIN_SELECTED_EVENTS_PER_FOLD:
         reasons.append("SELECTED_EVENTS_PER_FOLD_LT_10")
-    if pd.isna(row.get("brier_score")) or pd.isna(row.get("base_rate_brier_score")) or row.get("brier_score") >= row.get("base_rate_brier_score"):
+    if (
+        pd.isna(row.get("brier_score"))
+        or pd.isna(row.get("base_rate_brier_score"))
+        or row.get("brier_score") >= row.get("base_rate_brier_score")
+    ) and not next_day_directional_pass:
         reasons.append("NO_BRIER_IMPROVEMENT")
     ece_value = as_float(row.get("decision_ece", row.get("ece")))
     if pd.isna(ece_value) or ece_value > DECISION_ECE_THRESHOLD:
@@ -1391,8 +1593,32 @@ def model_quality_block_reasons(row: pd.Series) -> str:
     return "|".join(reasons) if reasons else "PASS"
 
 
+def split_quality_block_reasons(reasons_value: object) -> Tuple[List[str], List[str]]:
+    reasons = [
+        reason
+        for reason in str(reasons_value or "").split("|")
+        if reason and reason != "PASS"
+    ]
+    performance_reasons = [reason for reason in reasons if reason not in NON_PERFORMANCE_AUDIT_REASONS]
+    sample_or_scope_reasons = [reason for reason in reasons if reason in NON_PERFORMANCE_AUDIT_REASONS]
+    return performance_reasons, sample_or_scope_reasons
+
+
+def performance_quality_block_reasons(reasons_value: object) -> str:
+    performance_reasons, _ = split_quality_block_reasons(reasons_value)
+    return "|".join(performance_reasons) if performance_reasons else "PASS"
+
+
+def performance_quality_pass_from_reasons(reasons_value: object) -> bool:
+    performance_reasons, _ = split_quality_block_reasons(reasons_value)
+    return not performance_reasons
+
+
 def feature_group_for_column(col: str) -> str:
     lower = col.lower()
+    intraday_prefixes = tuple(f"{prefix}_" for prefix in INTRADAY_PREFIXES)
+    if lower.startswith(intraday_prefixes) or lower.startswith("intraday_") or lower.startswith("timeframe_") or lower == "daily_signal_available":
+        return "intraday_context"
     if lower.startswith(("tsmc_", "market_", "peer_", "fx_", "external_", "universe_external_")) or "earnings" in lower:
         return "external_context"
     if lower.startswith("hist_"):
@@ -1584,7 +1810,22 @@ def select_fold_features(
     selected_numeric: List[str] = []
     rows: List[Dict] = []
     numeric_data: Dict[str, pd.Series] = {}
-    group_priority = {"score_core": 0, "risk_vol": 1, "trend_momentum": 2, "history_priors": 3, "market_context": 4}
+    group_priority = {"score_core": 0, "risk_vol": 1, "trend_momentum": 2, "history_priors": 3, "intraday_context": 4, "market_context": 5}
+    target_col = f"label_success_{horizon}d"
+    target_values = pd.to_numeric(train[target_col], errors="coerce") if target_col in train.columns else pd.Series(np.nan, index=train.index)
+    target_association_cache: Dict[str, float] = {}
+
+    def target_association(col: str, values: pd.Series) -> float:
+        if col in target_association_cache:
+            return target_association_cache[col]
+        aligned = pd.DataFrame({"feature": pd.to_numeric(values, errors="coerce"), "target": target_values}).dropna()
+        if len(aligned) < MIN_FOLD_VALIDATION_EVENTS or aligned["feature"].nunique() <= 1 or aligned["target"].nunique() <= 1:
+            target_association_cache[col] = 0.0
+            return 0.0
+        corr = aligned["feature"].rank(method="average").corr(aligned["target"].rank(method="average"))
+        target_association_cache[col] = abs(float(corr)) if pd.notna(corr) else 0.0
+        return target_association_cache[col]
+
     for col in numeric_candidates:
         if col not in train.columns:
             continue
@@ -1600,20 +1841,51 @@ def select_fold_features(
             "feature_selection_source": "train_only",
         }
         if is_future_leakage_feature(col):
-            rows.append({**common, "decision": "excluded", "reason": "future_or_label_feature_blocked", "missing_rate": np.nan})
+            rows.append(
+                {
+                    **common,
+                    "decision": "excluded",
+                    "reason": "future_or_label_feature_blocked",
+                    "missing_rate": np.nan,
+                    "target_association": np.nan,
+                }
+            )
             continue
         values = pd.to_numeric(train[col], errors="coerce")
         missing_rate = float(values.isna().mean())
+        association = target_association(col, values)
         non_na = values.dropna()
-        if missing_rate > MISSING_FEATURE_THRESHOLD:
-            rows.append({**common, "decision": "excluded", "reason": "missing_rate_gt_30pct", "missing_rate": missing_rate})
+        if feature_group == "intraday_context":
+            min_non_null = min(MIN_INTRADAY_NON_NULL_EVENTS, max(2, int(len(train) * 0.01)))
+            if missing_rate > INTRADAY_MISSING_FEATURE_THRESHOLD or len(non_na) < min_non_null:
+                rows.append(
+                    {
+                        **common,
+                        "decision": "excluded",
+                        "reason": "intraday_coverage_too_sparse",
+                        "missing_rate": missing_rate,
+                        "non_null_count": int(len(non_na)),
+                        "target_association": association,
+                    }
+                )
+                continue
+        elif missing_rate > MISSING_FEATURE_THRESHOLD:
+            rows.append(
+                {
+                    **common,
+                    "decision": "excluded",
+                    "reason": "missing_rate_gt_30pct",
+                    "missing_rate": missing_rate,
+                    "target_association": association,
+                }
+            )
             continue
         if non_na.nunique() <= 1:
-            rows.append({**common, "decision": "excluded", "reason": "zero_variance", "missing_rate": missing_rate})
+            rows.append({**common, "decision": "excluded", "reason": "zero_variance", "missing_rate": missing_rate, "target_association": association})
             continue
         selected_numeric.append(col)
         numeric_data[col] = values
-        rows.append({**common, "decision": "selected_pre_corr", "reason": "", "missing_rate": missing_rate})
+        rows.append({**common, "decision": "selected_pre_corr", "reason": "", "missing_rate": missing_rate, "target_association": association})
 
     dropped_corr: set[str] = set()
     if len(selected_numeric) > 1:
@@ -1641,6 +1913,7 @@ def select_fold_features(
                             "decision": "excluded",
                             "reason": f"corr_gt_{CORRELATION_FEATURE_THRESHOLD}_with:{col}",
                             "missing_rate": float(pd.to_numeric(train[other], errors="coerce").isna().mean()),
+                            "target_association": target_association(other, pd.to_numeric(train[other], errors="coerce")),
                         }
                     )
 
@@ -1653,6 +1926,7 @@ def select_fold_features(
                 {
                     "feature": col,
                     "group_rank": group_priority.get(feature_group_for_column(col), 9),
+                    "target_association": target_association(col, values),
                     "missing_rate": float(values.isna().mean()),
                     "variance": float(values.var(skipna=True)) if values.notna().any() else 0.0,
                 }
@@ -1673,8 +1947,9 @@ def select_fold_features(
                     "feature_group": feature_group_for_column(col),
                     "feature_selection_source": "train_only",
                     "decision": "excluded",
-                    "reason": "max_25_numeric_features",
+                    "reason": NUMERIC_CAP_EXCLUSION_REASON,
                     "missing_rate": float(pd.to_numeric(train[col], errors="coerce").isna().mean()),
+                    "target_association": target_association(col, pd.to_numeric(train[col], errors="coerce")),
                 }
             )
     selected_categorical: List[str] = []
@@ -1706,8 +1981,49 @@ def select_fold_features(
         if row["decision"] == "selected_pre_corr":
             row["decision"] = "selected" if row["feature"] in final_numeric else "excluded"
             if row["feature"] not in final_numeric and not row["reason"]:
-                row["reason"] = "correlation_filter" if row["feature"] in dropped_corr else "max_25_numeric_features"
+                row["reason"] = "correlation_filter" if row["feature"] in dropped_corr else NUMERIC_CAP_EXCLUSION_REASON
     return final_numeric, selected_categorical, rows
+
+
+def select_multitimeframe_overlay_features(
+    train: pd.DataFrame,
+    numeric_candidates: Sequence[str],
+    categorical_candidates: Sequence[str],
+    include_core_score: bool = True,
+) -> Tuple[List[str], List[str]]:
+    numeric: List[str] = []
+    if include_core_score and "score_price_algo_total" in train.columns:
+        numeric.append("score_price_algo_total")
+    priority_names = {
+        "timeframe_coverage_score",
+        "intraday_any_coverage",
+        "intraday_model_ready",
+        "intraday_execution_ready",
+        "intraday_feature_freshness_minutes",
+    }
+    intraday_numeric: List[tuple[int, float, str]] = []
+    for col in numeric_candidates:
+        if col not in train.columns or col in numeric or is_future_leakage_feature(col):
+            continue
+        if feature_group_for_column(col) != "intraday_context":
+            continue
+        values = pd.to_numeric(train[col], errors="coerce")
+        non_null = int(values.notna().sum())
+        min_non_null = min(MIN_INTRADAY_NON_NULL_EVENTS, max(2, int(len(train) * 0.01)))
+        if non_null < min_non_null:
+            continue
+        intraday_numeric.append((0 if col in priority_names else 1, float(values.isna().mean()), col))
+    numeric.extend(col for _, _, col in sorted(intraday_numeric)[: max(0, MAX_NUMERIC_FEATURES - len(numeric))])
+
+    categorical: List[str] = []
+    for col in categorical_candidates:
+        if col not in train.columns or is_future_leakage_feature(col):
+            continue
+        if feature_group_for_column(col) != "intraday_context":
+            continue
+        if train[col].dropna().nunique() > 1:
+            categorical.append(col)
+    return numeric, categorical
 
 
 def select_elastic_net_params(train: pd.DataFrame, target_col: str, numeric_cols: Sequence[str], categorical_cols: Sequence[str]) -> Dict[str, float]:
@@ -1861,6 +2177,22 @@ def validation_sample_ok(y_true: pd.Series) -> bool:
     return n >= MIN_FOLD_VALIDATION_EVENTS and positives >= MIN_CALIBRATION_CLASS_COUNT and negatives >= MIN_CALIBRATION_CLASS_COUNT
 
 
+def validation_ece_for_probabilities(probabilities: np.ndarray, y_true: pd.Series) -> float:
+    """Weighted expected calibration error of probabilities against labels on a sample."""
+    y = pd.to_numeric(pd.Series(y_true).reset_index(drop=True), errors="coerce")
+    p = pd.Series(np.asarray(probabilities, dtype=float)).reset_index(drop=True)
+    valid = y.notna() & p.notna()
+    if int(valid.sum()) < MIN_FOLD_VALIDATION_EVENTS or y[valid].nunique() < 2:
+        return np.nan
+    bins = adaptive_calibration_bins_core(
+        y[valid].astype(int).to_numpy(),
+        p[valid].to_numpy(dtype=float),
+        target_min_bin_n=MIN_CALIBRATION_BIN_N,
+        max_bins=10,
+    )
+    return expected_calibration_error(bins)
+
+
 def fit_probability_calibrator(probabilities: np.ndarray, y_true: pd.Series) -> Tuple[object | None, str]:
     y = y_true.astype(int)
     valid = pd.Series(probabilities).notna().to_numpy()
@@ -1870,13 +2202,38 @@ def fit_probability_calibrator(probabilities: np.ndarray, y_true: pd.Series) -> 
     negatives = int(n - positives)
     if n < MIN_FOLD_VALIDATION_EVENTS or positives < MIN_CALIBRATION_CLASS_COUNT or negatives < MIN_CALIBRATION_CLASS_COUNT:
         return None, "INSUFFICIENT_CALIBRATION_SAMPLE"
+    probs = np.asarray(probabilities, dtype=float)
+    # Build the candidate calibrator pool. Raw (identity) is always a candidate so an
+    # already well-calibrated stream is never made worse by forcing a fit.
+    candidates: List[Tuple[object | None, str]] = [(None, "validation_raw_uncalibrated")]
     sigmoid = fit_sigmoid_probability_calibrator(probabilities, y_true)
-    if n < 1000:
-        return sigmoid, "validation_sigmoid_fixed" if sigmoid is not None else "none"
-    isotonic = fit_isotonic_probability_calibrator(probabilities, y_true)
-    if isotonic is not None:
-        return isotonic, "validation_isotonic_fixed_n_ge_1000"
-    return sigmoid, "validation_sigmoid_fixed" if sigmoid is not None else "none"
+    if sigmoid is not None:
+        candidates.append((sigmoid, "validation_sigmoid_selected"))
+    if n >= 1000:
+        isotonic = fit_isotonic_probability_calibrator(probabilities, y_true)
+        if isotonic is not None:
+            candidates.append((isotonic, "validation_isotonic_selected"))
+    # Select the calibrator minimizing in-validation ECE. Candidates are ordered from
+    # simplest to most flexible, and ties keep the simpler choice (strict-less-than),
+    # so the more flexible isotonic fit only wins on a real calibration gain.
+    best_cal: object | None = None
+    best_method = "none"
+    best_ece = np.inf
+    for cal, method in candidates:
+        cal_probs = apply_probability_calibrator(probs, cal)
+        ece = validation_ece_for_probabilities(cal_probs, y_true)
+        if pd.isna(ece):
+            continue
+        if ece + 1e-9 < best_ece:
+            best_cal, best_method, best_ece = cal, method, float(ece)
+    if math.isfinite(best_ece):
+        return best_cal, best_method
+    # Fall back to the previous fixed policy if ECE could not be evaluated.
+    if n >= 1000:
+        isotonic = fit_isotonic_probability_calibrator(probabilities, y_true)
+        if isotonic is not None:
+            return isotonic, "validation_isotonic_fixed_n_ge_1000"
+    return (sigmoid, "validation_sigmoid_fixed") if sigmoid is not None else (None, "none")
 
 
 def apply_probability_calibrator(probabilities: np.ndarray, calibrator) -> np.ndarray:
@@ -1887,6 +2244,97 @@ def apply_probability_calibrator(probabilities: np.ndarray, calibrator) -> np.nd
         return np.array([bounded_probability(x) for x in calibrated], dtype=float)
     calibrated = calibrator.predict_proba(np.asarray(probabilities).reshape(-1, 1))[:, 1]
     return np.array([bounded_probability(x) for x in calibrated], dtype=float)
+
+
+def apply_base_rate_probability_shrinkage(probabilities: np.ndarray, base_rate: float, weight: float) -> np.ndarray:
+    base = bounded_probability(base_rate)
+    w = max(0.0, min(float(weight), 1.0))
+    values = (1.0 - w) * np.asarray(probabilities, dtype=float) + w * base
+    return np.array([bounded_probability(x) for x in values], dtype=float)
+
+
+def fit_validation_base_rate_shrinkage(
+    probabilities: np.ndarray,
+    y_true: pd.Series,
+    base_rate: float,
+) -> Dict[str, object]:
+    y = pd.to_numeric(pd.Series(y_true).reset_index(drop=True), errors="coerce")
+    p = pd.Series(np.asarray(probabilities, dtype=float)).reset_index(drop=True)
+    if len(y) != len(p):
+        return {
+            "weight": 0.0,
+            "method": "no_validation_shrinkage_length_mismatch",
+            "raw_brier": np.nan,
+            "shrunk_brier": np.nan,
+            "improvement_lower_bound": np.nan,
+        }
+    valid = y.notna() & p.notna()
+    if int(valid.sum()) < MIN_FOLD_VALIDATION_EVENTS or y[valid].nunique() < 2:
+        return {
+            "weight": 0.0,
+            "method": "no_validation_shrinkage",
+            "raw_brier": np.nan,
+            "shrunk_brier": np.nan,
+            "improvement_lower_bound": np.nan,
+        }
+    y_valid = y[valid].astype(int)
+    p_valid = p[valid].to_numpy(dtype=float)
+    raw_brier = float(brier_score_loss(y_valid, p_valid))
+    best_weight = 0.0
+    best_brier = raw_brier
+    best_lower_bound = -np.inf
+    for weight in PROBABILITY_SHRINKAGE_WEIGHTS:
+        shrunk = apply_base_rate_probability_shrinkage(p_valid, base_rate, float(weight))
+        brier = float(brier_score_loss(y_valid, shrunk))
+        loss_improvement = (p_valid - y_valid.to_numpy(dtype=float)) ** 2 - (shrunk - y_valid.to_numpy(dtype=float)) ** 2
+        mean_improvement = float(loss_improvement.mean()) if len(loss_improvement) else np.nan
+        improvement_se = float(loss_improvement.std(ddof=1) / math.sqrt(len(loss_improvement))) if len(loss_improvement) > 1 else 0.0
+        lower_bound = mean_improvement - improvement_se if pd.notna(mean_improvement) else -np.inf
+        if (
+            weight > 0
+            and brier + MIN_SHRINKAGE_BRIER_IMPROVEMENT < best_brier
+        ):
+            best_weight = float(weight)
+            best_brier = brier
+            best_lower_bound = lower_bound
+    method = f"validation_base_rate_shrink_{best_weight:.2f}" if best_weight > 0 else "validation_no_base_rate_shrinkage"
+    return {
+        "weight": best_weight,
+        "method": method,
+        "raw_brier": raw_brier,
+        "shrunk_brier": best_brier,
+        "improvement_lower_bound": best_lower_bound if best_weight > 0 else 0.0,
+    }
+
+
+def apply_shrinkage_weight_floor(
+    probability_shrinkage: Dict[str, object],
+    *,
+    candidate_scope_name: str,
+    model_name: str,
+) -> Dict[str, object]:
+    if candidate_scope_name != "entry_research" or model_name != "elastic_net_logistic":
+        return probability_shrinkage
+    current_weight = max(0.0, min(float(probability_shrinkage.get("weight", 0.0)), 1.0))
+    floor = float(ENTRY_RESEARCH_ELASTIC_NET_MIN_SHRINKAGE_WEIGHT)
+    if current_weight >= floor:
+        return probability_shrinkage
+    out = dict(probability_shrinkage)
+    out["weight"] = floor
+    out["method"] = f"{probability_shrinkage.get('method', 'validation_shrinkage')}_floor_{floor:.2f}"
+    return out
+
+
+def transform_threshold_for_shrinkage_floor(threshold: float, base_rate: float, original_weight: float, floored_weight: float) -> float:
+    if pd.isna(threshold):
+        return np.nan
+    original = max(0.0, min(float(original_weight), 1.0))
+    floored = max(0.0, min(float(floored_weight), 1.0))
+    if floored <= original or original >= 1.0:
+        return bounded_probability(threshold)
+    base = bounded_probability(base_rate)
+    ratio = (1.0 - floored) / (1.0 - original)
+    return bounded_probability(base + ratio * (float(threshold) - base))
 
 
 def fit_stage_probability_calibrators(stage_result: Dict[str, object], validation: pd.DataFrame, horizon: int) -> Dict[str, object]:
@@ -2061,6 +2509,137 @@ def expected_calibration_error(bins: pd.DataFrame) -> float:
     return float((bins["abs_calibration_error"] * bins["n"]).sum() / bins["n"].sum())
 
 
+def validation_threshold_candidates(
+    y_prob: np.ndarray,
+    thresholds: Sequence[float],
+    default_threshold: float,
+    required_trades: int,
+    *,
+    include_dynamic: bool = True,
+) -> List[Tuple[float, str]]:
+    candidates: List[Tuple[float, str]] = []
+
+    def add_candidate(value: float, source: str) -> None:
+        if pd.isna(value):
+            return
+        bounded = bounded_probability(float(value))
+        if any(abs(bounded - existing) < 1e-9 for existing, _ in candidates):
+            return
+        candidates.append((bounded, source))
+
+    for threshold in thresholds:
+        add_candidate(float(threshold), "FIXED_GRID")
+    add_candidate(float(default_threshold), "DEFAULT")
+
+    if not include_dynamic:
+        return candidates
+
+    probabilities = pd.Series(np.asarray(y_prob, dtype=float)).dropna()
+    if len(probabilities) < required_trades:
+        return candidates
+    sorted_probabilities = np.sort(probabilities.to_numpy(dtype=float))
+    for fraction in VALIDATION_THRESHOLD_TOP_FRACTIONS:
+        top_count = max(required_trades, int(math.ceil(len(sorted_probabilities) * float(fraction))))
+        if top_count > len(sorted_probabilities):
+            continue
+        threshold = float(sorted_probabilities[-top_count])
+        add_candidate(threshold, f"VALIDATION_TOP_{int(float(fraction) * 100)}PCT")
+    return candidates
+
+
+THRESHOLD_SCORE_COLUMNS = [
+    "threshold",
+    "threshold_source",
+    "validation_candidate_eligible",
+    "validation_selected_count",
+    "validation_selected_return_count",
+    "validation_all_expectancy_pct",
+    "validation_expectancy_pct",
+    "validation_uplift_pct",
+    "validation_selected_std_pct",
+    "validation_selected_standard_error_pct",
+    "validation_absolute_lower_bound_pct",
+    "validation_uplift_lower_bound_pct",
+    "validation_utility_lower_bound_pct",
+]
+
+
+def score_threshold_candidates(
+    y_prob: np.ndarray,
+    returns_pct: pd.Series,
+    thresholds: Sequence[float],
+    min_trades: int,
+    default_threshold: float,
+) -> pd.DataFrame:
+    returns = pd.to_numeric(returns_pct, errors="coerce").reset_index(drop=True)
+    probabilities = pd.Series(np.asarray(y_prob, dtype=float)).reset_index(drop=True)
+    required_trades = max(int(min_trades), MIN_THRESHOLD_SELECTED_EVENTS)
+    all_expectancy = float(returns.dropna().mean()) if returns.notna().any() else np.nan
+    if len(probabilities) != len(returns):
+        return pd.DataFrame(columns=THRESHOLD_SCORE_COLUMNS)
+
+    rows: list[dict[str, object]] = []
+    for threshold, source in validation_threshold_candidates(
+        probabilities.to_numpy(dtype=float),
+        thresholds,
+        default_threshold,
+        required_trades,
+        include_dynamic=True,
+    ):
+        mask = probabilities >= threshold
+        selected_returns = returns[mask].dropna()
+        selected_count = int(mask.sum())
+        return_count = int(len(selected_returns))
+        eligible = selected_count >= required_trades and return_count >= required_trades
+        if eligible:
+            expectancy = float(selected_returns.mean())
+            std = float(selected_returns.std(ddof=1)) if return_count > 1 else 0.0
+            standard_error = std / math.sqrt(return_count)
+            absolute_lower_bound = expectancy - standard_error
+            uplift = expectancy - all_expectancy if pd.notna(all_expectancy) else np.nan
+            uplift_lower_bound = uplift - standard_error if pd.notna(uplift) else np.nan
+            utility_lower_bound = min(absolute_lower_bound, uplift_lower_bound) if pd.notna(uplift_lower_bound) else np.nan
+        else:
+            expectancy = np.nan
+            std = np.nan
+            standard_error = np.nan
+            absolute_lower_bound = np.nan
+            uplift = np.nan
+            uplift_lower_bound = np.nan
+            utility_lower_bound = np.nan
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "threshold_source": source,
+                "validation_candidate_eligible": bool(eligible),
+                "validation_selected_count": selected_count,
+                "validation_selected_return_count": return_count,
+                "validation_all_expectancy_pct": all_expectancy,
+                "validation_expectancy_pct": expectancy,
+                "validation_uplift_pct": uplift,
+                "validation_selected_std_pct": std,
+                "validation_selected_standard_error_pct": standard_error,
+                "validation_absolute_lower_bound_pct": absolute_lower_bound,
+                "validation_uplift_lower_bound_pct": uplift_lower_bound,
+                "validation_utility_lower_bound_pct": utility_lower_bound,
+            }
+        )
+    return pd.DataFrame(rows, columns=THRESHOLD_SCORE_COLUMNS)
+
+
+def best_threshold_candidate(scores: pd.DataFrame) -> pd.Series | None:
+    if scores.empty or "validation_candidate_eligible" not in scores.columns:
+        return None
+    eligible = scores[
+        scores["validation_candidate_eligible"].map(to_bool)
+        & pd.to_numeric(scores["validation_utility_lower_bound_pct"], errors="coerce").notna()
+    ]
+    if eligible.empty:
+        return None
+    idx = pd.to_numeric(eligible["validation_utility_lower_bound_pct"], errors="coerce").idxmax()
+    return scores.loc[idx]
+
+
 def choose_threshold(
     y_prob: np.ndarray,
     returns_pct: pd.Series,
@@ -2068,31 +2647,52 @@ def choose_threshold(
     min_trades: int,
     default_threshold: float,
 ) -> Tuple[float, float, int, str]:
-    returns = pd.to_numeric(returns_pct, errors="coerce")
-    required_trades = max(int(min_trades), MIN_THRESHOLD_SELECTED_EVENTS)
-    best_threshold = np.nan
-    best_expectancy = np.nan
-    best_lower_bound = -np.inf
-    best_count = 0
-    for threshold in thresholds:
-        mask = y_prob >= threshold
-        count = int(mask.sum())
-        if count < required_trades:
-            continue
-        selected_returns = returns[mask].dropna()
-        if len(selected_returns) < required_trades:
-            continue
-        expectancy = float(selected_returns.mean())
-        std = float(selected_returns.std(ddof=1)) if len(selected_returns) > 1 else 0.0
-        lower_bound = expectancy - (std / math.sqrt(len(selected_returns)))
-        if pd.notna(lower_bound) and lower_bound > best_lower_bound:
-            best_lower_bound = lower_bound
-            best_expectancy = expectancy
-            best_threshold = float(threshold)
-            best_count = count
-    if best_count == 0:
+    scores = score_threshold_candidates(
+        y_prob,
+        returns_pct,
+        thresholds,
+        min_trades,
+        default_threshold,
+    )
+    best = best_threshold_candidate(scores)
+    if best is None:
         return np.nan, np.nan, 0, "INSUFFICIENT_VALIDATION_SELECTION"
-    return best_threshold, best_expectancy, best_count, "TRAIN_VALIDATION_EXPECTANCY_LOWER_BOUND"
+    return (
+        float(best["threshold"]),
+        float(best["validation_expectancy_pct"]),
+        int(best["validation_selected_count"]),
+        f"TRAIN_VALIDATION_UTILITY_LOWER_BOUND_{best['threshold_source']}",
+    )
+
+
+def top_probability_slice_metrics(
+    y_prob: np.ndarray,
+    returns_pct: pd.Series,
+    y_true: pd.Series,
+    *,
+    fraction: float = 0.20,
+) -> Dict[str, float]:
+    probabilities = pd.Series(np.asarray(y_prob, dtype=float))
+    returns = pd.to_numeric(returns_pct, errors="coerce").reset_index(drop=True)
+    labels = pd.to_numeric(y_true, errors="coerce").reset_index(drop=True)
+    frame = pd.DataFrame({"p": probabilities, "return": returns, "label": labels}).dropna(subset=["p", "return"])
+    if frame.empty:
+        return {
+            "rank_top_quintile_count": 0,
+            "rank_top_quintile_return_pct": np.nan,
+            "rank_top_quintile_minus_all_pct": np.nan,
+            "rank_top_quintile_success_rate": np.nan,
+        }
+    top_count = max(1, int(math.ceil(len(frame) * float(fraction))))
+    top = frame.sort_values("p", ascending=False).head(top_count)
+    all_return = float(frame["return"].mean())
+    top_return = float(top["return"].mean())
+    return {
+        "rank_top_quintile_count": int(len(top)),
+        "rank_top_quintile_return_pct": top_return,
+        "rank_top_quintile_minus_all_pct": top_return - all_return,
+        "rank_top_quintile_success_rate": float(top["label"].mean()) if top["label"].notna().any() else np.nan,
+    }
 
 
 def purge_history_against_eval(
@@ -2233,6 +2833,7 @@ def evaluate_sparse_trade_ready_diagnostic(
         returns = pd.to_numeric(test[return_col], errors="coerce")
         selected = test_prob >= threshold
         selected_returns = returns[selected]
+        rank_metrics = top_probability_slice_metrics(test_prob, returns, y_test)
         selected_return_std = float(selected_returns.std(ddof=1)) if len(selected_returns) > 1 else 0.0
         selected_expectancy_ci_lower = (
             float(selected_returns.mean()) - selected_return_std / math.sqrt(len(selected_returns))
@@ -2345,6 +2946,7 @@ def evaluate_sparse_trade_ready_diagnostic(
                 "mean_p_positive_given_survival": safe_nanmean(test_positive),
                 "mean_effective_sample_size": safe_nanmean(effective_n),
                 "all_signal_expectancy_pct": float(returns.mean()),
+                **rank_metrics,
                 "selected_signal_count": int(selected.sum()),
                 "selected_signal_expectancy_pct": float(selected_returns.mean()) if len(selected_returns) else np.nan,
                 "selected_signal_expectancy_ci_lower_pct": selected_expectancy_ci_lower,
@@ -2487,6 +3089,8 @@ def evaluate_prediction_stream(
             "base_rate_by_trigger_regime",
             "score_logistic",
             "elastic_net_logistic",
+            "multitimeframe_overlay",
+            "coverage_aware_ensemble",
         ]
     elif candidate_scope_name == "trigger_all":
         model_names = [
@@ -2495,6 +3099,19 @@ def evaluate_prediction_stream(
             "score_logistic",
             "elastic_net_logistic",
             "logistic_balanced",
+            "multitimeframe_overlay",
+            "coverage_aware_ensemble",
+        ]
+    elif candidate_scope_name == NEXT_DAY_UP_SCOPE:
+        model_names = [
+            "empirical_bayes_group_rate",
+            "base_rate_by_trigger_regime",
+            "score_logistic",
+            "elastic_net_logistic",
+            "logistic_balanced",
+            "hist_gradient_boosting_fixed",
+            "multitimeframe_overlay",
+            "coverage_aware_ensemble",
         ]
     else:
         model_names = ["empirical_bayes_group_rate", "base_rate_by_trigger_regime"]
@@ -2521,6 +3138,14 @@ def evaluate_prediction_stream(
         train_feature_basis, _ = add_train_history_features(train, train, target_col, return_col, exit_col)
 
         for model_name in model_names:
+            probability_shrinkage: Dict[str, object] = {
+                "weight": 0.0,
+                "method": "not_evaluated",
+                "raw_brier": np.nan,
+                "shrunk_brier": np.nan,
+                "improvement_lower_bound": np.nan,
+            }
+            threshold_reference_shrinkage_weight = 0.0
             selected_numeric, selected_categorical, selected_rows = select_fold_features(
                 train_feature_basis,
                 numeric_cols,
@@ -2533,6 +3158,12 @@ def evaluate_prediction_stream(
             feature_rows.extend(selected_rows)
             if model_name == "score_logistic":
                 selected_numeric, selected_categorical = ["score_price_algo_total"], []
+            elif model_name == "multitimeframe_overlay":
+                selected_numeric, selected_categorical = select_multitimeframe_overlay_features(train_feature_basis, numeric_cols, categorical_cols)
+            elif model_name == "coverage_aware_ensemble":
+                overlay_numeric, overlay_categorical = select_multitimeframe_overlay_features(train_feature_basis, numeric_cols, categorical_cols)
+                selected_numeric = list(dict.fromkeys([*selected_numeric, *overlay_numeric]))
+                selected_categorical = list(dict.fromkeys([*selected_categorical, *overlay_categorical]))
             elif model_name in {"base_rate_by_trigger_regime", "empirical_bayes_group_rate"}:
                 selected_numeric, selected_categorical = [], []
 
@@ -2544,6 +3175,18 @@ def evaluate_prediction_stream(
                 else:
                     val_result = two_stage_predict_model(model_name, train_core, validation, horizon, selected_numeric, selected_categorical)
                     val_prob = val_result["probabilities"]
+                    train_core_base_rate = bounded_probability(pd.to_numeric(train_core[target_col], errors="coerce").mean())
+                    probability_shrinkage = fit_validation_base_rate_shrinkage(val_prob, validation[target_col], train_core_base_rate)
+                    probability_shrinkage = apply_shrinkage_weight_floor(
+                        probability_shrinkage,
+                        candidate_scope_name=candidate_scope_name,
+                        model_name=model_name,
+                    )
+                    val_prob = apply_base_rate_probability_shrinkage(
+                        val_prob,
+                        train_core_base_rate,
+                        float(probability_shrinkage["weight"]),
+                    )
                     threshold, val_expectancy, val_count, threshold_source = choose_threshold(
                         val_prob,
                         validation[return_col],
@@ -2553,6 +3196,12 @@ def evaluate_prediction_stream(
                     )
                 test_result = two_stage_predict_model(model_name, train, test, horizon, selected_numeric, selected_categorical)
                 test_prob = test_result["probabilities"]
+                test_base_rate = bounded_probability(pd.to_numeric(train[target_col], errors="coerce").mean())
+                test_prob = apply_base_rate_probability_shrinkage(
+                    test_prob,
+                    test_base_rate,
+                    float(probability_shrinkage["weight"]),
+                )
                 test_survival = test_result["p_stop_survival"]
                 test_positive = test_result["p_positive_given_survival"]
                 effective_n = test_result["effective_n"]
@@ -2577,16 +3226,35 @@ def evaluate_prediction_stream(
                     )
                     if model_name == "score_logistic":
                         core_numeric, core_categorical = ["score_price_algo_total"], []
+                    elif model_name == "multitimeframe_overlay":
+                        core_numeric, core_categorical = select_multitimeframe_overlay_features(train_core_feature_basis, numeric_cols, categorical_cols)
+                    elif model_name == "coverage_aware_ensemble":
+                        overlay_numeric, overlay_categorical = select_multitimeframe_overlay_features(train_core_feature_basis, numeric_cols, categorical_cols)
+                        core_numeric = list(dict.fromkeys([*core_numeric, *overlay_numeric]))
+                        core_categorical = list(dict.fromkeys([*core_categorical, *overlay_categorical]))
                     val_result = two_stage_predict_model(model_name, train_core, validation, horizon, core_numeric, core_categorical)
                     stage_calibrators = fit_stage_probability_calibrators(val_result, validation, horizon)
                     calibration_method = str(stage_calibrators["method"])
                     val_prob, _, _ = apply_stage_probability_calibrators(val_result, stage_calibrators)
+                    train_core_base_rate = bounded_probability(pd.to_numeric(train_core[target_col], errors="coerce").mean())
+                    probability_shrinkage = fit_validation_base_rate_shrinkage(val_prob, validation[target_col], train_core_base_rate)
+                    threshold_reference_shrinkage_weight = float(probability_shrinkage["weight"])
+                    val_prob = apply_base_rate_probability_shrinkage(
+                        val_prob,
+                        train_core_base_rate,
+                        threshold_reference_shrinkage_weight,
+                    )
                     threshold, val_expectancy, val_count, threshold_source = choose_threshold(
                         val_prob,
                         validation[return_col],
                         thresholds,
                         min_validation_trades,
                         default_threshold,
+                    )
+                    probability_shrinkage = apply_shrinkage_weight_floor(
+                        probability_shrinkage,
+                        candidate_scope_name=candidate_scope_name,
+                        model_name=model_name,
                     )
                 if calibration_method == "INSUFFICIENT_CALIBRATION_SAMPLE":
                     base_prob, base_n = base_rate_predict_with_effective_n(train, test, target_col)
@@ -2600,6 +3268,21 @@ def evaluate_prediction_stream(
                     if validation.empty:
                         stage_calibrators = None
                     test_prob, test_survival, test_positive = apply_stage_probability_calibrators(test_result, stage_calibrators)
+                    test_base_rate = bounded_probability(pd.to_numeric(train[target_col], errors="coerce").mean())
+                    floored_weight = float(probability_shrinkage["weight"])
+                    if floored_weight > threshold_reference_shrinkage_weight:
+                        threshold = transform_threshold_for_shrinkage_floor(
+                            threshold,
+                            test_base_rate,
+                            threshold_reference_shrinkage_weight,
+                            floored_weight,
+                        )
+                        threshold_source = f"{threshold_source}|SHRINK_FLOOR_RANK_PRESERVED"
+                    test_prob = apply_base_rate_probability_shrinkage(
+                        test_prob,
+                        test_base_rate,
+                        floored_weight,
+                    )
                     effective_n = test_result["effective_n"]
                     fallback_reason = test_result["fallback_reason"]
 
@@ -2607,6 +3290,7 @@ def evaluate_prediction_stream(
             returns = pd.to_numeric(test[return_col], errors="coerce")
             selected = test_prob >= threshold if pd.notna(threshold) else np.zeros(len(test_prob), dtype=bool)
             selected_returns = returns[selected]
+            rank_metrics = top_probability_slice_metrics(test_prob, returns, y_test)
             selected_return_std = float(selected_returns.std(ddof=1)) if len(selected_returns) > 1 else 0.0
             selected_expectancy_ci_lower = (
                 float(selected_returns.mean()) - selected_return_std / math.sqrt(len(selected_returns))
@@ -2669,6 +3353,8 @@ def evaluate_prediction_stream(
                         "test_start_date": test["date"].min(),
                         "test_end_date": test["date"].max(),
                         "calibration_method": calibration_method,
+                        "probability_shrinkage_method": probability_shrinkage["method"],
+                        "probability_shrinkage_weight": probability_shrinkage["weight"],
                         "threshold_source": threshold_source,
                         "fallback_reason": fallback_reason,
                     }
@@ -2712,6 +3398,11 @@ def evaluate_prediction_stream(
                     "threshold": threshold,
                     "threshold_source": threshold_source,
                     "calibration_method": calibration_method,
+                    "probability_shrinkage_method": probability_shrinkage["method"],
+                    "probability_shrinkage_weight": probability_shrinkage["weight"],
+                    "validation_brier_raw_before_shrinkage": probability_shrinkage["raw_brier"],
+                    "validation_brier_after_shrinkage": probability_shrinkage["shrunk_brier"],
+                    "validation_brier_shrinkage_improvement_lower_bound": probability_shrinkage["improvement_lower_bound"],
                     "fallback_reason": fallback_reason,
                     "model_feature_count": len(numeric_cols) + len(categorical_cols),
                     "selected_model_feature_count": len(selected_numeric) + len(selected_categorical),
@@ -2719,6 +3410,7 @@ def evaluate_prediction_stream(
                     "mean_p_positive_given_survival": safe_nanmean(test_positive),
                     "mean_effective_sample_size": safe_nanmean(effective_n),
                     "all_signal_expectancy_pct": float(returns.mean()),
+                    **rank_metrics,
                     "selected_signal_count": int(selected.sum()),
                     "selected_signal_expectancy_pct": float(selected_returns.mean()) if len(selected_returns) else np.nan,
                     "selected_signal_expectancy_ci_lower_pct": selected_expectancy_ci_lower,
@@ -2728,6 +3420,41 @@ def evaluate_prediction_stream(
                     "expectancy_improvement_pct": (float(selected_returns.mean()) - float(returns.mean())) if len(selected_returns) else np.nan,
                 }
             )
+            threshold_scores = score_threshold_candidates(
+                val_prob,
+                validation[return_col],
+                thresholds,
+                min_validation_trades,
+                default_threshold,
+            )
+            best_threshold_score = best_threshold_candidate(threshold_scores)
+            threshold_score_fields = {
+                "validation_all_expectancy_pct": np.nan,
+                "validation_uplift_pct": np.nan,
+                "validation_selected_std_pct": np.nan,
+                "validation_selected_standard_error_pct": np.nan,
+                "validation_absolute_lower_bound_pct": np.nan,
+                "validation_uplift_lower_bound_pct": np.nan,
+                "validation_utility_lower_bound_pct": np.nan,
+                "validation_threshold_candidate_count": int(len(threshold_scores)),
+                "validation_threshold_eligible_candidate_count": int(
+                    threshold_scores.get("validation_candidate_eligible", pd.Series(dtype=bool)).map(to_bool).sum()
+                ) if not threshold_scores.empty else 0,
+                "validation_best_candidate_source": "",
+            }
+            if best_threshold_score is not None:
+                threshold_score_fields.update(
+                    {
+                        "validation_all_expectancy_pct": best_threshold_score.get("validation_all_expectancy_pct", np.nan),
+                        "validation_uplift_pct": best_threshold_score.get("validation_uplift_pct", np.nan),
+                        "validation_selected_std_pct": best_threshold_score.get("validation_selected_std_pct", np.nan),
+                        "validation_selected_standard_error_pct": best_threshold_score.get("validation_selected_standard_error_pct", np.nan),
+                        "validation_absolute_lower_bound_pct": best_threshold_score.get("validation_absolute_lower_bound_pct", np.nan),
+                        "validation_uplift_lower_bound_pct": best_threshold_score.get("validation_uplift_lower_bound_pct", np.nan),
+                        "validation_utility_lower_bound_pct": best_threshold_score.get("validation_utility_lower_bound_pct", np.nan),
+                        "validation_best_candidate_source": best_threshold_score.get("threshold_source", ""),
+                    }
+                )
             threshold_rows.append(
                 {
                     "horizon_days": horizon,
@@ -2743,6 +3470,9 @@ def evaluate_prediction_stream(
                     "validation_negative_count": validation_neg,
                     "validation_sample_sufficient": validation_ok,
                     "min_validation_trades": min_validation_trades,
+                    "probability_shrinkage_method": probability_shrinkage["method"],
+                    "probability_shrinkage_weight": probability_shrinkage["weight"],
+                    **threshold_score_fields,
                 }
             )
 
@@ -2779,8 +3509,20 @@ def aggregate_model_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
                 return np.nan
             return float((group[col] * weights).sum() / weight_sum) if weight_sum else np.nan
 
+        def count_weighted(value_col: str, count_col: str) -> float:
+            if value_col not in group.columns or count_col not in group.columns:
+                return np.nan
+            value = pd.to_numeric(group[value_col], errors="coerce")
+            count = pd.to_numeric(group[count_col], errors="coerce").fillna(0.0)
+            valid = value.notna() & (count > 0)
+            denominator = float(count[valid].sum())
+            if denominator <= 0:
+                return np.nan
+            return float((value[valid] * count[valid]).sum() / denominator)
+
         oos_events = int(group["test_event_count"].sum())
         selected_count = int(group["selected_signal_count"].sum())
+        rank_top_count = int(pd.to_numeric(group.get("rank_top_quintile_count", pd.Series([0])), errors="coerce").fillna(0).sum())
         brier = weighted("brier_score")
         base_brier = weighted("base_rate_brier_score")
         brier_improvement = (base_brier - brier) / base_brier * 100.0 if base_brier > 0 else np.nan
@@ -2790,18 +3532,88 @@ def aggregate_model_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
         ece = decision_ece_value
         fixed_width_ece = weighted("fixed_width_ece") if "fixed_width_ece" in group.columns else np.nan
         expectancy_all = weighted("all_signal_expectancy_pct")
-        if selected_count:
-            selected_expectancy = float(
-                (group["selected_signal_expectancy_pct"].fillna(0) * group["selected_signal_count"]).sum() / selected_count
+        probability_shrinkage_weight = weighted("probability_shrinkage_weight") if "probability_shrinkage_weight" in group.columns else np.nan
+        probability_shrinkage_applied_fold_count = (
+            int((pd.to_numeric(group.get("probability_shrinkage_weight", pd.Series(dtype=float)), errors="coerce").fillna(0.0) > 0.0).sum())
+            if "probability_shrinkage_weight" in group.columns
+            else 0
+        )
+        if {"validation_brier_raw_before_shrinkage", "validation_brier_after_shrinkage"}.issubset(group.columns):
+            raw_validation_brier = weighted("validation_brier_raw_before_shrinkage")
+            shrunk_validation_brier = weighted("validation_brier_after_shrinkage")
+            validation_brier_shrinkage_improvement = (
+                raw_validation_brier - shrunk_validation_brier
+                if pd.notna(raw_validation_brier) and pd.notna(shrunk_validation_brier)
+                else np.nan
             )
         else:
-            selected_expectancy = np.nan
-        expectancy_improvement = selected_expectancy - expectancy_all if pd.notna(selected_expectancy) else np.nan
-        if selected_count:
-            selected_ci_values = pd.to_numeric(group.get("selected_signal_expectancy_ci_lower_pct", pd.Series(dtype=float)), errors="coerce").dropna()
-            selected_expectancy_ci_lower = float(selected_ci_values.min()) if not selected_ci_values.empty else np.nan
+            validation_brier_shrinkage_improvement = np.nan
+        validation_brier_shrinkage_improvement_lower_bound = (
+            weighted("validation_brier_shrinkage_improvement_lower_bound")
+            if "validation_brier_shrinkage_improvement_lower_bound" in group.columns
+            else np.nan
+        )
+        rank_top_return = count_weighted("rank_top_quintile_return_pct", "rank_top_quintile_count")
+        rank_top_success = count_weighted("rank_top_quintile_success_rate", "rank_top_quintile_count")
+        rank_top_minus_all = rank_top_return - expectancy_all if pd.notna(rank_top_return) and pd.notna(expectancy_all) else np.nan
+        rank_fold_uplifts = pd.to_numeric(group.get("rank_top_quintile_minus_all_pct", pd.Series(dtype=float)), errors="coerce").dropna()
+        rank_top_fold_count = int(len(rank_fold_uplifts))
+        rank_top_positive_folds = int((rank_fold_uplifts > 0.0).sum()) if rank_top_fold_count else 0
+        rank_top_positive_fold_rate = rank_top_positive_folds / rank_top_fold_count if rank_top_fold_count else np.nan
+        rank_top_min_fold_uplift = float(rank_fold_uplifts.min()) if rank_top_fold_count else np.nan
+        if rank_top_fold_count > 1:
+            rank_top_se_lower = float(rank_fold_uplifts.mean() - rank_fold_uplifts.std(ddof=1) / math.sqrt(rank_top_fold_count))
+        elif rank_top_fold_count == 1:
+            rank_top_se_lower = float(rank_fold_uplifts.iloc[0])
         else:
+            rank_top_se_lower = np.nan
+        rank_policy_diagnostic_pass = bool(
+            rank_top_count >= MIN_SELECTED_OOS_EVENTS
+            and rank_top_fold_count >= MIN_POSITIVE_EXPECTANCY_FOLDS
+            and rank_top_positive_folds >= MIN_POSITIVE_EXPECTANCY_FOLDS
+            and pd.notna(rank_top_se_lower)
+            and rank_top_se_lower > 0.0
+        )
+        if selected_count:
+            selected_means = pd.to_numeric(
+                group["selected_signal_expectancy_pct"] if "selected_signal_expectancy_pct" in group.columns else pd.Series(np.nan, index=group.index),
+                errors="coerce",
+            )
+            selected_counts = pd.to_numeric(
+                group["selected_signal_count"] if "selected_signal_count" in group.columns else pd.Series(0.0, index=group.index),
+                errors="coerce",
+            ).fillna(0.0)
+            selected_stds = pd.to_numeric(
+                group["selected_signal_return_std_pct"] if "selected_signal_return_std_pct" in group.columns else pd.Series(0.0, index=group.index),
+                errors="coerce",
+            ).fillna(0.0)
+            valid_selected = selected_means.notna() & (selected_counts > 0)
+            selected_n = float(selected_counts[valid_selected].sum())
+            if selected_n > 0:
+                selected_expectancy = float((selected_means[valid_selected] * selected_counts[valid_selected]).sum() / selected_n)
+                selected_sum_sq = 0.0
+                for count_value, mean_value, std_value in zip(
+                    selected_counts[valid_selected],
+                    selected_means[valid_selected],
+                    selected_stds[valid_selected],
+                ):
+                    count_float = float(count_value)
+                    mean_float = float(mean_value)
+                    std_float = float(std_value) if pd.notna(std_value) else 0.0
+                    if count_float > 1:
+                        selected_sum_sq += (count_float - 1.0) * (std_float**2)
+                    selected_sum_sq += count_float * ((mean_float - selected_expectancy) ** 2)
+                selected_pooled_std = math.sqrt(selected_sum_sq / (selected_n - 1.0)) if selected_n > 1 else 0.0
+                selected_expectancy_ci_lower = selected_expectancy - (selected_pooled_std / math.sqrt(selected_n)) if selected_n > 0 else np.nan
+            else:
+                selected_expectancy = np.nan
+                selected_expectancy_ci_lower = np.nan
+        else:
+            selected_expectancy = np.nan
             selected_expectancy_ci_lower = np.nan
+        expectancy_improvement = selected_expectancy - expectancy_all if pd.notna(selected_expectancy) else np.nan
+        selected_ci_values = pd.to_numeric(group.get("selected_signal_expectancy_ci_lower_pct", pd.Series(dtype=float)), errors="coerce").dropna()
+        min_fold_selected_expectancy_ci_lower = float(selected_ci_values.min()) if not selected_ci_values.empty else np.nan
         positive_expectancy_folds = int((group["selected_signal_expectancy_pct"] > 0).sum())
         selected_positive_folds = int((group["selected_signal_count"] > 0).sum())
         min_selected_events_per_fold = int(pd.to_numeric(group.get("selected_signal_count", pd.Series([0])), errors="coerce").fillna(0).min())
@@ -2824,7 +3636,58 @@ def aggregate_model_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
             model_policy = "RESEARCH_ONLY"
         else:
             model_policy = "DECISION_CANDIDATE"
-        quality_pass = (
+        row_data = {
+            "candidate_scope": candidate_scope_name,
+            "horizon_days": horizon,
+            "model_name": model_name,
+            "fold_count": group["fold_id"].nunique(),
+            "oos_event_count": oos_events,
+            "selected_oos_event_count": selected_count,
+            "brier_score": brier,
+            "base_rate_brier_score": base_brier,
+            "brier_improvement_pct": brier_improvement,
+            "log_loss": weighted("log_loss"),
+            "pr_auc": pr_auc,
+            "base_rate_pr_auc": base_pr_auc,
+            "ece": ece,
+            "decision_ece": decision_ece_value,
+            "decision_min_calibration_bin_n": min_calibration_bin_n,
+            "calibration_binning_primary": calibration_binning_primary_core(),
+            "fixed_width_ece": fixed_width_ece,
+            "fixed_width_min_calibration_bin_n": fixed_width_min_bin_n,
+            "probability_shrinkage_weight": probability_shrinkage_weight,
+            "probability_shrinkage_applied_fold_count": probability_shrinkage_applied_fold_count,
+            "validation_brier_shrinkage_improvement": validation_brier_shrinkage_improvement,
+            "validation_brier_shrinkage_improvement_lower_bound": validation_brier_shrinkage_improvement_lower_bound,
+            "all_signal_expectancy_pct": expectancy_all,
+            "rank_top_quintile_count": rank_top_count,
+            "rank_top_quintile_return_pct": rank_top_return,
+            "rank_top_quintile_minus_all_pct": rank_top_minus_all,
+            "rank_top_quintile_success_rate": rank_top_success,
+            "rank_top_quintile_fold_count": rank_top_fold_count,
+            "rank_top_quintile_positive_folds": rank_top_positive_folds,
+            "rank_top_quintile_positive_fold_rate": rank_top_positive_fold_rate,
+            "rank_top_quintile_min_fold_uplift_pct": rank_top_min_fold_uplift,
+            "rank_top_quintile_se_lower_pct": rank_top_se_lower,
+            "rank_policy_diagnostic_pass": rank_policy_diagnostic_pass,
+            "selected_signal_expectancy_pct": selected_expectancy,
+            "selected_signal_expectancy_ci_lower_pct": selected_expectancy_ci_lower,
+            "min_fold_selected_expectancy_ci_lower_pct": min_fold_selected_expectancy_ci_lower,
+            "selected_expectancy_ci_method": "pooled_oos_selected_event_one_se",
+            "expectancy_improvement_pct": expectancy_improvement,
+            "selected_minus_rule_all_pct": expectancy_improvement,
+            "positive_expectancy_folds": positive_expectancy_folds,
+            "selected_positive_folds": selected_positive_folds,
+            "min_selected_events_per_fold": min_selected_events_per_fold,
+            "threshold_iqr": threshold_iqr,
+            "min_calibration_bin_n": min_calibration_bin_n,
+            "mean_effective_sample_size": weighted("mean_effective_sample_size") if "mean_effective_sample_size" in group.columns else np.nan,
+            "min_decision_oos_events": MIN_DECISION_OOS_EVENTS,
+            "min_selected_oos_events": MIN_SELECTED_OOS_EVENTS,
+            "decision_scope_eligible": bool(is_20d_trade_ready),
+            "model_policy": model_policy,
+        }
+        strict_quality_pass = (
             model_name in DECISION_MODELS
             and oos_events >= MIN_DECISION_OOS_EVENTS
             and selected_count >= MIN_SELECTED_OOS_EVENTS
@@ -2844,47 +3707,16 @@ def aggregate_model_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
             and pd.notna(threshold_iqr)
             and threshold_iqr <= MAX_THRESHOLD_IQR
         )
-        rows.append(
-            {
-                "candidate_scope": candidate_scope_name,
-                "horizon_days": horizon,
-                "model_name": model_name,
-                "fold_count": group["fold_id"].nunique(),
-                "oos_event_count": oos_events,
-                "selected_oos_event_count": selected_count,
-                "brier_score": brier,
-                "base_rate_brier_score": base_brier,
-                "brier_improvement_pct": brier_improvement,
-                "log_loss": weighted("log_loss"),
-                "pr_auc": pr_auc,
-                "base_rate_pr_auc": base_pr_auc,
-                "ece": ece,
-                "decision_ece": decision_ece_value,
-                "decision_min_calibration_bin_n": min_calibration_bin_n,
-                "calibration_binning_primary": calibration_binning_primary_core(),
-                "fixed_width_ece": fixed_width_ece,
-                "fixed_width_min_calibration_bin_n": fixed_width_min_bin_n,
-                "all_signal_expectancy_pct": expectancy_all,
-                "selected_signal_expectancy_pct": selected_expectancy,
-                "selected_signal_expectancy_ci_lower_pct": selected_expectancy_ci_lower,
-                "expectancy_improvement_pct": expectancy_improvement,
-                "selected_minus_rule_all_pct": expectancy_improvement,
-                "positive_expectancy_folds": positive_expectancy_folds,
-                "selected_positive_folds": selected_positive_folds,
-                "min_selected_events_per_fold": min_selected_events_per_fold,
-                "threshold_iqr": threshold_iqr,
-                "min_calibration_bin_n": min_calibration_bin_n,
-                "mean_effective_sample_size": weighted("mean_effective_sample_size") if "mean_effective_sample_size" in group.columns else np.nan,
-                "min_decision_oos_events": MIN_DECISION_OOS_EVENTS,
-                "min_selected_oos_events": MIN_SELECTED_OOS_EVENTS,
-                "decision_scope_eligible": bool(is_20d_trade_ready),
-                "model_policy": model_policy,
-                "prediction_quality_pass": bool(quality_pass),
-            }
-        )
+        directional_quality_pass = next_day_directional_diagnostic_pass(pd.Series(row_data))
+        row_data["directional_diagnostic_quality_pass"] = bool(directional_quality_pass)
+        row_data["prediction_quality_pass"] = bool(strict_quality_pass or directional_quality_pass)
+        rows.append(row_data)
     out = pd.DataFrame(rows)
     if out.empty:
         return out
+    out["quality_block_reasons"] = out.apply(model_quality_block_reasons, axis=1)
+    out["performance_quality_block_reasons"] = out["quality_block_reasons"].map(performance_quality_block_reasons)
+    out["performance_quality_pass"] = out["quality_block_reasons"].map(performance_quality_pass_from_reasons)
     out["rank_score"] = (
         out["prediction_quality_pass"].astype(int) * 1000
         + out["expectancy_improvement_pct"].fillna(-999)
@@ -2928,25 +3760,56 @@ def build_model_audit(metrics: pd.DataFrame, comparison: pd.DataFrame, calibrati
         return pd.DataFrame()
     rows = []
     for _, row in comparison.iterrows():
-        part = metrics[
-            (metrics["candidate_scope"] == row["candidate_scope"])
-            & (metrics["horizon_days"] == row["horizon_days"])
-            & (metrics["model_name"] == row["model_name"])
-        ]
-        bins = calibration[
-            (calibration["candidate_scope"] == row["candidate_scope"])
-            & (calibration["horizon_days"] == row["horizon_days"])
-            & (calibration["model_name"] == row["model_name"])
-        ]
+        if {"candidate_scope", "horizon_days", "model_name"}.issubset(metrics.columns):
+            part = metrics[
+                (metrics["candidate_scope"] == row["candidate_scope"])
+                & (metrics["horizon_days"] == row["horizon_days"])
+                & (metrics["model_name"] == row["model_name"])
+            ]
+        else:
+            part = pd.DataFrame()
+        if {"candidate_scope", "horizon_days", "model_name"}.issubset(calibration.columns):
+            bins = calibration[
+                (calibration["candidate_scope"] == row["candidate_scope"])
+                & (calibration["horizon_days"] == row["horizon_days"])
+                & (calibration["model_name"] == row["model_name"])
+            ]
+        else:
+            bins = pd.DataFrame()
         if "binning" in bins.columns:
             reliability_bins = bins[bins["binning"].fillna("fixed_width").eq("fixed_width")]
         else:
             reliability_bins = bins
-        thresholds = threshold_policy[
-            (threshold_policy["candidate_scope"] == row["candidate_scope"])
-            & (threshold_policy["horizon_days"] == row["horizon_days"])
-            & (threshold_policy["model_name"] == row["model_name"])
-        ]
+        if {"candidate_scope", "horizon_days", "model_name"}.issubset(threshold_policy.columns):
+            thresholds = threshold_policy[
+                (threshold_policy["candidate_scope"] == row["candidate_scope"])
+                & (threshold_policy["horizon_days"] == row["horizon_days"])
+                & (threshold_policy["model_name"] == row["model_name"])
+            ]
+        else:
+            thresholds = pd.DataFrame()
+        validation_utility = pd.to_numeric(
+            thresholds.get("validation_utility_lower_bound_pct", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        validation_eligible_counts = pd.to_numeric(
+            thresholds.get("validation_threshold_eligible_candidate_count", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        validation_threshold_candidate_counts = pd.to_numeric(
+            thresholds.get("validation_threshold_candidate_count", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        validation_utility_fold_count = int(len(validation_utility))
+        validation_positive_utility_folds = int((validation_utility > 0.0).sum()) if validation_utility_fold_count else 0
+        min_validation_utility_lower_bound_pct = float(validation_utility.min()) if validation_utility_fold_count else np.nan
+        median_validation_utility_lower_bound_pct = float(validation_utility.median()) if validation_utility_fold_count else np.nan
+        min_validation_threshold_eligible_candidate_count = (
+            int(validation_eligible_counts.min()) if not validation_eligible_counts.empty else np.nan
+        )
+        min_validation_threshold_candidate_count = (
+            int(validation_threshold_candidate_counts.min()) if not validation_threshold_candidate_counts.empty else np.nan
+        )
         if reliability_bins.empty or reliability_bins["n"].sum() == 0:
             reliability = resolution = uncertainty = np.nan
         else:
@@ -2986,6 +3849,8 @@ def build_model_audit(metrics: pd.DataFrame, comparison: pd.DataFrame, calibrati
             block_reasons.append("CALIBRATION_MIN_BIN_N_LT_30")
         if pd.isna(row.get("threshold_iqr")) or row.get("threshold_iqr") > MAX_THRESHOLD_IQR:
             block_reasons.append("THRESHOLD_IQR_GT_0_10")
+        quality_block_reason_text = "|".join(block_reasons) if block_reasons else "PASS"
+        performance_quality_block_reason_text = performance_quality_block_reasons(quality_block_reason_text)
         rows.append(
             {
                 "candidate_scope": row["candidate_scope"],
@@ -2993,7 +3858,10 @@ def build_model_audit(metrics: pd.DataFrame, comparison: pd.DataFrame, calibrati
                 "model_name": row["model_name"],
                 "model_policy": row.get("model_policy", "UNKNOWN"),
                 "prediction_quality_pass": row["prediction_quality_pass"],
-                "quality_block_reasons": "|".join(block_reasons) if block_reasons else "PASS",
+                "performance_quality_pass": performance_quality_pass_from_reasons(quality_block_reason_text),
+                "rank_score": row.get("rank_score", np.nan),
+                "quality_block_reasons": quality_block_reason_text,
+                "performance_quality_block_reasons": performance_quality_block_reason_text,
                 "fold_count": row["fold_count"],
                 "oos_event_count": row["oos_event_count"],
                 "selected_oos_event_count": row["selected_oos_event_count"],
@@ -3011,19 +3879,394 @@ def build_model_audit(metrics: pd.DataFrame, comparison: pd.DataFrame, calibrati
                 "calibration_binning_primary": row.get("calibration_binning_primary", calibration_binning_primary_core()),
                 "fixed_width_ece": row.get("fixed_width_ece", np.nan),
                 "fixed_width_min_calibration_bin_n": row.get("fixed_width_min_calibration_bin_n", np.nan),
+                "probability_shrinkage_weight": row.get("probability_shrinkage_weight", np.nan),
+                "probability_shrinkage_applied_fold_count": row.get("probability_shrinkage_applied_fold_count", 0),
+                "validation_brier_shrinkage_improvement": row.get("validation_brier_shrinkage_improvement", np.nan),
+                "validation_brier_shrinkage_improvement_lower_bound": row.get("validation_brier_shrinkage_improvement_lower_bound", np.nan),
                 "pr_auc": row["pr_auc"],
                 "base_rate_pr_auc": row["base_rate_pr_auc"],
                 "expectancy_improvement_pct": row["expectancy_improvement_pct"],
                 "selected_signal_expectancy_ci_lower_pct": row.get("selected_signal_expectancy_ci_lower_pct", np.nan),
+                "min_fold_selected_expectancy_ci_lower_pct": row.get("min_fold_selected_expectancy_ci_lower_pct", np.nan),
+                "selected_expectancy_ci_method": row.get("selected_expectancy_ci_method", ""),
                 "selected_minus_rule_all_pct": row.get("selected_minus_rule_all_pct", np.nan),
                 "positive_expectancy_folds": row.get("positive_expectancy_folds", 0),
                 "min_selected_events_per_fold": row.get("min_selected_events_per_fold", 0),
                 "threshold_iqr": row.get("threshold_iqr", np.nan),
                 "min_calibration_bin_n": row.get("min_calibration_bin_n", 0),
                 "mean_effective_sample_size": row.get("mean_effective_sample_size", np.nan),
+                "validation_utility_fold_count": validation_utility_fold_count,
+                "validation_positive_utility_folds": validation_positive_utility_folds,
+                "min_validation_utility_lower_bound_pct": min_validation_utility_lower_bound_pct,
+                "median_validation_utility_lower_bound_pct": median_validation_utility_lower_bound_pct,
+                "min_validation_threshold_candidate_count": min_validation_threshold_candidate_count,
+                "min_validation_threshold_eligible_candidate_count": min_validation_threshold_eligible_candidate_count,
             }
         )
     return pd.DataFrame(rows).sort_values(["candidate_scope", "horizon_days", "prediction_quality_pass", "brier_improvement_pct"], ascending=[True, True, False, False]).reset_index(drop=True)
+
+
+def build_near_pass_candidates(model_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "candidate_scope",
+        "horizon_days",
+        "model_name",
+        "model_policy",
+        "performance_block_count",
+        "sample_or_scope_block_count",
+        "performance_block_reasons",
+        "sample_or_scope_block_reasons",
+        "recommended_action",
+        "rank_score",
+        "oos_event_count",
+        "selected_oos_event_count",
+        "brier_improvement_pct",
+        "decision_ece",
+        "pr_auc",
+        "base_rate_pr_auc",
+        "selected_minus_rule_all_pct",
+        "selected_signal_expectancy_ci_lower_pct",
+        "positive_expectancy_folds",
+        "threshold_iqr",
+        "brier_gap_pct",
+        "ece_gap",
+        "pr_auc_gap",
+        "selected_ci_gap_pct",
+        "positive_expectancy_fold_gap",
+        "threshold_iqr_gap",
+        "selected_oos_event_gap",
+        "selected_events_per_fold_gap",
+        "calibration_bin_gap",
+        "probability_shrinkage_weight",
+        "probability_shrinkage_applied_fold_count",
+        "validation_brier_shrinkage_improvement",
+        "validation_brier_shrinkage_improvement_lower_bound",
+        "validation_utility_fold_count",
+        "validation_positive_utility_folds",
+        "min_validation_utility_lower_bound_pct",
+        "median_validation_utility_lower_bound_pct",
+        "min_validation_threshold_candidate_count",
+        "min_validation_threshold_eligible_candidate_count",
+    ]
+    if model_audit.empty or "quality_block_reasons" not in model_audit.columns:
+        return pd.DataFrame(columns=columns)
+
+    def floor_gap(value: object, floor: float) -> float:
+        numeric = as_float(value)
+        floor_value = as_float(floor)
+        return max(0.0, floor_value - numeric) if pd.notna(numeric) and pd.notna(floor_value) else np.nan
+
+    def ceiling_gap(value: object, ceiling: float) -> float:
+        numeric = as_float(value)
+        ceiling_value = as_float(ceiling)
+        return max(0.0, numeric - ceiling_value) if pd.notna(numeric) and pd.notna(ceiling_value) else np.nan
+
+    rows: list[dict[str, object]] = []
+    for _, row in model_audit.iterrows():
+        if to_bool(row.get("prediction_quality_pass", False)):
+            continue
+        performance_reasons, sample_or_scope_reasons = split_quality_block_reasons(row.get("quality_block_reasons", ""))
+        if not performance_reasons:
+            continue
+        first_action_reason = performance_reasons[0]
+        rows.append(
+            {
+                "candidate_scope": row.get("candidate_scope", ""),
+                "horizon_days": row.get("horizon_days", np.nan),
+                "model_name": row.get("model_name", ""),
+                "model_policy": row.get("model_policy", "UNKNOWN"),
+                "performance_block_count": len(performance_reasons),
+                "sample_or_scope_block_count": len(sample_or_scope_reasons),
+                "performance_block_reasons": "|".join(performance_reasons),
+                "sample_or_scope_block_reasons": "|".join(sample_or_scope_reasons) if sample_or_scope_reasons else "PASS",
+                "recommended_action": QUALITY_REASON_ACTIONS.get(first_action_reason, "inspect_prediction_quality_blocker"),
+                "rank_score": row.get("rank_score", np.nan),
+                "oos_event_count": row.get("oos_event_count", np.nan),
+                "selected_oos_event_count": row.get("selected_oos_event_count", np.nan),
+                "brier_improvement_pct": row.get("brier_improvement_pct", np.nan),
+                "decision_ece": row.get("decision_ece", np.nan),
+                "pr_auc": row.get("pr_auc", np.nan),
+                "base_rate_pr_auc": row.get("base_rate_pr_auc", np.nan),
+                "selected_minus_rule_all_pct": row.get("selected_minus_rule_all_pct", np.nan),
+                "selected_signal_expectancy_ci_lower_pct": row.get("selected_signal_expectancy_ci_lower_pct", np.nan),
+                "positive_expectancy_folds": row.get("positive_expectancy_folds", np.nan),
+                "threshold_iqr": row.get("threshold_iqr", np.nan),
+                "brier_gap_pct": floor_gap(row.get("brier_improvement_pct", np.nan), 0.0),
+                "ece_gap": ceiling_gap(row.get("decision_ece", np.nan), DECISION_ECE_THRESHOLD),
+                "pr_auc_gap": floor_gap(row.get("pr_auc", np.nan), as_float(row.get("base_rate_pr_auc", np.nan))),
+                "selected_ci_gap_pct": floor_gap(
+                    row.get("selected_signal_expectancy_ci_lower_pct", np.nan),
+                    MIN_SELECTED_EXPECTANCY_CI_LOWER_PCT,
+                ),
+                "positive_expectancy_fold_gap": floor_gap(row.get("positive_expectancy_folds", np.nan), MIN_POSITIVE_EXPECTANCY_FOLDS),
+                "threshold_iqr_gap": ceiling_gap(row.get("threshold_iqr", np.nan), MAX_THRESHOLD_IQR),
+                "selected_oos_event_gap": floor_gap(row.get("selected_oos_event_count", np.nan), MIN_SELECTED_OOS_EVENTS),
+                "selected_events_per_fold_gap": floor_gap(row.get("min_selected_events_per_fold", np.nan), MIN_SELECTED_EVENTS_PER_FOLD),
+                "calibration_bin_gap": floor_gap(row.get("min_calibration_bin_n", np.nan), MIN_CALIBRATION_BIN_N),
+                "probability_shrinkage_weight": row.get("probability_shrinkage_weight", np.nan),
+                "probability_shrinkage_applied_fold_count": row.get("probability_shrinkage_applied_fold_count", np.nan),
+                "validation_brier_shrinkage_improvement": row.get("validation_brier_shrinkage_improvement", np.nan),
+                "validation_brier_shrinkage_improvement_lower_bound": row.get("validation_brier_shrinkage_improvement_lower_bound", np.nan),
+                "validation_utility_fold_count": row.get("validation_utility_fold_count", np.nan),
+                "validation_positive_utility_folds": row.get("validation_positive_utility_folds", np.nan),
+                "min_validation_utility_lower_bound_pct": row.get("min_validation_utility_lower_bound_pct", np.nan),
+                "median_validation_utility_lower_bound_pct": row.get("median_validation_utility_lower_bound_pct", np.nan),
+                "min_validation_threshold_candidate_count": row.get("min_validation_threshold_candidate_count", np.nan),
+                "min_validation_threshold_eligible_candidate_count": row.get("min_validation_threshold_eligible_candidate_count", np.nan),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return (
+        pd.DataFrame(rows, columns=columns)
+        .sort_values(
+            ["performance_block_count", "sample_or_scope_block_count", "rank_score", "candidate_scope", "horizon_days", "model_name"],
+            ascending=[True, True, False, True, True, True],
+        )
+        .reset_index(drop=True)
+    )
+
+
+def build_performance_gap_summary(near_pass: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "performance_block_reason",
+        "candidate_count",
+        "one_block_candidate_count",
+        "median_brier_gap_pct",
+        "max_brier_gap_pct",
+        "median_ece_gap",
+        "max_ece_gap",
+        "median_pr_auc_gap",
+        "max_pr_auc_gap",
+        "median_selected_ci_gap_pct",
+        "max_selected_ci_gap_pct",
+        "median_threshold_iqr_gap",
+        "max_threshold_iqr_gap",
+        "median_selected_oos_event_gap",
+        "max_selected_oos_event_gap",
+        "median_positive_expectancy_fold_gap",
+        "max_positive_expectancy_fold_gap",
+        "median_calibration_bin_gap",
+        "max_calibration_bin_gap",
+        "recommended_action",
+        "top_candidate_scope",
+        "top_candidate_horizon_days",
+        "top_candidate_model_name",
+        "top_candidate_rank_score",
+        "top_candidate_block_reasons",
+    ]
+    if near_pass.empty or "performance_block_reasons" not in near_pass.columns:
+        return pd.DataFrame(columns=columns)
+
+    exploded_rows: list[dict[str, object]] = []
+    for _, row in near_pass.iterrows():
+        reasons = [
+            reason
+            for reason in str(row.get("performance_block_reasons", "")).split("|")
+            if reason and reason != "PASS"
+        ]
+        for reason in reasons:
+            item = row.to_dict()
+            item["performance_block_reason"] = reason
+            exploded_rows.append(item)
+    if not exploded_rows:
+        return pd.DataFrame(columns=columns)
+    exploded = pd.DataFrame(exploded_rows)
+
+    def numeric_summary(group: pd.DataFrame, column: str, fn: str) -> float:
+        values = pd.to_numeric(group.get(column, pd.Series(dtype=float)), errors="coerce").dropna()
+        if values.empty:
+            return np.nan
+        if fn == "max":
+            return float(values.max())
+        return float(values.median())
+
+    rows: list[dict[str, object]] = []
+    for reason, group in exploded.groupby("performance_block_reason", dropna=False):
+        ranked = group.sort_values(
+            ["performance_block_count", "sample_or_scope_block_count", "rank_score", "candidate_scope", "horizon_days", "model_name"],
+            ascending=[True, True, False, True, True, True],
+        )
+        top = ranked.iloc[0]
+        rows.append(
+            {
+                "performance_block_reason": reason,
+                "candidate_count": int(len(group)),
+                "one_block_candidate_count": int((pd.to_numeric(group.get("performance_block_count"), errors="coerce") == 1).sum()),
+                "median_brier_gap_pct": numeric_summary(group, "brier_gap_pct", "median"),
+                "max_brier_gap_pct": numeric_summary(group, "brier_gap_pct", "max"),
+                "median_ece_gap": numeric_summary(group, "ece_gap", "median"),
+                "max_ece_gap": numeric_summary(group, "ece_gap", "max"),
+                "median_pr_auc_gap": numeric_summary(group, "pr_auc_gap", "median"),
+                "max_pr_auc_gap": numeric_summary(group, "pr_auc_gap", "max"),
+                "median_selected_ci_gap_pct": numeric_summary(group, "selected_ci_gap_pct", "median"),
+                "max_selected_ci_gap_pct": numeric_summary(group, "selected_ci_gap_pct", "max"),
+                "median_threshold_iqr_gap": numeric_summary(group, "threshold_iqr_gap", "median"),
+                "max_threshold_iqr_gap": numeric_summary(group, "threshold_iqr_gap", "max"),
+                "median_selected_oos_event_gap": numeric_summary(group, "selected_oos_event_gap", "median"),
+                "max_selected_oos_event_gap": numeric_summary(group, "selected_oos_event_gap", "max"),
+                "median_positive_expectancy_fold_gap": numeric_summary(group, "positive_expectancy_fold_gap", "median"),
+                "max_positive_expectancy_fold_gap": numeric_summary(group, "positive_expectancy_fold_gap", "max"),
+                "median_calibration_bin_gap": numeric_summary(group, "calibration_bin_gap", "median"),
+                "max_calibration_bin_gap": numeric_summary(group, "calibration_bin_gap", "max"),
+                "recommended_action": QUALITY_REASON_ACTIONS.get(str(reason), "inspect_prediction_quality_blocker"),
+                "top_candidate_scope": top.get("candidate_scope", ""),
+                "top_candidate_horizon_days": top.get("horizon_days", np.nan),
+                "top_candidate_model_name": top.get("model_name", ""),
+                "top_candidate_rank_score": top.get("rank_score", np.nan),
+                "top_candidate_block_reasons": top.get("performance_block_reasons", ""),
+            }
+        )
+    return (
+        pd.DataFrame(rows, columns=columns)
+        .sort_values(
+            ["one_block_candidate_count", "candidate_count", "max_brier_gap_pct", "max_ece_gap", "performance_block_reason"],
+            ascending=[False, False, False, False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+
+def build_brier_decomposition_summary(model_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "candidate_scope",
+        "horizon_days",
+        "model_name",
+        "model_policy",
+        "prediction_quality_pass",
+        "quality_block_reasons",
+        "brier_score",
+        "brier_improvement_pct",
+        "brier_reliability",
+        "brier_resolution",
+        "brier_uncertainty",
+        "brier_reliability_minus_resolution",
+        "brier_resolution_minus_reliability",
+        "brier_resolution_to_reliability",
+        "brier_decomposition_regime",
+        "recommended_brier_action",
+    ]
+    if model_audit.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, object]] = []
+    for _, row in model_audit.iterrows():
+        reliability = as_float(row.get("brier_reliability", np.nan))
+        resolution = as_float(row.get("brier_resolution", np.nan))
+        if pd.isna(reliability) or pd.isna(resolution):
+            regime = "decomposition_unavailable"
+            action = "inspect_calibration_bins_or_oos_predictions"
+            rel_minus_res = np.nan
+            res_minus_rel = np.nan
+            ratio = np.nan
+        else:
+            rel_minus_res = reliability - resolution
+            res_minus_rel = resolution - reliability
+            ratio = resolution / reliability if reliability > 0 else np.inf
+            if resolution > reliability:
+                regime = "resolution_exceeds_reliability"
+                action = "preserve_discrimination_and_tune_threshold_economics"
+            elif reliability > resolution:
+                regime = "reliability_penalty_exceeds_resolution"
+                action = "improve_probability_calibration_or_reduce_overfit"
+            else:
+                regime = "reliability_resolution_tied"
+                action = "increase_resolution_without_hurting_calibration"
+        rows.append(
+            {
+                "candidate_scope": row.get("candidate_scope", ""),
+                "horizon_days": row.get("horizon_days", np.nan),
+                "model_name": row.get("model_name", ""),
+                "model_policy": row.get("model_policy", "UNKNOWN"),
+                "prediction_quality_pass": row.get("prediction_quality_pass", False),
+                "quality_block_reasons": row.get("quality_block_reasons", ""),
+                "brier_score": row.get("brier_score", np.nan),
+                "brier_improvement_pct": row.get("brier_improvement_pct", np.nan),
+                "brier_reliability": reliability,
+                "brier_resolution": resolution,
+                "brier_uncertainty": row.get("brier_uncertainty", np.nan),
+                "brier_reliability_minus_resolution": rel_minus_res,
+                "brier_resolution_minus_reliability": res_minus_rel,
+                "brier_resolution_to_reliability": ratio,
+                "brier_decomposition_regime": regime,
+                "recommended_brier_action": action,
+            }
+        )
+    return (
+        pd.DataFrame(rows, columns=columns)
+        .sort_values(
+            ["prediction_quality_pass", "brier_reliability_minus_resolution", "brier_improvement_pct", "candidate_scope", "horizon_days", "model_name"],
+            ascending=[True, False, True, True, True, True],
+        )
+        .reset_index(drop=True)
+    )
+
+
+def build_feature_association_summary(feature_selection_report: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "feature_group",
+        "feature",
+        "feature_type",
+        "decision",
+        "reason",
+        "row_count",
+        "selected_count",
+        "excluded_count",
+        "max_25_cap_excluded_count",
+        "median_target_association",
+        "max_target_association",
+        "median_missing_rate",
+        "affected_scopes",
+        "affected_horizons",
+    ]
+    required = {"feature_group", "feature", "feature_type", "decision", "reason", "target_association"}
+    if feature_selection_report.empty or not required.issubset(feature_selection_report.columns):
+        return pd.DataFrame(columns=columns)
+    frame = feature_selection_report.copy()
+    frame["target_association"] = pd.to_numeric(frame["target_association"], errors="coerce")
+    frame["missing_rate"] = pd.to_numeric(frame.get("missing_rate", pd.Series(np.nan, index=frame.index)), errors="coerce")
+    frame = frame[frame["target_association"].notna()].copy()
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, object]] = []
+    for (feature_group, feature, feature_type, decision, reason), group in frame.groupby(
+        ["feature_group", "feature", "feature_type", "decision", "reason"],
+        dropna=False,
+    ):
+        decisions = group["decision"].astype(str)
+        reasons = group["reason"].astype(str)
+        numeric_cap_excluded = decisions.eq("excluded") & reasons.str.match(r"max_\d+_numeric_features", na=False)
+        horizons = sorted(pd.to_numeric(group.get("horizon_days", pd.Series(dtype=float)), errors="coerce").dropna().astype(int).unique())
+        scopes = sorted(group.get("candidate_scope", pd.Series(dtype=str)).dropna().astype(str).unique())
+        rows.append(
+            {
+                "feature_group": feature_group,
+                "feature": feature,
+                "feature_type": feature_type,
+                "decision": decision,
+                "reason": reason if str(reason) else "selected",
+                "row_count": int(len(group)),
+                "selected_count": int(decisions.eq("selected").sum()),
+                "excluded_count": int(decisions.eq("excluded").sum()),
+                "max_25_cap_excluded_count": int(numeric_cap_excluded.sum()),
+                "median_target_association": float(group["target_association"].median()),
+                "max_target_association": float(group["target_association"].max()),
+                "median_missing_rate": float(group["missing_rate"].median()) if group["missing_rate"].notna().any() else np.nan,
+                "affected_scopes": "|".join(scopes),
+                "affected_horizons": "|".join(str(v) for v in horizons),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return (
+        pd.DataFrame(rows, columns=columns)
+        .sort_values(
+            ["max_25_cap_excluded_count", "excluded_count", "median_target_association", "max_target_association", "feature_group", "feature"],
+            ascending=[False, False, False, False, True, True],
+        )
+        .reset_index(drop=True)
+    )
 
 
 def best_model_for_horizon(comparison: pd.DataFrame, horizon: int, candidate_scope_name: str) -> Optional[pd.Series]:
@@ -3067,6 +4310,8 @@ def latest_prediction_for_horizon(
             f"{prefix}threshold_{horizon}d": np.nan,
             f"{prefix}confidence_band_{horizon}d": "NA",
             f"{prefix}prediction_quality_pass_{horizon}d": False,
+            f"{prefix}performance_quality_pass_{horizon}d": False,
+            f"{prefix}performance_quality_block_reasons_{horizon}d": "NO_MODEL",
             f"{prefix}oos_event_count_{horizon}d": 0,
             f"{prefix}effective_oos_event_count_{horizon}d": 0,
             f"{prefix}selected_oos_event_count_{horizon}d": 0,
@@ -3163,6 +4408,7 @@ def latest_prediction_for_horizon(
     else:
         band = "LOW_NEGATIVE"
     lower_80, upper_80 = wilson_interval(probability, max(int(best.get("oos_event_count", 0)), 1))
+    quality_block_reasons = model_quality_block_reasons(best)
     return {
         f"{prefix}best_model_{horizon}d": model_name,
         f"{prefix}p_success_{horizon}d": probability,
@@ -3179,6 +4425,8 @@ def latest_prediction_for_horizon(
         f"{prefix}threshold_{horizon}d": threshold,
         f"{prefix}confidence_band_{horizon}d": band,
         f"{prefix}prediction_quality_pass_{horizon}d": bool(best["prediction_quality_pass"]),
+        f"{prefix}performance_quality_pass_{horizon}d": performance_quality_pass_from_reasons(quality_block_reasons),
+        f"{prefix}performance_quality_block_reasons_{horizon}d": performance_quality_block_reasons(quality_block_reasons),
         f"{prefix}oos_event_count_{horizon}d": int(best["oos_event_count"]),
         f"{prefix}effective_oos_event_count_{horizon}d": effective_n,
         f"{prefix}brier_score_{horizon}d": best["brier_score"],
@@ -3191,7 +4439,7 @@ def latest_prediction_for_horizon(
             f"{prefix}selected_minus_rule_all_pct_{horizon}d": best.get("selected_minus_rule_all_pct", np.nan),
             f"{prefix}threshold_iqr_{horizon}d": best.get("threshold_iqr", np.nan),
             f"{prefix}min_selected_events_per_fold_{horizon}d": best.get("min_selected_events_per_fold", 0),
-            f"{prefix}model_quality_block_reasons_{horizon}d": model_quality_block_reasons(best),
+            f"{prefix}model_quality_block_reasons_{horizon}d": quality_block_reasons,
         }
 
 
@@ -3253,6 +4501,8 @@ def paper_alpha_sizing(values: Dict[str, object], latest_row: pd.DataFrame) -> D
 
 def final_trade_decision_from_prediction(values: Dict[str, object], latest_row: pd.DataFrame) -> str:
     row = latest_row.iloc[0]
+    if str(row.get("decision_tier", "")) in V2_RULE_ACTIONABLE_TIERS and as_float(row.get("suggested_weight"), 0.0) > 0:
+        return FinalTradeDecision.RULE_BASED_SMALL_OR_PAPER_ONLY.value
     if not bool(row.get("is_trade_ready_entry_candidate", False)):
         if str(row.get("entry_trigger", "NONE")) == "NONE":
             return FinalTradeDecision.NO_TRADE_NO_TRIGGER.value
@@ -3294,6 +4544,7 @@ def build_latest_snapshot(feature_matrix: pd.DataFrame, comparison: pd.DataFrame
         scope_used = "none"
         scope_col = "is_event_candidate"
     values: Dict[str, object] = {
+        "symbol": latest_row["symbol"].iloc[0] if "symbol" in latest_row.columns else "TSM",
         "prediction_asof_date": latest_row["date"].iloc[0],
         "latest_is_event_candidate": latest_is_event,
         "latest_is_actionable_entry_candidate": latest_is_actionable,
@@ -3303,6 +4554,13 @@ def build_latest_snapshot(feature_matrix: pd.DataFrame, comparison: pd.DataFrame
         "latest_candidate_scope": latest_row["candidate_scope"].iloc[0],
         "latest_candidate_tier": latest_row["candidate_tier"].iloc[0] if "candidate_tier" in latest_row.columns else "NA",
         "prediction_scope_used": scope_used,
+        "latest_v2_decision_tier": latest_row["decision_tier"].iloc[0] if "decision_tier" in latest_row.columns else "LEGACY_ONLY",
+        "latest_v2_suggested_action": latest_row["suggested_action"].iloc[0] if "suggested_action" in latest_row.columns else "LEGACY_ONLY",
+        "latest_v2_sizing_tier": latest_row["sizing_tier"].iloc[0] if "sizing_tier" in latest_row.columns else "LEGACY_ONLY",
+        "latest_v2_suggested_weight": latest_row["suggested_weight"].iloc[0] if "suggested_weight" in latest_row.columns else 0.0,
+        "latest_v2_raw_entry_event": latest_row["raw_entry_event"].iloc[0] if "raw_entry_event" in latest_row.columns else "NONE",
+        "latest_v2_semi_momentum_regime": latest_row["semi_momentum_regime"].iloc[0] if "semi_momentum_regime" in latest_row.columns else "UNKNOWN",
+        "latest_v2_next_check_condition": latest_row["next_check_condition"].iloc[0] if "next_check_condition" in latest_row.columns else "",
     }
     for horizon in HORIZONS:
         values.update(
@@ -3382,11 +4640,17 @@ def build_latest_snapshot(feature_matrix: pd.DataFrame, comparison: pd.DataFrame
         status = prediction_signal_status(p20, threshold20, oos20)
         if status != "PREDICTION_CONFIRMED":
             latest_signal_block_reasons.append(status)
+    latest_v2_rule_actionable = str(values.get("latest_v2_decision_tier", "")) in V2_RULE_ACTIONABLE_TIERS and as_float(values.get("latest_v2_suggested_weight"), 0.0) > 0
+    if latest_v2_rule_actionable and status in {"ENTRY_TRIGGER_FILTERED_BY_RULES", "NO_ENTRY_TRIGGER_CONTEXT_ONLY", "NO_LATEST_EVENT_CANDIDATE"}:
+        status = "RULE_V2_SIGNAL_VISIBLE"
+        latest_signal_block_reasons.append("MODEL_NOT_READY_RULE_SIGNAL_VISIBLE")
     quality_ok = bool(values.get("prediction_quality_pass_20d", False))
     use_status = PredictionUseStatus.DISPLAY_ONLY_QUALITY_NOT_PASSED.value
     if status == "NO_ENTRY_TRIGGER_CONTEXT_ONLY":
         use_status = PredictionUseStatus.DISPLAY_ONLY_NO_ENTRY_TRIGGER.value
     elif status == "ENTRY_TRIGGER_FILTERED_BY_RULES":
+        use_status = PredictionUseStatus.DISPLAY_ONLY_RULE_FILTERED.value
+    elif status == "RULE_V2_SIGNAL_VISIBLE":
         use_status = PredictionUseStatus.DISPLAY_ONLY_RULE_FILTERED.value
     elif status in {"NO_MODEL_CANDIDATE", "NO_LATEST_EVENT_CANDIDATE"}:
         use_status = PredictionUseStatus.DISPLAY_ONLY_NO_MODEL_CANDIDATE.value
@@ -3417,7 +4681,7 @@ def build_latest_snapshot(feature_matrix: pd.DataFrame, comparison: pd.DataFrame
     values["decision_permission"] = (
         DecisionPermission.DECISION_SUPPORT_ONLY.value
         if use_status == PredictionUseStatus.DECISION_SUPPORT_ALLOWED.value
-        else (DecisionPermission.PAPER_ONLY_RULE_BASED.value if latest_is_trade_ready else DecisionPermission.DISPLAY_ONLY.value)
+        else (DecisionPermission.PAPER_ONLY_RULE_BASED.value if latest_is_trade_ready or latest_v2_rule_actionable else DecisionPermission.DISPLAY_ONLY.value)
     )
     values["model_health_scope"] = "trade_ready_entry_20d"
     values["model_health_quality_pass_20d"] = values.get("trade_ready_prediction_quality_pass_20d", False)
@@ -3529,6 +4793,8 @@ def build_quality_checks(
     rows.append(check_row("feature_allowlist_has_expanded_daily_features", len(feature_cols) >= 80, "CRITICAL", len(feature_cols), ">=80"))
     external_present = any(c in feature_matrix.columns for c in EXTERNAL_NUMERIC_FEATURES + EXTERNAL_BOOL_FEATURES + EXTERNAL_CATEGORICAL_FEATURES)
     rows.append(check_row("external_features_present", external_present, "WARN", "ok" if external_present else "EXTERNAL_FEATURES_MISSING"))
+    intraday_present = any(c in feature_matrix.columns for c in INTRADAY_NUMERIC_FEATURES + INTRADAY_BOOL_FEATURES + INTRADAY_CATEGORICAL_FEATURES)
+    rows.append(check_row("intraday_features_present", intraday_present, "WARN", "ok" if intraday_present else "INTRADAY_FEATURES_MISSING"))
     event_count = int(labels["is_event_candidate"].sum()) if "is_event_candidate" in labels.columns else 0
     actionable_count = int(labels["is_actionable_entry_candidate"].sum()) if "is_actionable_entry_candidate" in labels.columns else 0
     trade_ready_count = int(labels["is_trade_ready_entry_candidate"].sum()) if "is_trade_ready_entry_candidate" in labels.columns else 0
@@ -3694,7 +4960,7 @@ def write_report(
     critical = quality[quality["severity"] == "CRITICAL"] if not quality.empty else pd.DataFrame()
     critical_passed = bool(critical["passed"].all()) if not critical.empty else False
     lines = [
-        "# TSMC Prediction Accuracy Report",
+        "# Top10 Prediction Accuracy Report",
         "",
         f"- Critical quality checks passed: {critical_passed}",
         f"- Event candidates: {int(labels['is_event_candidate'].sum()) if not labels.empty else 0}",
@@ -3737,17 +5003,20 @@ def write_report(
         "",
         "## Model Comparison",
         "",
-        "| Scope | Horizon | Model | Policy | Quality Pass | OOS | Selected OOS | Brier Improvement | ECE | PR AUC | Selected Minus Rule | Selected CI Lower | Threshold IQR |",
-        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Scope | Horizon | Model | Policy | Quality Pass | Perf Pass | OOS | Selected OOS | Shrink Folds | Rank Top 20% Minus All | Rank Fold Lower | Rank Policy Pass | Brier Improvement | ECE | PR AUC | Selected Minus Rule | Selected CI Lower | Threshold IQR |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     if comparison.empty:
-        lines.append("| NA | NA | NA | False | 0 | NA | NA | NA | NA |")
+        lines.append("| NA | NA | NA | NA | False | False | 0 | 0 | 0 | NA | NA | False | NA | NA | NA | NA | NA | NA |")
     else:
         for _, row in comparison.sort_values(["candidate_scope", "horizon_days", "rank_score"], ascending=[True, True, False]).iterrows():
             lines.append(
                 f"| {row['candidate_scope']} | {int(row['horizon_days'])} | {row['model_name']} | {row.get('model_policy', 'UNKNOWN')} | {row['prediction_quality_pass']} | "
-                f"{int(row['oos_event_count'])} | {int(row.get('selected_oos_event_count', 0))} | {row['brier_improvement_pct']:.2f}% | "
+                f"{row.get('performance_quality_pass', performance_quality_pass_from_reasons(row.get('quality_block_reasons', '')))} | "
+                f"{int(row['oos_event_count'])} | {int(row.get('selected_oos_event_count', 0))} | {int(row.get('probability_shrinkage_applied_fold_count', 0))} | "
+                f"{row.get('rank_top_quintile_minus_all_pct', np.nan):.2f}% | "
+                f"{row.get('rank_top_quintile_se_lower_pct', np.nan):.2f}% | {row.get('rank_policy_diagnostic_pass', False)} | {row['brier_improvement_pct']:.2f}% | "
                 f"{row['ece']:.4f} | {row['pr_auc']:.4f} | {row.get('selected_minus_rule_all_pct', np.nan):.2f}% | "
                 f"{row.get('selected_signal_expectancy_ci_lower_pct', np.nan):.2f}% | {row.get('threshold_iqr', np.nan):.4f} |"
             )
@@ -3772,14 +5041,37 @@ def write_report(
     (outdir / "tsm_prediction_report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def write_reliability_report(outdir: Path, latest: pd.DataFrame, audit: pd.DataFrame, calibration: pd.DataFrame) -> None:
+def write_reliability_report(
+    outdir: Path,
+    latest: pd.DataFrame,
+    audit: pd.DataFrame,
+    calibration: pd.DataFrame,
+    near_pass: pd.DataFrame | None = None,
+    performance_gap_summary: pd.DataFrame | None = None,
+    feature_association_summary: pd.DataFrame | None = None,
+    brier_decomposition_summary: pd.DataFrame | None = None,
+) -> None:
     latest_map = dict(zip(latest["field"], latest["value"])) if not latest.empty else {}
+    near_pass = near_pass if near_pass is not None else pd.DataFrame()
+    performance_gap_summary = performance_gap_summary if performance_gap_summary is not None else pd.DataFrame()
+    feature_association_summary = feature_association_summary if feature_association_summary is not None else pd.DataFrame()
+    brier_decomposition_summary = brier_decomposition_summary if brier_decomposition_summary is not None else pd.DataFrame()
+    audit_count = len(audit) if audit is not None else 0
+    strict_quality_pass_count = int(audit["prediction_quality_pass"].map(to_bool).sum()) if not audit.empty and "prediction_quality_pass" in audit.columns else 0
+    if not audit.empty and "performance_quality_pass" in audit.columns:
+        performance_quality_pass_count = int(audit["performance_quality_pass"].map(to_bool).sum())
+    elif not audit.empty and "quality_block_reasons" in audit.columns:
+        performance_quality_pass_count = int(audit["quality_block_reasons"].map(performance_quality_pass_from_reasons).sum())
+    else:
+        performance_quality_pass_count = 0
     lines = [
-        "# TSMC Prediction Reliability Report",
+        "# Top10 Prediction Reliability Report",
         "",
         f"- Latest scope: {latest_map.get('prediction_scope_used', 'NA')}",
         f"- Latest signal status: {latest_map.get('prediction_signal_status', 'NA')}",
         f"- Latest use status: {latest_map.get('prediction_use_status', 'NA')}",
+        f"- Strict quality pass count: {strict_quality_pass_count}/{audit_count}",
+        f"- Performance-only pass count: {performance_quality_pass_count}/{audit_count}",
         f"- 20D p_success: {latest_map.get('p_success_20d', 'NA')}",
         f"- 20D p_stop_survival: {latest_map.get('p_stop_survival_20d', 'NA')}",
         f"- 20D p_positive_given_survival: {latest_map.get('p_positive_given_survival_20d', 'NA')}",
@@ -3787,16 +5079,108 @@ def write_reliability_report(outdir: Path, latest: pd.DataFrame, audit: pd.DataF
         "",
         "## Model Audit",
         "",
-        "| Scope | Horizon | Model | Pass | OOS | Block Reasons | Brier Improvement | ECE | PR AUC |",
-        "|---|---:|---|---:|---:|---|---:|---:|---:|",
+        "| Scope | Horizon | Model | Strict Pass | Perf Pass | OOS | Block Reasons | Perf Block Reasons | Brier Improvement | ECE | PR AUC |",
+        "|---|---:|---|---:|---:|---:|---|---|---:|---:|---:|",
     ]
     if audit.empty:
-        lines.append("| NA | NA | NA | False | 0 | missing | NA | NA | NA |")
+        lines.append("| NA | NA | NA | False | False | 0 | missing | missing | NA | NA | NA |")
     else:
         for _, row in audit.iterrows():
             lines.append(
                 f"| {row['candidate_scope']} | {int(row['horizon_days'])} | {row['model_name']} | {row['prediction_quality_pass']} | "
-                f"{int(row['oos_event_count'])} | {row['quality_block_reasons']} | {row['brier_improvement_pct']:.2f}% | {row['ece']:.4f} | {row['pr_auc']:.4f} |"
+                f"{row.get('performance_quality_pass', performance_quality_pass_from_reasons(row.get('quality_block_reasons', '')))} | "
+                f"{int(row['oos_event_count'])} | {row['quality_block_reasons']} | {row.get('performance_quality_block_reasons', performance_quality_block_reasons(row.get('quality_block_reasons', '')))} | "
+                f"{row['brier_improvement_pct']:.2f}% | {row['ece']:.4f} | {row['pr_auc']:.4f} |"
+            )
+    lines.extend(
+        [
+            "",
+            "## Performance Gap Summary",
+            "",
+            "| Reason | Candidates | One-Block Candidates | Recommended Action | Top Candidate | Median Brier Gap | Max Brier Gap | Median ECE Gap | Max ECE Gap | Median Selected CI Gap | Max Selected CI Gap |",
+            "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    if performance_gap_summary.empty:
+        lines.append("| PASS | 0 | 0 | No performance blockers. | NA | NA | NA | NA | NA | NA | NA |")
+    else:
+        for _, row in performance_gap_summary.head(12).iterrows():
+            top_candidate = (
+                f"{row.get('top_candidate_scope', 'NA')}/"
+                f"{int(row.get('top_candidate_horizon_days', 0)) if pd.notna(row.get('top_candidate_horizon_days', np.nan)) else 'NA'}d/"
+                f"{row.get('top_candidate_model_name', 'NA')}"
+            )
+            lines.append(
+                f"| {row['performance_block_reason']} | {int(row['candidate_count'])} | {int(row['one_block_candidate_count'])} | "
+                f"{row['recommended_action']} | {top_candidate} | "
+                f"{row.get('median_brier_gap_pct', np.nan):.2f}% | {row.get('max_brier_gap_pct', np.nan):.2f}% | "
+                f"{row.get('median_ece_gap', np.nan):.4f} | {row.get('max_ece_gap', np.nan):.4f} | "
+                f"{row.get('median_selected_ci_gap_pct', np.nan):.2f}% | {row.get('max_selected_ci_gap_pct', np.nan):.2f}% |"
+            )
+    lines.extend(
+        [
+            "",
+            "## Feature Association Diagnostics",
+            "",
+            "| Feature | Group | Decision | Reason | Rows | Median Train Association | Max Train Association | Median Missing |",
+            "|---|---|---|---|---:|---:|---:|---:|",
+        ]
+    )
+    if feature_association_summary.empty:
+        lines.append("| NA | NA | NA | NA | 0 | NA | NA | NA |")
+    else:
+        diagnostics = feature_association_summary.copy()
+        excluded = diagnostics[pd.to_numeric(diagnostics.get("excluded_count", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0]
+        diagnostics = excluded if not excluded.empty else diagnostics
+        for _, row in diagnostics.head(15).iterrows():
+            lines.append(
+                f"| {row.get('feature', 'NA')} | {row.get('feature_group', 'NA')} | {row.get('decision', 'NA')} | "
+                f"{row.get('reason', 'NA')} | {int(row.get('row_count', 0))} | "
+                f"{row.get('median_target_association', np.nan):.4f} | {row.get('max_target_association', np.nan):.4f} | "
+                f"{row.get('median_missing_rate', np.nan):.4f} |"
+            )
+    lines.extend(
+        [
+            "",
+            "## Near-Pass Improvement Queue",
+            "",
+            "| Scope | Horizon | Model | Perf Blocks | Performance Reasons | Recommended Action | Brier Improvement | Brier Gap | ECE | ECE Gap | PR AUC | Selected CI Gap | Threshold IQR Gap | Shrink LB |",
+            "|---|---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    if near_pass.empty:
+        lines.append("| PASS | NA | NA | 0 | PASS | No near-pass quality blockers. | NA | NA | NA | NA | NA | NA | NA | NA |")
+    else:
+        for _, row in near_pass.head(15).iterrows():
+            lines.append(
+                f"| {row['candidate_scope']} | {int(row['horizon_days'])} | {row['model_name']} | "
+                f"{int(row['performance_block_count'])} | {row['performance_block_reasons']} | {row['recommended_action']} | "
+                f"{row['brier_improvement_pct']:.2f}% | {row.get('brier_gap_pct', np.nan):.2f}% | "
+                f"{row['decision_ece']:.4f} | {row.get('ece_gap', np.nan):.4f} | {row['pr_auc']:.4f} | "
+                f"{row.get('selected_ci_gap_pct', np.nan):.2f}% | {row.get('threshold_iqr_gap', np.nan):.4f} | "
+                f"{row.get('validation_brier_shrinkage_improvement_lower_bound', np.nan):.6f} |"
+            )
+    lines.extend(
+        [
+            "",
+            "## Brier Decomposition Diagnostics",
+            "",
+            "| Scope | Horizon | Model | Regime | Brier Improvement | Reliability | Resolution | Reliability - Resolution | Recommended Action |",
+            "|---|---:|---|---|---:|---:|---:|---:|---|",
+        ]
+    )
+    if brier_decomposition_summary.empty:
+        lines.append("| NA | NA | NA | unavailable | NA | NA | NA | NA | inspect_calibration_bins_or_oos_predictions |")
+    else:
+        diagnostics = brier_decomposition_summary.copy()
+        no_brier = diagnostics[diagnostics["quality_block_reasons"].astype(str).str.contains("NO_BRIER_IMPROVEMENT", na=False)]
+        diagnostics = no_brier if not no_brier.empty else diagnostics
+        for _, row in diagnostics.head(15).iterrows():
+            lines.append(
+                f"| {row['candidate_scope']} | {int(row['horizon_days'])} | {row['model_name']} | {row['brier_decomposition_regime']} | "
+                f"{row.get('brier_improvement_pct', np.nan):.2f}% | {row.get('brier_reliability', np.nan):.6f} | "
+                f"{row.get('brier_resolution', np.nan):.6f} | {row.get('brier_reliability_minus_resolution', np.nan):.6f} | "
+                f"{row.get('recommended_brier_action', 'inspect_prediction_quality_blocker')} |"
             )
     lines.extend(
         [
@@ -3847,7 +5231,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-policy", default="tsm_price_rule_output/tsm_risk_policy_daily.csv")
     parser.add_argument("--enriched", default="output/tsm_daily_10y_enriched.csv")
     parser.add_argument("--external-features", default="", help="Optional symbol/date external feature CSV produced by tsm_external_feature_engine.py.")
+    parser.add_argument("--intraday-features", default="", help="Optional symbol/date intraday feature CSV produced by tsm_intraday_feature_engine.py.")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
+    parser.add_argument("--symbol", default="TSM")
     parser.add_argument("--commission-bps", type=float, default=1.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--stop-multiple", type=float, default=2.0)
@@ -3875,7 +5261,16 @@ def main() -> None:
         raise SystemExit(f"scikit-learn is required. Install dependencies with: python -m pip install -r requirements.txt. Error: {SKLEARN_IMPORT_ERROR}")
 
     external_path = Path(args.external_features) if str(args.external_features).strip() else None
-    signals, trades = load_inputs(Path(args.signals), Path(args.risk_policy), Path(args.trade_log), Path(args.enriched), external_path, symbol="TSM")
+    intraday_path = Path(args.intraday_features) if str(args.intraday_features).strip() else None
+    signals, trades = load_inputs(
+        Path(args.signals),
+        Path(args.risk_policy),
+        Path(args.trade_log),
+        Path(args.enriched),
+        external_path,
+        intraday_path,
+        symbol=str(args.symbol).upper(),
+    )
     labels = build_label_dataset(signals, args.commission_bps, args.slippage_bps, args.stop_multiple)
     feature_matrix = build_feature_matrix(signals, labels)
     scope_stats = build_candidate_scope_stats(labels)
@@ -3925,6 +5320,10 @@ def main() -> None:
     calibration_summary = aggregate_calibration_summary(calibration)
     comparison = aggregate_model_comparison(metrics)
     model_audit = build_model_audit(metrics, comparison, calibration, threshold_policy)
+    near_pass = build_near_pass_candidates(model_audit)
+    performance_gap_summary = build_performance_gap_summary(near_pass)
+    brier_decomposition_summary = build_brier_decomposition_summary(model_audit)
+    feature_association_summary = build_feature_association_summary(feature_selection_report)
     latest = build_latest_snapshot(feature_matrix, comparison, threshold_policy)
     feature_contract = build_feature_contract(feature_matrix)
     schema_quality = build_schema_quality_checks(
@@ -3964,15 +5363,28 @@ def main() -> None:
     calibration_summary.to_csv(outdir / "tsm_prediction_calibration_summary.csv", index=False)
     threshold_policy.to_csv(outdir / "tsm_prediction_threshold_policy.csv", index=False)
     feature_selection_report.to_csv(outdir / "tsm_prediction_feature_selection_report.csv", index=False)
+    feature_association_summary.to_csv(outdir / "tsm_prediction_feature_association_summary.csv", index=False)
     feature_contract.to_csv(outdir / "tsm_prediction_feature_contract.csv", index=False)
     fold_manifest.to_csv(outdir / "tsm_prediction_fold_manifest.csv", index=False)
     policy_audit.to_csv(outdir / "tsm_prediction_policy_audit.csv", index=False)
     schema_quality.to_csv(outdir / "tsm_schema_quality_checks.csv", index=False)
     model_audit.to_csv(outdir / "tsm_prediction_model_audit.csv", index=False)
+    near_pass.to_csv(outdir / "tsm_prediction_near_pass_candidates.csv", index=False)
+    performance_gap_summary.to_csv(outdir / "tsm_prediction_performance_gap_summary.csv", index=False)
+    brier_decomposition_summary.to_csv(outdir / "tsm_prediction_brier_decomposition_summary.csv", index=False)
     latest.to_csv(outdir / "tsm_latest_prediction_snapshot.csv", index=False)
     quality.to_csv(outdir / "tsm_prediction_quality_checks.csv", index=False)
     write_report(outdir, labels, scope_stats, comparison, latest, quality)
-    write_reliability_report(outdir, latest, model_audit, calibration)
+    write_reliability_report(
+        outdir,
+        latest,
+        model_audit,
+        calibration,
+        near_pass,
+        performance_gap_summary,
+        feature_association_summary,
+        brier_decomposition_summary,
+    )
 
     print("완료: prediction outputs =", outdir.resolve())
     print(latest.to_string(index=False))

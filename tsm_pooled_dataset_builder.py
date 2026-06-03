@@ -19,21 +19,29 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
+from tsm_core.universe import market_region_for_symbol
 from tsm_prediction_engine import (
     BOOL_FEATURES,
     CATEGORICAL_FEATURES,
     HORIZONS,
     NUMERIC_FEATURES,
+    add_label_overlap_uniqueness,
+    as_float,
     build_candidate_scope_stats,
     build_feature_matrix,
-    build_label_dataset,
+    cost_rate,
     load_inputs,
+    pct,
+    to_bool,
+    valid_price,
 )
 
 
@@ -47,10 +55,23 @@ SEMICONDUCTOR_UNIVERSE = [
     ("LRCX", "semicap"),
     ("KLAC", "semicap"),
     ("MU", "memory"),
+    ("005930.KS", "memory_foundry_idm"),
+    ("000660.KS", "memory_storage"),
     ("QCOM", "semiconductor"),
     ("SMH", "semiconductor_etf"),
     ("SOXX", "semiconductor_etf"),
 ]
+
+
+REQUIRED_DECISION_SYMBOL_COUNT = 12
+ENTRY_SCORE_GRID = (70.0, 72.5, 75.0, 77.5, 80.0)
+WATCHLIST_SCORE_GRID = (60.0, 62.5, 65.0, 67.5, 70.0)
+OBSERVATION_SCORE_GRID = (55.0, 57.5, 60.0, 62.5, 65.0)
+OVEREXTENDED_SMA50_GRID = (0.10, 0.15, 0.20, 0.25, 0.30)
+BASELINE_ENTRY_SCORE = 75.0
+BASELINE_WATCHLIST_SCORE = 65.0
+BASELINE_OBSERVATION_SCORE = 60.0
+BASELINE_OVEREXTENDED_SMA50 = 0.15
 
 
 def strip_bom_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -97,8 +118,261 @@ def read_config(path: Path | None) -> pd.DataFrame:
         raise ValueError(f"pooled config missing columns: {missing}")
     if "symbol_group" not in config.columns:
         config["symbol_group"] = "semiconductor"
-    optional = [c for c in ["strict_eligible", "eligibility_status"] if c in config.columns]
+    optional = [
+        c
+        for c in ["enabled", "paper_enabled", "strict_eligible", "eligibility_status", "is_decision_universe", "decision_scope", "training_scope", "market_region"]
+        if c in config.columns
+    ]
     return config[["symbol", "symbol_group", *required[1:], *optional]].copy()
+
+
+def _unavailable_label_fields(horizon: int, status: str) -> Dict[str, object]:
+    return {
+        f"label_status_{horizon}d": status,
+        f"label_success_{horizon}d": np.nan,
+        f"label_stop_survival_{horizon}d": np.nan,
+        f"label_hit_1r_before_stop_{horizon}d": np.nan,
+        f"label_hit_2r_before_stop_{horizon}d": np.nan,
+        f"label_positive_return_{horizon}d": np.nan,
+        f"label_expected_r_{horizon}d": np.nan,
+        f"label_mfe_r_{horizon}d": np.nan,
+        f"label_mae_r_{horizon}d": np.nan,
+        f"label_time_to_1r_{horizon}d": np.nan,
+        f"label_time_to_2r_{horizon}d": np.nan,
+        f"label_time_to_stop_{horizon}d": np.nan,
+        f"label_ambiguous_stop_1r_same_day_{horizon}d": np.nan,
+        f"label_ambiguous_stop_2r_same_day_{horizon}d": np.nan,
+        f"label_gap_through_stop_{horizon}d": np.nan,
+        f"label_entry_gap_pct_{horizon}d": np.nan,
+        f"label_first_touch_type_{horizon}d": status,
+        f"label_time_to_first_touch_{horizon}d": np.nan,
+        f"label_mfe_before_stop_{horizon}d": np.nan,
+        f"label_mae_before_profit_{horizon}d": np.nan,
+        f"label_event_regime_at_entry_{horizon}d": status,
+        f"label_net_return_pct_{horizon}d": np.nan,
+        f"label_gross_return_pct_{horizon}d": np.nan,
+        f"label_exit_reason_{horizon}d": status,
+        f"label_exit_type_clean_{horizon}d": status,
+        f"label_entry_date_{horizon}d": "",
+        f"label_exit_date_{horizon}d": "",
+        f"label_entry_price_{horizon}d": np.nan,
+        f"label_exit_price_{horizon}d": np.nan,
+        f"label_stop_price_{horizon}d": np.nan,
+        f"label_1r_price_{horizon}d": np.nan,
+        f"label_2r_price_{horizon}d": np.nan,
+        f"label_holding_trading_days_{horizon}d": np.nan,
+    }
+
+
+def build_pooled_label_dataset(
+    df: pd.DataFrame,
+    commission_bps: float,
+    slippage_bps: float,
+    stop_multiple: float,
+) -> pd.DataFrame:
+    base_cols = [
+        "date",
+        "signal_idx",
+        "is_event_candidate",
+        "is_actionable_entry_candidate",
+        "is_trade_ready_entry_candidate",
+        "is_entry_research_candidate",
+        "is_risk_research_candidate",
+        "is_model_training_candidate",
+        "is_decision_entry_candidate",
+        "candidate_tier",
+        "entry_gate_status",
+        "candidate_scope",
+        "prediction_universe",
+        "entry_trigger",
+        "trade_action",
+        "close",
+        "atr_14",
+        "score_price_algo_total",
+        "risk_state",
+        "news_primary_cause_type",
+        "news_match_confidence",
+        "news_coverage_status",
+        "news_cause_summary",
+    ]
+    n = len(df)
+    if n == 0:
+        return pd.DataFrame(columns=base_cols)
+
+    dates = df["date"].to_numpy()
+    open_values = pd.to_numeric(df["open"], errors="coerce").to_numpy(dtype=float)
+    high_values = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+    low_values = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+    close_values = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    atr_values = pd.to_numeric(df["atr_14"], errors="coerce").to_numpy(dtype=float)
+    trend_values = df["trend_regime"].fillna("UNKNOWN").astype(str).to_numpy() if "trend_regime" in df.columns else np.full(n, "UNKNOWN", dtype=object)
+    vol_values = df["vol_regime"].fillna("UNKNOWN").astype(str).to_numpy() if "vol_regime" in df.columns else np.full(n, "UNKNOWN", dtype=object)
+    event_values = df["is_event_candidate"].map(to_bool).to_numpy(dtype=bool)
+    cr = cost_rate(commission_bps, slippage_bps)
+
+    rows: list[Dict[str, object]] = []
+    for idx, base in enumerate(df[base_cols].to_dict("records")):
+        out = dict(base)
+        for horizon in HORIZONS:
+            if not event_values[idx]:
+                out.update(_unavailable_label_fields(horizon, "NOT_EVENT"))
+                continue
+
+            entry_idx = idx + 1
+            horizon_exit_idx = idx + horizon
+            if entry_idx >= n:
+                out.update(_unavailable_label_fields(horizon, "UNAVAILABLE_NEXT_OPEN"))
+                continue
+            if horizon_exit_idx >= n:
+                out.update(_unavailable_label_fields(horizon, "UNAVAILABLE_FUTURE_WINDOW"))
+                continue
+
+            entry_price = as_float(open_values[entry_idx])
+            atr = as_float(atr_values[idx])
+            if not valid_price(entry_price) or atr <= 0:
+                out.update(_unavailable_label_fields(horizon, "INVALID_ENTRY_DATA"))
+                continue
+
+            stop_price = entry_price - stop_multiple * atr
+            risk_per_share = entry_price - stop_price
+            if risk_per_share <= 0:
+                out.update(_unavailable_label_fields(horizon, "INVALID_RISK_DISTANCE"))
+                continue
+
+            target_1r = entry_price + stop_multiple * atr
+            target_2r = entry_price + 2.0 * stop_multiple * atr
+            exit_idx = horizon_exit_idx
+            exit_price = as_float(close_values[horizon_exit_idx])
+            exit_reason = f"HORIZON_{horizon}D"
+            stop_hit = False
+            hit_1r = False
+            hit_2r = False
+            mfe = 0.0
+            mae = 0.0
+            ambiguous_stop_1r_same_day = False
+            ambiguous_stop_2r_same_day = False
+            gap_through_stop = False
+            first_touch_type = "NONE"
+            time_to_first_touch = np.nan
+            mfe_before_stop = np.nan
+            mae_before_profit = np.nan
+            time_to_1r = np.nan
+            time_to_2r = np.nan
+            time_to_stop = np.nan
+            signal_close = as_float(close_values[idx])
+            entry_gap_pct = entry_price / signal_close - 1.0 if valid_price(signal_close) else np.nan
+            event_regime_at_entry = f"{trend_values[entry_idx]}|{vol_values[entry_idx]}"
+
+            for j in range(entry_idx, horizon_exit_idx + 1):
+                low = as_float(low_values[j])
+                high = as_float(high_values[j])
+                open_price = as_float(open_values[j])
+                prior_mfe = mfe
+                prior_mae = mae
+                stop_touched = valid_price(low) and low <= stop_price
+                hit_1r_touched = valid_price(high) and high >= target_1r
+                hit_2r_touched = valid_price(high) and high >= target_2r
+                if stop_touched and hit_1r_touched:
+                    ambiguous_stop_1r_same_day = True
+                if stop_touched and hit_2r_touched:
+                    ambiguous_stop_2r_same_day = True
+                if pd.isna(time_to_first_touch) and (stop_touched or hit_1r_touched or hit_2r_touched):
+                    time_to_first_touch = j - entry_idx
+                    if stop_touched and hit_2r_touched:
+                        first_touch_type = "AMBIGUOUS_STOP_2R_SAME_DAY"
+                    elif stop_touched and hit_1r_touched:
+                        first_touch_type = "AMBIGUOUS_STOP_1R_SAME_DAY"
+                    elif stop_touched:
+                        first_touch_type = "STOP"
+                    elif hit_2r_touched:
+                        first_touch_type = "TARGET_2R"
+                    else:
+                        first_touch_type = "TARGET_1R"
+                if stop_touched and pd.isna(mfe_before_stop):
+                    mfe_before_stop = prior_mfe
+                if (hit_1r_touched or hit_2r_touched) and pd.isna(mae_before_profit):
+                    mae_before_profit = prior_mae
+                if valid_price(high):
+                    mfe = max(mfe, (high - entry_price) / risk_per_share)
+                if valid_price(low):
+                    mae = min(mae, (low - entry_price) / risk_per_share)
+                if stop_touched:
+                    exit_idx = j
+                    if valid_price(open_price) and open_price <= stop_price:
+                        gap_through_stop = True
+                    exit_price = open_price if valid_price(open_price) and open_price <= stop_price else stop_price
+                    exit_reason = f"ATR_STOP_{stop_multiple:g}X"
+                    stop_hit = True
+                    time_to_stop = j - entry_idx
+                    break
+                if hit_1r_touched:
+                    hit_1r = True
+                    if pd.isna(time_to_1r):
+                        time_to_1r = j - entry_idx
+                if hit_2r_touched:
+                    hit_2r = True
+                    if pd.isna(time_to_2r):
+                        time_to_2r = j - entry_idx
+
+            if not valid_price(exit_price):
+                out.update(_unavailable_label_fields(horizon, "INVALID_EXIT_DATA"))
+                continue
+
+            entry_after_cost = entry_price * (1.0 + cr)
+            exit_after_cost = exit_price * (1.0 - cr)
+            gross_return = exit_price / entry_price - 1.0
+            net_return = exit_after_cost / entry_after_cost - 1.0
+            expected_r = (exit_after_cost - entry_after_cost) / risk_per_share
+            success = (not stop_hit) and net_return > 0
+            positive_return = net_return > 0
+            if stop_hit:
+                exit_type_clean = "STOP"
+            elif hit_2r:
+                exit_type_clean = "TARGET_2R_OR_TIME"
+            elif hit_1r:
+                exit_type_clean = "TARGET_1R_OR_TIME"
+            else:
+                exit_type_clean = "TIME"
+
+            out.update(
+                {
+                    f"label_status_{horizon}d": "LABELED",
+                    f"label_success_{horizon}d": int(success),
+                    f"label_stop_survival_{horizon}d": int(not stop_hit),
+                    f"label_hit_1r_before_stop_{horizon}d": int(hit_1r),
+                    f"label_hit_2r_before_stop_{horizon}d": int(hit_2r),
+                    f"label_positive_return_{horizon}d": int(positive_return),
+                    f"label_expected_r_{horizon}d": expected_r,
+                    f"label_mfe_r_{horizon}d": mfe,
+                    f"label_mae_r_{horizon}d": mae,
+                    f"label_time_to_1r_{horizon}d": time_to_1r,
+                    f"label_time_to_2r_{horizon}d": time_to_2r,
+                    f"label_time_to_stop_{horizon}d": time_to_stop,
+                    f"label_ambiguous_stop_1r_same_day_{horizon}d": int(ambiguous_stop_1r_same_day),
+                    f"label_ambiguous_stop_2r_same_day_{horizon}d": int(ambiguous_stop_2r_same_day),
+                    f"label_gap_through_stop_{horizon}d": int(gap_through_stop),
+                    f"label_entry_gap_pct_{horizon}d": pct(entry_gap_pct),
+                    f"label_first_touch_type_{horizon}d": first_touch_type,
+                    f"label_time_to_first_touch_{horizon}d": time_to_first_touch,
+                    f"label_mfe_before_stop_{horizon}d": mfe_before_stop,
+                    f"label_mae_before_profit_{horizon}d": mae_before_profit,
+                    f"label_event_regime_at_entry_{horizon}d": event_regime_at_entry,
+                    f"label_net_return_pct_{horizon}d": pct(net_return),
+                    f"label_gross_return_pct_{horizon}d": pct(gross_return),
+                    f"label_exit_reason_{horizon}d": exit_reason,
+                    f"label_exit_type_clean_{horizon}d": exit_type_clean,
+                    f"label_entry_date_{horizon}d": dates[entry_idx],
+                    f"label_exit_date_{horizon}d": dates[exit_idx],
+                    f"label_entry_price_{horizon}d": entry_price,
+                    f"label_exit_price_{horizon}d": exit_price,
+                    f"label_stop_price_{horizon}d": stop_price,
+                    f"label_1r_price_{horizon}d": target_1r,
+                    f"label_2r_price_{horizon}d": target_2r,
+                    f"label_holding_trading_days_{horizon}d": exit_idx - entry_idx,
+                }
+            )
+        rows.append(out)
+    return add_label_overlap_uniqueness(pd.DataFrame(rows))
 
 
 def build_symbol_dataset(
@@ -107,9 +381,15 @@ def build_symbol_dataset(
     slippage_bps: float,
     stop_multiple: float,
     external_features_path: Path | None = None,
+    intraday_features_path: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     symbol = str(row["symbol"]).upper()
     symbol_group = str(row.get("symbol_group", "semiconductor"))
+    market_region = market_region_for_symbol(symbol, "", row.get("market_region"))
+    decision_flag = row.get("is_decision_universe", row.get("enabled", "true"))
+    is_decision_universe = str(decision_flag).strip().lower() in {"true", "1", "yes", "y", "t"}
+    decision_scope = str(row.get("decision_scope", "top10"))
+    training_scope = str(row.get("training_scope", "universal_research_pool"))
     for col in ["signals", "risk_policy", "trade_log", "enriched"]:
         if not Path(row[col]).exists():
             raise FileNotFoundError(f"{symbol} missing {col}: {row[col]}")
@@ -119,14 +399,19 @@ def build_symbol_dataset(
         Path(row["trade_log"]),
         Path(row["enriched"]),
         external_features_path,
+        intraday_features_path,
         symbol=symbol,
     )
-    labels = build_label_dataset(signals, commission_bps, slippage_bps, stop_multiple)
+    labels = build_pooled_label_dataset(signals, commission_bps, slippage_bps, stop_multiple)
     features = build_feature_matrix(signals, labels)
     scope_stats = build_candidate_scope_stats(labels)
     for frame in [labels, features, scope_stats]:
         frame.insert(0, "symbol", symbol)
         frame.insert(1, "symbol_group", symbol_group)
+        frame.insert(2, "market_region", market_region)
+        frame["is_decision_universe"] = is_decision_universe
+        frame["decision_scope"] = decision_scope
+        frame["training_scope"] = training_scope
     return labels, features, scope_stats
 
 
@@ -135,6 +420,13 @@ def add_cross_sectional_features(features: pd.DataFrame) -> pd.DataFrame:
         return features.copy()
     out = features.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    if "market_region" not in out.columns:
+        out["market_region"] = out["symbol"].map(lambda symbol: market_region_for_symbol(symbol))
+    out["market_region"] = out["market_region"].fillna("").astype(str).map(
+        lambda value: market_region_for_symbol("", "", value)
+    )
+    group_keys = ["market_region", "date"]
+    group_values = [out[key] for key in group_keys]
     rank_cols = [
         "return_20d",
         "return_60d",
@@ -145,19 +437,18 @@ def add_cross_sectional_features(features: pd.DataFrame) -> pd.DataFrame:
         "volume_ratio_20",
         "score_price_algo_total",
     ]
-    by_date = out.groupby("date", dropna=False)
     for col in rank_cols:
         if col not in out.columns:
             continue
         values = pd.to_numeric(out[col], errors="coerce")
-        out[f"cs_rank_{col}"] = values.groupby(out["date"], dropna=False).rank(pct=True, method="average")
-        mean = by_date[col].transform(lambda s: pd.to_numeric(s, errors="coerce").mean())
-        std = by_date[col].transform(lambda s: pd.to_numeric(s, errors="coerce").std()).replace(0, np.nan)
+        out[f"cs_rank_{col}"] = values.groupby(group_values, dropna=False).rank(pct=True, method="average")
+        mean = values.groupby(group_values, dropna=False).transform("mean")
+        std = values.groupby(group_values, dropna=False).transform("std").replace(0, np.nan)
         out[f"cs_z_{col}"] = (values - mean) / std
 
     if "return_20d" in out.columns:
         ret20 = pd.to_numeric(out["return_20d"], errors="coerce")
-        universe_median = ret20.groupby(out["date"], dropna=False).transform("median")
+        universe_median = ret20.groupby(group_values, dropna=False).transform("median")
         out["relative_return_vs_universe_median_20d"] = ret20 - universe_median
         for benchmark in ["SMH", "SOXX"]:
             bench_col = f"{benchmark.lower()}_return_20d"
@@ -172,16 +463,16 @@ def add_cross_sectional_features(features: pd.DataFrame) -> pd.DataFrame:
             out[f"relative_return_vs_{benchmark.lower()}_20d"] = ret20.to_numpy() - pd.to_numeric(out[bench_col], errors="coerce")
     if {"close", "sma_50"}.issubset(out.columns):
         above_50 = pd.to_numeric(out["close"], errors="coerce") >= pd.to_numeric(out["sma_50"], errors="coerce")
-        out["universe_above_sma50_ratio"] = above_50.astype(float).groupby(out["date"], dropna=False).transform("mean")
+        out["universe_above_sma50_ratio"] = above_50.astype(float).groupby(group_values, dropna=False).transform("mean")
     if {"close", "sma_200"}.issubset(out.columns):
         above_200 = pd.to_numeric(out["close"], errors="coerce") >= pd.to_numeric(out["sma_200"], errors="coerce")
-        out["universe_above_sma200_ratio"] = above_200.astype(float).groupby(out["date"], dropna=False).transform("mean")
+        out["universe_above_sma200_ratio"] = above_200.astype(float).groupby(group_values, dropna=False).transform("mean")
     if "is_model_training_candidate" in out.columns:
         model_training = out["is_model_training_candidate"].astype(str).str.lower().isin(["true", "1", "yes"])
-        out["universe_model_training_candidate_ratio"] = model_training.astype(float).groupby(out["date"], dropna=False).transform("mean")
+        out["universe_model_training_candidate_ratio"] = model_training.astype(float).groupby(group_values, dropna=False).transform("mean")
     if "is_decision_entry_candidate" in out.columns:
         decision_entry = out["is_decision_entry_candidate"].astype(str).str.lower().isin(["true", "1", "yes"])
-        out["universe_decision_entry_candidate_ratio"] = decision_entry.astype(float).groupby(out["date"], dropna=False).transform("mean")
+        out["universe_decision_entry_candidate_ratio"] = decision_entry.astype(float).groupby(group_values, dropna=False).transform("mean")
     return out
 
 
@@ -205,16 +496,11 @@ def add_signal_cluster_features(features: pd.DataFrame) -> pd.DataFrame:
     out["_pooled_strict_signal"] = strict_signal.astype(float)
     out["days_since_prev_signal"] = np.nan
     for _, group in out.groupby("symbol", sort=False):
-        last_event_date = None
-        for idx, row in group.iterrows():
-            date = row["date"]
-            if last_event_date is not None and pd.notna(date):
-                out.at[idx, "days_since_prev_signal"] = int((date - last_event_date).days)
-            if bool(out.at[idx, "_pooled_event_signal"]) and pd.notna(date):
-                last_event_date = date
         dated = group.dropna(subset=["date"]).copy()
         if dated.empty:
             continue
+        event_dates = dated["date"].where(out.loc[dated.index, "_pooled_event_signal"].astype(bool)).ffill().shift()
+        out.loc[dated.index, "days_since_prev_signal"] = (dated["date"] - event_dates).dt.days
         rolling_basis = out.loc[dated.index, ["date", "_pooled_event_signal", "_pooled_strict_signal"]].set_index("date")
         for window in [20, 60, 120]:
             out.loc[dated.index, f"signal_count_{window}d"] = (
@@ -271,9 +557,9 @@ def schema_rows(features: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
                     break
             if role == "metadata":
                 lower = str(col).lower()
-                if lower in {"fx_data_available", "tsmc_earnings_pre_5d_window", "tsmc_earnings_post_5d_window", "tsmc_earnings_event_day"}:
+                if lower in {"fx_data_available", "vix_data_available", "tsmc_earnings_pre_5d_window", "tsmc_earnings_post_5d_window", "tsmc_earnings_event_day"}:
                     role = "bool_feature"
-                elif lower.startswith(("cs_rank_", "cs_z_", "relative_return_vs_", "signal_count_", "strict_signal_count_", "universe_", "tsmc_", "market_", "peer_", "fx_", "external_")) or lower in {"days_since_prev_signal", "days_since_tsmc_earnings"}:
+                elif lower.startswith(("cs_rank_", "cs_z_", "relative_return_vs_", "signal_count_", "strict_signal_count_", "universe_", "tsmc_", "market_", "peer_", "fx_", "vix_", "external_")) or lower in {"days_since_prev_signal", "days_since_tsmc_earnings"}:
                     role = "numeric_feature"
                 elif "__x__" in lower:
                     role = "categorical_feature"
@@ -302,6 +588,33 @@ def schema_rows(features: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
 
 def check_row(check: str, passed: bool, severity: str, value, details: str = "") -> Dict:
     return {"check": check, "passed": bool(passed), "severity": severity, "value": value, "details": details}
+
+
+def to_bool_series(values: pd.Series, default: bool = False) -> pd.Series:
+    if values is None:
+        return pd.Series(dtype=bool)
+    if values.dtype == bool:
+        return values.fillna(default).astype(bool)
+    normalized = values.astype(str).str.strip().str.lower()
+    return normalized.isin({"true", "1", "yes", "y", "t"}).fillna(default)
+
+
+def decision_symbols(config: pd.DataFrame) -> list[str]:
+    if config.empty or "symbol" not in config.columns:
+        return []
+    if "is_decision_universe" in config.columns:
+        mask = to_bool_series(config["is_decision_universe"])
+    elif "enabled" in config.columns:
+        mask = to_bool_series(config["enabled"])
+    else:
+        return []
+    return sorted(config.loc[mask, "symbol"].astype(str).str.upper().unique().tolist())
+
+
+def _symbol_set(frame: pd.DataFrame) -> set[str]:
+    if frame.empty or "symbol" not in frame.columns:
+        return set()
+    return {str(symbol).upper() for symbol in frame["symbol"].dropna().tolist()}
 
 
 def assign_date_split(date_value) -> str:
@@ -336,6 +649,7 @@ def build_split_manifest(features: pd.DataFrame) -> pd.DataFrame:
         c
         for c in [
             "symbol_group",
+            "is_decision_universe",
             "is_trade_ready_entry_candidate",
             "is_decision_entry_candidate",
         ]
@@ -385,12 +699,14 @@ def build_split_manifest(features: pd.DataFrame) -> pd.DataFrame:
 
 
 TSM_DIRECT_SYMBOLS = {"TSM"}
-TSM_LIKE_FOUNDRY_IDM_SYMBOLS = {"TSM", "UMC", "GFS", "INTC", "STM", "TSEM"}
+TSM_LIKE_FOUNDRY_IDM_SYMBOLS = {"TSM", "UMC", "GFS", "INTC", "STM", "TSEM", "005930.KS"}
+TSM_MEMORY_SUPPLY_SYMBOLS = {"MU", "005930.KS", "000660.KS"}
 TSM_SUPPLY_CHAIN_SYMBOLS = {"ASML", "AMAT", "LRCX", "KLAC", "TER", "ENTG", "AMKR", "PLAB"}
 SEMI_BREADTH_REGIME_SYMBOLS = {"SMH", "SOXX", "SOXQ", "XSD", "PSI", "FTXL"}
 TSM_LIKE_BASE_GROUP_WEIGHTS = {
     "TSM_DIRECT": 1.00,
     "TSM_LIKE_FOUNDRY_IDM": 0.80,
+    "TSM_MEMORY_SUPPLY": 0.65,
     "TSM_SUPPLY_CHAIN": 0.55,
     "SEMI_BREADTH_REGIME": 0.40,
     "OTHER_SEMI": 0.25,
@@ -402,8 +718,10 @@ def tsm_like_group_for_symbol(symbol: str, symbol_group: str = "") -> str:
     group = str(symbol_group).lower()
     if value in TSM_DIRECT_SYMBOLS:
         return "TSM_DIRECT"
-    if value in TSM_LIKE_FOUNDRY_IDM_SYMBOLS or group in {"foundry", "foundry_idm"}:
+    if value in TSM_LIKE_FOUNDRY_IDM_SYMBOLS or group in {"foundry", "foundry_idm", "memory_foundry_idm"}:
         return "TSM_LIKE_FOUNDRY_IDM"
+    if value in TSM_MEMORY_SUPPLY_SYMBOLS or group in {"memory", "memory_storage"}:
+        return "TSM_MEMORY_SUPPLY"
     if value in TSM_SUPPLY_CHAIN_SYMBOLS or group in {"semicap", "semicap_osat"}:
         return "TSM_SUPPLY_CHAIN"
     if value in SEMI_BREADTH_REGIME_SYMBOLS or group in {"semiconductor_etf", "semi_breadth_regime"}:
@@ -436,6 +754,10 @@ def build_sample_audit(config: pd.DataFrame, labels: pd.DataFrame, features: pd.
             {
                 "symbol": symbol,
                 "symbol_group": symbol_group,
+                "market_region": market_region_for_symbol(symbol, "", cfg.get("market_region")),
+                "is_decision_universe": str(cfg.get("is_decision_universe", "")).strip(),
+                "decision_scope": str(cfg.get("decision_scope", "")),
+                "training_scope": str(cfg.get("training_scope", "")),
                 "strict_eligible": strict_eligible,
                 "loaded": loaded,
                 "row_count": int(len(symbol_features)),
@@ -450,8 +772,258 @@ def build_sample_audit(config: pd.DataFrame, labels: pd.DataFrame, features: pd.
     return pd.DataFrame(rows)
 
 
+def _combined_feature_labels(labels: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
+    if features.empty:
+        return pd.DataFrame()
+    key_cols = [c for c in ["symbol", "date", "signal_idx"] if c in features.columns and c in labels.columns]
+    label_cols = [
+        c
+        for c in labels.columns
+        if c.startswith("label_") or c in {"symbol", "date", "signal_idx"}
+    ]
+    if labels.empty or not key_cols or not label_cols:
+        return features.copy()
+    label_part = labels[list(dict.fromkeys(label_cols))].copy()
+    return features.merge(label_part, on=key_cols, how="left", suffixes=("", "_label"))
+
+
+def _nonempty_trigger(values: pd.Series) -> pd.Series:
+    return ~values.astype(str).str.strip().str.upper().isin({"", "NONE", "NO_ENTRY_TRIGGER", "NA", "N/A", "NULL"})
+
+
+def _candidate_masks(frame: pd.DataFrame, entry: float, watch: float, observation: float, overextended_line: float) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    score = pd.to_numeric(frame.get("score_price_algo_total", pd.Series(np.nan, index=frame.index)), errors="coerce")
+    dist50 = pd.to_numeric(frame.get("dist_close_sma_50_pct", pd.Series(np.nan, index=frame.index)), errors="coerce")
+    trend = to_bool_series(frame.get("algo_trend_up_loose", pd.Series(False, index=frame.index))).reindex(frame.index, fill_value=False)
+    high_vol = to_bool_series(frame.get("algo_vol_high", pd.Series(False, index=frame.index))).reindex(frame.index, fill_value=False)
+    extreme_vol = to_bool_series(frame.get("algo_vol_extreme", pd.Series(False, index=frame.index))).reindex(frame.index, fill_value=False)
+    trigger = _nonempty_trigger(frame.get("entry_trigger", pd.Series("", index=frame.index))).reindex(frame.index, fill_value=False)
+    overextended = trend & high_vol & (dist50 > overextended_line)
+    trade = (score >= entry) & trigger & (~extreme_vol) & (~overextended)
+    research = (score >= watch) & trend & (~overextended)
+    observe = (score >= observation) & trend
+    return trade.fillna(False), research.fillna(False), observe.fillna(False), overextended.fillna(False)
+
+
+def _mean_pct(frame: pd.DataFrame, col: str) -> float:
+    if col not in frame.columns or frame.empty:
+        return np.nan
+    return float(pd.to_numeric(frame[col], errors="coerce").mean())
+
+
+def _selected_max_drawdown_pct(selected: pd.DataFrame, return_col: str) -> float:
+    if selected.empty or return_col not in selected.columns or "date" not in selected.columns:
+        return np.nan
+    daily = selected.copy()
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily["_ret"] = pd.to_numeric(daily[return_col], errors="coerce") / 100.0
+    grouped = daily.dropna(subset=["date"]).groupby("date")["_ret"].mean().sort_index()
+    if grouped.empty:
+        return np.nan
+    equity = (1.0 + grouped.fillna(0.0)).cumprod()
+    drawdown = equity / equity.cummax() - 1.0
+    return float(drawdown.min() * 100.0)
+
+
+def _selected_sharpe(selected: pd.DataFrame, return_col: str) -> float:
+    if selected.empty or return_col not in selected.columns or "date" not in selected.columns:
+        return np.nan
+    daily = selected.copy()
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily["_ret"] = pd.to_numeric(daily[return_col], errors="coerce") / 100.0
+    grouped = daily.dropna(subset=["date"]).groupby("date")["_ret"].mean().dropna().sort_index()
+    std = grouped.std(ddof=0)
+    return float(grouped.mean() / std * np.sqrt(252)) if std and std > 0 else np.nan
+
+
+def _latest_changed_symbols(
+    latest_frame: pd.DataFrame,
+    trade: pd.Series,
+    research: pd.Series,
+    observe: pd.Series,
+    baseline_trade: pd.Series,
+    baseline_research: pd.Series,
+    baseline_observe: pd.Series,
+) -> str:
+    if latest_frame.empty or "symbol" not in latest_frame.columns:
+        return ""
+    changed = latest_frame[
+        (trade.reindex(latest_frame.index, fill_value=False) != baseline_trade.reindex(latest_frame.index, fill_value=False))
+        | (research.reindex(latest_frame.index, fill_value=False) != baseline_research.reindex(latest_frame.index, fill_value=False))
+        | (observe.reindex(latest_frame.index, fill_value=False) != baseline_observe.reindex(latest_frame.index, fill_value=False))
+    ]
+    return "|".join(sorted(changed["symbol"].astype(str).str.upper().tolist()))
+
+
+def _latest_rows_for_change_detection(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "symbol" not in frame.columns or "date" not in frame.columns:
+        return pd.DataFrame()
+    work = frame[["symbol", "date"]].copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    latest_index = work.sort_values(["symbol", "date"]).groupby(work["symbol"].astype(str).str.upper(), dropna=False).tail(1).index
+    return frame.loc[latest_index].copy()
+
+
+def build_rule_threshold_sensitivity(labels: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
+    frame = _combined_feature_labels(labels, features)
+    if frame.empty:
+        return pd.DataFrame()
+    rows: list[Dict[str, object]] = []
+    unique_dates = max(int(pd.to_datetime(frame.get("date", pd.Series(dtype=object)), errors="coerce").nunique()), 1)
+    latest_frame = _latest_rows_for_change_detection(frame)
+    baseline_trade, baseline_research, baseline_observe, _ = _candidate_masks(
+        frame,
+        BASELINE_ENTRY_SCORE,
+        BASELINE_WATCHLIST_SCORE,
+        BASELINE_OBSERVATION_SCORE,
+        BASELINE_OVEREXTENDED_SMA50,
+    )
+    for entry in ENTRY_SCORE_GRID:
+        for watch in WATCHLIST_SCORE_GRID:
+            for observation in OBSERVATION_SCORE_GRID:
+                for over_line in OVEREXTENDED_SMA50_GRID:
+                    trade, research, observe, overextended = _candidate_masks(frame, entry, watch, observation, over_line)
+                    selected = frame[trade].copy()
+                    stop_survival = pd.to_numeric(selected.get("label_stop_survival_20d", pd.Series(dtype=float)), errors="coerce")
+                    stop_hit_rate = float((1.0 - stop_survival).mean() * 100.0) if len(stop_survival.dropna()) else np.nan
+                    rows.append(
+                        {
+                            "entry_score_threshold": entry,
+                            "watchlist_score_threshold": watch,
+                            "observation_score_threshold": observation,
+                            "overextended_sma50_pct": over_line * 100.0,
+                            "is_current_baseline": bool(
+                                entry == BASELINE_ENTRY_SCORE
+                                and watch == BASELINE_WATCHLIST_SCORE
+                                and observation == BASELINE_OBSERVATION_SCORE
+                                and over_line == BASELINE_OVEREXTENDED_SMA50
+                            ),
+                            "selected_symbol_count": int(selected["symbol"].nunique()) if "symbol" in selected.columns else 0,
+                            "trade_candidate_count": int(trade.sum()),
+                            "research_candidate_count": int(research.sum()),
+                            "observation_candidate_count": int(observe.sum()),
+                            "overextended_event_count": int(overextended.sum()),
+                            "mean_fwd_return_20d_pct": _mean_pct(selected, "label_net_return_pct_20d"),
+                            "mean_fwd_return_60d_pct": _mean_pct(selected, "label_net_return_pct_60d"),
+                            "stop_hit_rate_20d_pct": stop_hit_rate,
+                            "mean_expected_r_20d": _mean_pct(selected, "label_expected_r_20d"),
+                            "max_drawdown_pct": _selected_max_drawdown_pct(selected, "label_net_return_pct_20d"),
+                            "sharpe_20d_zero_rf": _selected_sharpe(selected, "label_net_return_pct_20d"),
+                            "turnover_events_per_date": float(trade.sum() / unique_dates),
+                            "latest_affected_symbols": _latest_changed_symbols(
+                                latest_frame,
+                                trade,
+                                research,
+                                observe,
+                                baseline_trade,
+                                baseline_research,
+                                baseline_observe,
+                            ),
+                        }
+                    )
+    return pd.DataFrame(rows)
+
+
+def build_rule_threshold_sensitivity_summary(sensitivity: pd.DataFrame) -> pd.DataFrame:
+    if sensitivity.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "recommendation": "KEEP_CURRENT",
+                    "baseline_entry_score_threshold": BASELINE_ENTRY_SCORE,
+                    "baseline_watchlist_score_threshold": BASELINE_WATCHLIST_SCORE,
+                    "baseline_observation_score_threshold": BASELINE_OBSERVATION_SCORE,
+                    "baseline_overextended_sma50_pct": BASELINE_OVEREXTENDED_SMA50 * 100.0,
+                    "reason": "no_sensitivity_rows",
+                }
+            ]
+        )
+    baseline_rows = sensitivity[sensitivity["is_current_baseline"].astype(bool)]
+    baseline = baseline_rows.iloc[0] if not baseline_rows.empty else pd.Series(dtype=object)
+    baseline_sharpe = float(pd.to_numeric(pd.Series([baseline.get("sharpe_20d_zero_rf", np.nan)]), errors="coerce").iloc[0])
+    baseline_return = float(pd.to_numeric(pd.Series([baseline.get("mean_fwd_return_20d_pct", np.nan)]), errors="coerce").iloc[0])
+    baseline_dd = float(pd.to_numeric(pd.Series([baseline.get("max_drawdown_pct", np.nan)]), errors="coerce").iloc[0])
+    baseline_count = int(pd.to_numeric(pd.Series([baseline.get("trade_candidate_count", 0)]), errors="coerce").fillna(0).iloc[0])
+    candidates = sensitivity.copy()
+    candidates["_trade_count"] = pd.to_numeric(candidates["trade_candidate_count"], errors="coerce").fillna(0)
+    candidates["_sharpe"] = pd.to_numeric(candidates["sharpe_20d_zero_rf"], errors="coerce")
+    candidates["_return"] = pd.to_numeric(candidates["mean_fwd_return_20d_pct"], errors="coerce")
+    candidates["_dd"] = pd.to_numeric(candidates["max_drawdown_pct"], errors="coerce")
+    min_count = max(30, int(baseline_count * 0.5))
+    viable = candidates[candidates["_trade_count"] >= min_count].dropna(subset=["_sharpe", "_return"])
+    if viable.empty or pd.isna(baseline_sharpe):
+        best = baseline
+        recommendation = "KEEP_CURRENT"
+        reason = "insufficient_viable_alternative"
+    else:
+        viable["_score"] = viable["_sharpe"] + 0.02 * viable["_return"] + 0.005 * viable["_dd"].fillna(0.0)
+        best = viable.sort_values(["_score", "_trade_count"], ascending=[False, False]).iloc[0]
+        materially_better = (
+            float(best["_sharpe"]) > baseline_sharpe + 0.10
+            and float(best["_return"]) >= baseline_return
+            and (pd.isna(baseline_dd) or pd.isna(best["_dd"]) or float(best["_dd"]) >= baseline_dd - 5.0)
+        )
+        if not materially_better:
+            recommendation = "KEEP_CURRENT"
+            reason = "no_materially_better_grid_point"
+        elif float(best["entry_score_threshold"]) < BASELINE_ENTRY_SCORE or float(best["overextended_sma50_pct"]) > BASELINE_OVEREXTENDED_SMA50 * 100.0:
+            recommendation = "REVIEW_LOOSER"
+            reason = "alternative_has_better_risk_adjusted_metrics_with_looser_entry_or_chase_line"
+        elif float(best["entry_score_threshold"]) > BASELINE_ENTRY_SCORE or float(best["overextended_sma50_pct"]) < BASELINE_OVEREXTENDED_SMA50 * 100.0:
+            recommendation = "REVIEW_TIGHTER"
+            reason = "alternative_has_better_risk_adjusted_metrics_with_tighter_entry_or_chase_line"
+        else:
+            recommendation = "KEEP_CURRENT"
+            reason = "best_grid_point_matches_current_threshold_family"
+    return pd.DataFrame(
+        [
+            {
+                "recommendation": recommendation,
+                "reason": reason,
+                "baseline_entry_score_threshold": BASELINE_ENTRY_SCORE,
+                "baseline_watchlist_score_threshold": BASELINE_WATCHLIST_SCORE,
+                "baseline_observation_score_threshold": BASELINE_OBSERVATION_SCORE,
+                "baseline_overextended_sma50_pct": BASELINE_OVEREXTENDED_SMA50 * 100.0,
+                "baseline_trade_candidate_count": baseline_count,
+                "baseline_mean_fwd_return_20d_pct": baseline_return,
+                "baseline_sharpe_20d_zero_rf": baseline_sharpe,
+                "baseline_max_drawdown_pct": baseline_dd,
+                "best_entry_score_threshold": best.get("entry_score_threshold", np.nan),
+                "best_watchlist_score_threshold": best.get("watchlist_score_threshold", np.nan),
+                "best_observation_score_threshold": best.get("observation_score_threshold", np.nan),
+                "best_overextended_sma50_pct": best.get("overextended_sma50_pct", np.nan),
+                "best_trade_candidate_count": best.get("trade_candidate_count", np.nan),
+                "best_mean_fwd_return_20d_pct": best.get("mean_fwd_return_20d_pct", np.nan),
+                "best_sharpe_20d_zero_rf": best.get("sharpe_20d_zero_rf", np.nan),
+                "best_max_drawdown_pct": best.get("max_drawdown_pct", np.nan),
+                "config_mutation_allowed": False,
+            }
+        ]
+    )
+
+
+def build_rule_threshold_sensitivity_quality_checks(sensitivity: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
+    expected_grid_size = len(ENTRY_SCORE_GRID) * len(WATCHLIST_SCORE_GRID) * len(OBSERVATION_SCORE_GRID) * len(OVEREXTENDED_SMA50_GRID)
+    baseline_present = bool(not sensitivity.empty and sensitivity.get("is_current_baseline", pd.Series(dtype=bool)).astype(bool).any())
+    summary_recommendation = str(summary.iloc[0].get("recommendation", "")) if not summary.empty else ""
+    return pd.DataFrame(
+        [
+            check_row("rule_threshold_sensitivity_rows_positive", not sensitivity.empty, "CRITICAL", len(sensitivity)),
+            check_row("rule_threshold_sensitivity_grid_complete", len(sensitivity) == expected_grid_size, "CRITICAL", len(sensitivity), f"expected={expected_grid_size}"),
+            check_row("rule_threshold_sensitivity_baseline_present", baseline_present, "CRITICAL", baseline_present),
+            check_row("rule_threshold_sensitivity_recommendation_valid", summary_recommendation in {"KEEP_CURRENT", "REVIEW_LOOSER", "REVIEW_TIGHTER"}, "CRITICAL", summary_recommendation),
+            check_row("rule_threshold_sensitivity_no_config_mutation", True, "CRITICAL", "advisory_only"),
+        ]
+    )
+
+
 def build_quality_checks(config: pd.DataFrame, labels: pd.DataFrame, features: pd.DataFrame, schema: pd.DataFrame, failures: pd.DataFrame, split_manifest: pd.DataFrame) -> pd.DataFrame:
     loaded_symbol_count = int(features["symbol"].nunique()) if "symbol" in features.columns and not features.empty else 0
+    configured_decision_symbols = decision_symbols(config)
+    loaded_symbols = _symbol_set(features)
+    labeled_symbols = _symbol_set(labels)
+    missing_feature_symbols = sorted(set(configured_decision_symbols) - loaded_symbols)
+    missing_label_symbols = sorted(set(configured_decision_symbols) - labeled_symbols)
     trade_ready_20d = 0
     model_training_20d = 0
     if not labels.empty and {"is_trade_ready_entry_candidate", "label_status_20d"}.issubset(labels.columns):
@@ -462,7 +1034,23 @@ def build_quality_checks(config: pd.DataFrame, labels: pd.DataFrame, features: p
             model_training_20d = int((labels[training_col].astype(bool) & labels["label_status_20d"].eq("LABELED")).sum())
     rows = [
         check_row("pooled_config_symbol_count_positive", config["symbol"].nunique() > 0, "CRITICAL", config["symbol"].nunique()),
+        check_row(
+            "pooled_decision_symbol_count_eq_required",
+            not configured_decision_symbols or len(configured_decision_symbols) == REQUIRED_DECISION_SYMBOL_COUNT,
+            "CRITICAL",
+            len(configured_decision_symbols) if configured_decision_symbols else "not_configured",
+            f"required={REQUIRED_DECISION_SYMBOL_COUNT}",
+        ),
+        check_row(
+            "pooled_decision_symbols_loaded_all",
+            not configured_decision_symbols or (not missing_feature_symbols and not missing_label_symbols),
+            "CRITICAL",
+            "PASS" if not missing_feature_symbols and not missing_label_symbols else f"missing_features={','.join(missing_feature_symbols)};missing_labels={','.join(missing_label_symbols)}",
+            "Every decision universe symbol must be present in pooled feature and label datasets.",
+        ),
         check_row("pooled_loaded_symbol_count_at_least_10", loaded_symbol_count >= 10, "CRITICAL", loaded_symbol_count, "Need at least 10 loaded symbols for pooled semiconductor ML."),
+        check_row("pooled_training_scope_recorded", "training_scope" in features.columns if not features.empty else False, "CRITICAL", "training_scope"),
+        check_row("pooled_decision_scope_recorded", "decision_scope" in features.columns if not features.empty else False, "CRITICAL", "decision_scope"),
         check_row("pooled_input_failures_absent", failures.empty, "WARN", len(failures), "Missing per-symbol outputs are expected until universe runner is executed."),
         check_row("pooled_labels_non_empty", not labels.empty, "CRITICAL", len(labels)),
         check_row("pooled_features_non_empty", not features.empty, "CRITICAL", len(features)),
@@ -483,15 +1071,21 @@ def build_quality_checks(config: pd.DataFrame, labels: pd.DataFrame, features: p
         duplicate_keys = int(features.duplicated(["symbol", "date", "signal_idx"]).sum()) if {"symbol", "date", "signal_idx"}.issubset(features.columns) else -1
         rows.append(check_row("pooled_symbol_date_signal_unique", duplicate_keys == 0, "CRITICAL", duplicate_keys))
         feature_count = int(schema["role"].isin(["numeric_feature", "bool_feature", "categorical_feature"]).sum()) if not schema.empty else 0
-        rows.append(check_row("pooled_feature_count_at_least_80", feature_count >= 80, "CRITICAL", feature_count, "Current single-symbol schema should expose the expanded feature set."))
-        external_cols = [c for c in features.columns if str(c).lower().startswith(("tsmc_", "market_", "peer_", "fx_", "external_"))]
+        rows.append(check_row("pooled_feature_count_at_least_80", feature_count >= 80, "CRITICAL", feature_count, "Current per-symbol schema should expose the expanded feature set."))
+        external_cols = [c for c in features.columns if str(c).lower().startswith(("tsmc_", "market_", "peer_", "fx_", "vix_", "external_"))]
         rows.append(check_row("pooled_external_features_present", bool(external_cols), "WARN", len(external_cols), "EXTERNAL_FEATURES_MISSING if zero."))
+        intraday_cols = [
+            c
+            for c in features.columns
+            if str(c).lower().startswith(("hourly_", "model_minute_", "execution_minute_", "m5_", "m1_", "intraday_", "timeframe_"))
+        ]
+        rows.append(check_row("pooled_intraday_features_present", bool(intraday_cols), "WARN", len(intraday_cols), "INTRADAY_FEATURES_MISSING if zero."))
     return pd.DataFrame(rows)
 
 
 def write_report(outdir: Path, config: pd.DataFrame, labels: pd.DataFrame, features: pd.DataFrame, quality: pd.DataFrame, failures: pd.DataFrame, split_manifest: pd.DataFrame) -> None:
     lines = [
-        "# TSMC Pooled Prediction Dataset Report",
+        "# Top10 Pooled Prediction Dataset Report",
         "",
         f"- Symbols: {', '.join(config['symbol'].astype(str).str.upper())}",
         f"- Loaded symbols: {features['symbol'].nunique() if 'symbol' in features.columns and not features.empty else 0}",
@@ -539,6 +1133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--stop-multiple", type=float, default=2.0)
     parser.add_argument("--external-features", default="", help="Optional symbol/date external feature CSV produced by tsm_external_feature_engine.py.")
+    parser.add_argument("--intraday-features", default="", help="Optional symbol/date intraday feature CSV produced by tsm_intraday_feature_engine.py.")
     return parser.parse_args()
 
 
@@ -549,6 +1144,7 @@ def main() -> None:
     config_path = Path(args.config) if args.config else None
     config = read_config(config_path)
     external_features_path = Path(args.external_features) if str(args.external_features).strip() else None
+    intraday_features_path = Path(args.intraday_features) if str(args.intraday_features).strip() else None
 
     label_parts = []
     feature_parts = []
@@ -567,7 +1163,14 @@ def main() -> None:
                 )
                 continue
         try:
-            labels, features, scope_stats = build_symbol_dataset(row, args.commission_bps, args.slippage_bps, args.stop_multiple, external_features_path)
+            labels, features, scope_stats = build_symbol_dataset(
+                row,
+                args.commission_bps,
+                args.slippage_bps,
+                args.stop_multiple,
+                external_features_path,
+                intraday_features_path,
+            )
         except Exception as exc:
             failures.append({"symbol": str(row.get("symbol", "UNKNOWN")).upper(), "status": "SKIPPED_INPUT_UNAVAILABLE", "details": str(exc)})
             continue
@@ -584,6 +1187,9 @@ def main() -> None:
     split_manifest = build_split_manifest(features)
     sample_audit = build_sample_audit(config, labels, features)
     quality = build_quality_checks(config, labels, features, schema, failure_df, split_manifest)
+    threshold_sensitivity = build_rule_threshold_sensitivity(labels, features)
+    threshold_sensitivity_summary = build_rule_threshold_sensitivity_summary(threshold_sensitivity)
+    threshold_sensitivity_quality = build_rule_threshold_sensitivity_quality_checks(threshold_sensitivity, threshold_sensitivity_summary)
 
     labels.to_csv(outdir / "tsm_prediction_pooled_label_dataset.csv", index=False)
     features.to_csv(outdir / "tsm_prediction_pooled_feature_matrix.csv", index=False)
@@ -593,9 +1199,15 @@ def main() -> None:
     sample_audit.to_csv(outdir / "tsm_prediction_pooled_sample_audit.csv", index=False)
     failure_df.to_csv(outdir / "tsm_prediction_pooled_input_failures.csv", index=False)
     quality.to_csv(outdir / "tsm_prediction_pooled_quality_checks.csv", index=False)
+    threshold_sensitivity.to_csv(outdir / "tsm_rule_threshold_sensitivity.csv", index=False)
+    threshold_sensitivity_summary.to_csv(outdir / "tsm_rule_threshold_sensitivity_summary.csv", index=False)
+    threshold_sensitivity_quality.to_csv(outdir / "tsm_rule_threshold_sensitivity_quality_checks.csv", index=False)
     write_report(outdir, config, labels, features, quality, failure_df, split_manifest)
     print("완료: pooled prediction dataset outputs =", outdir.resolve())
     print(quality.to_string(index=False))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
