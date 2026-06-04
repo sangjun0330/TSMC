@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>투자 실행 대시보드</title>
+    <link rel="stylesheet" href="/styles.css?v=8" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <p class="eyebrow">운영 12종목</p>
+          <h1>Today Stock</h1>
+        </div>
+        <div class="system-strip" aria-label="시스템 상태">
+          <div class="fx-calculator">
+            <span>환율 계산기</span>
+            <div class="fx-control-row">
+              <input id="fxAmount" type="number" min="0" step="0.01" value="1" aria-label="환율 계산 금액" />
+              <select id="fxDirection" aria-label="환율 계산 방향">
+                <option value="usd_to_krw">USD → KRW</option>
+                <option value="krw_to_usd">KRW → USD</option>
+              </select>
+              <button id="fxCalcBtn" class="mini-button" type="button">계산</button>
+            </div>
+            <strong id="fxCalcResult">-</strong>
+          </div>
+          <div class="fx-card">
+            <span>환율</span>
+            <strong id="fxRate">확인 중</strong>
+            <button id="fxRefreshBtn" class="mini-button" type="button">조회하기</button>
+          </div>
+          <div>
+            <span>데이터</span>
+            <strong id="dataStatus">확인 중</strong>
+          </div>
+          <div>
+            <span>모델</span>
+            <strong id="modelStatus">확인 중</strong>
+          </div>
+          <div>
+            <span>감사</span>
+            <strong id="auditStatus">확인 중</strong>
+          </div>
+          <div>
+            <span>실거래</span>
+            <strong id="liveStatus">비활성</strong>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section id="actionRow" class="action-row" aria-label="우선 행동"></section>
+
+        <nav class="tabs" aria-label="대시보드 보기">
+          <button class="tab-button active" type="button" data-tab="all">전체 종목</button>
+          <button class="tab-button" type="button" data-tab="portfolio">내 보유</button>
+          <button class="tab-button" type="button" data-tab="execute_candidate">실행 후보</button>
+          <button class="tab-button" type="button" data-tab="watch">관찰</button>
+          <button class="tab-button" type="button" data-tab="risk">금지/위험</button>
+          <button class="tab-button" type="button" data-tab="system">시스템 상태</button>
+          <button class="tab-button" type="button" data-tab="run">업데이트 실행</button>
+        </nav>
+
+        <section id="dashboardView" class="focus-layout">
+          <section class="selector-panel" aria-label="종목 선택">
+            <div class="section-head">
+              <div>
+                <h2>종목 선택</h2>
+                <p id="boardSummary">12개 종목 확인 중</p>
+              </div>
+              <button id="refreshBtn" class="icon-button" type="button" title="새로고침" aria-label="새로고침">↻</button>
+            </div>
+            <div id="symbolGrid" class="symbol-strip" role="tablist" aria-label="종목 목록"></div>
+          </section>
+
+          <section id="detailPanel" class="focus-panel" aria-label="선택 종목 예측"></section>
+        </section>
+
+        <section id="systemPanel" class="single-panel hidden" aria-label="시스템 상태"></section>
+
+        <section id="runPanel" class="single-panel hidden" aria-label="업데이트 실행">
+          <div class="section-head">
+            <div>
+              <h2>업데이트 실행</h2>
+              <p id="runStatusText">대기</p>
+            </div>
+            <button id="stopRunBtn" class="secondary-button" type="button">중지</button>
+          </div>
+          <form id="runForm" class="run-form">
+            <label>
+              실행 작업
+              <select id="runMode" name="mode">
+                <option value="downstream">데이터 유지 후 전체 재계산</option>
+                <option value="full">전체 업데이트</option>
+                <option value="next_day_up_model_engine">내일 상승 예측 계산</option>
+                <option value="next_close_forecast_engine">종가 예측 계산</option>
+                <option value="universe_market_data_update">일/시간/분봉 데이터 갱신</option>
+                <option value="hourly">시간봉 데이터 갱신</option>
+                <option value="intraday">분봉 데이터 갱신</option>
+              </select>
+            </label>
+            <label>
+              시작일
+              <input id="runStart" name="start" type="date" value="2016-05-12" />
+            </label>
+            <label>
+              종료일
+              <input id="runEnd" name="end" type="date" />
+            </label>
+            <label class="check-field">
+              <input id="skipCharts" name="skip_charts" type="checkbox" checked />
+              차트 생성 생략
+            </label>
+            <button id="runBtn" class="primary-button" type="submit">실행</button>
+          </form>
+          <pre id="runLog" class="run-log"></pre>
+        </section>
+
+        <section id="portfolioPanel" class="single-panel pf-panel hidden" aria-label="내 포트폴리오">
+          <div class="section-head">
+            <div>
+              <h2>내 포트폴리오</h2>
+              <p>직접 기록한 매수·매도로 보유 비중·수익률·실행 티켓을 계산합니다 · 실제 주문은 전송되지 않습니다</p>
+            </div>
+            <div class="pf-head-actions">
+              <div class="pf-currency" id="pfCurrency" role="group" aria-label="표시 통화">
+                <button type="button" data-cur="KRW" class="active">원</button>
+                <button type="button" data-cur="USD">$</button>
+              </div>
+              <button id="pfAddBtn" class="primary-button" type="button">+ 거래 입력</button>
+            </div>
+          </div>
+
+          <div id="pfHero" class="pf-hero"></div>
+
+          <div class="pf-block">
+            <h3 class="pf-block-title">실행 티켓 · 지금 할 일</h3>
+            <div id="pfTickets" class="pf-ticket-area"></div>
+          </div>
+
+          <div class="pf-grid">
+            <div class="pf-block">
+              <h3 class="pf-block-title">보유 종목</h3>
+              <div id="pfHoldings" class="pf-table-wrap"></div>
+            </div>
+            <div class="pf-block">
+              <h3 class="pf-block-title">비중 배분</h3>
+              <div id="pfAllocation" class="pf-alloc"></div>
+            </div>
+          </div>
+
+          <div class="pf-block">
+            <h3 class="pf-block-title">내가 입력한 거래</h3>
+            <div id="pfTransactions" class="pf-table-wrap"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="pfModalBackdrop" class="pf-modal-backdrop hidden">
+      <div class="pf-modal" role="dialog" aria-modal="true" aria-labelledby="pfModalTitle">
+        <div class="pf-modal-head">
+          <h2 id="pfModalTitle">거래 입력</h2>
+          <button id="pfModalClose" class="pf-modal-close" type="button" aria-label="닫기">×</button>
+        </div>
+        <form id="pfForm" class="pf-form">
+          <input type="hidden" name="transaction_id" />
+          <div class="pf-form-row">
+            <label>종목<select name="symbol" id="pfSymbol" required></select></label>
+            <label>구분<select name="side"><option value="BUY">매수</option><option value="SELL">매도</option></select></label>
+          </div>
+          <div class="pf-form-row">
+            <label>거래일<input name="trade_date" type="date" required /></label>
+            <label>주수 (소수 가능)<input name="quantity" type="number" step="any" min="0" required /></label>
+          </div>
+          <div class="pf-form-row">
+            <label>체결가<input name="price" type="number" step="any" min="0" required /></label>
+            <label>통화<select name="price_currency"><option value="USD">USD ($)</option><option value="KRW">KRW (원)</option></select></label>
+          </div>
+          <div class="pf-form-row">
+            <label>수수료 (선택)<input name="fees" type="number" step="any" min="0" value="0" /></label>
+            <label>메모 (선택)<input name="note" type="text" /></label>
+          </div>
+          <p id="pfFormError" class="pf-form-error hidden"></p>
+          <div class="pf-form-actions">
+            <button id="pfSubmitBtn" class="primary-button" type="submit">저장</button>
+            <button id="pfDeleteBtn" class="secondary-button pf-danger hidden" type="button">삭제</button>
+            <button id="pfCancelBtn" class="secondary-button" type="button">취소</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <script src="/app.js?v=6"></script>
+  </body>
+</html>
