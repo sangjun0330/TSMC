@@ -20,4 +20,4 @@ launchctl bootstrap "${DOMAIN}" "${PLIST_PATH}"
 
 echo "Installed ${LABEL}"
 echo "Plist: ${PLIST_PATH}"
-echo "Schedule: Tue-Sat 06:00 local time"
+echo "Schedule: Tue-Sat 07:30 local time, run_daily_update.py --universe-mode hybrid"

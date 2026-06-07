@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Callable, Dict, Iterable, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -42,7 +44,7 @@ try:
     from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
     from sklearn.impute import SimpleImputer
     from sklearn.isotonic import IsotonicRegression
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LogisticRegression, SGDClassifier
     from sklearn.metrics import average_precision_score
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -71,11 +73,25 @@ except Exception as exc:  # pragma: no cover
     XGBOOST_IMPORT_ERROR = exc
 
 
+class ProgressLogger:
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+        self.started_at = time.perf_counter()
+
+    def __call__(self, message: str) -> None:
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self.started_at
+        print(f"[pooled_model +{elapsed:.1f}s] {message}", file=sys.stderr, flush=True)
+
+
+POOLED_MODEL_HORIZONS = (5, 20, 60)
 HORIZON = 20
 TARGET_COL = "label_success_20d"
 RETURN_COL = "label_net_return_pct_20d"
 EXPECTED_R_COL = "label_expected_r_20d"
 STOP_SURVIVAL_COL = "label_stop_survival_20d"
+STOP_HIT_LABEL_COL = "label_stop_hit_20d"
 HIT_1R_COL = "label_hit_1r_before_stop_20d"
 HIT_2R_COL = "label_hit_2r_before_stop_20d"
 TRADE_READY_COL = "is_trade_ready_entry_candidate"
@@ -154,10 +170,13 @@ MIN_SELECTED_MINUS_ALL_PCT = 0.0
 MIN_SELECTED_MINUS_ALL_TARGET_PCT = 0.25
 MIN_SELECTED_FRACTION = 0.30
 MAX_SELECTED_FRACTION = 0.60
+MIN_FOLD_SELECTED_FRACTION = 0.10
+MAX_FOLD_SELECTED_FRACTION = 0.60
 MIN_STOP_RATE_IMPROVEMENT = 0.05
 MAX_THRESHOLD_IQR = 0.10
 MAX_SELECTION_FRACTION_DRIFT = 0.10
 CONSENSUS_SELECTION_FRACTIONS = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60)
+LIVE_LIKE_RANK_SELECTION_FRACTIONS = (MIN_SELECTED_FRACTION,)
 SCORE_BASELINE_MIN_SCORE = 75.0
 SCORE_BASELINE_FALLBACK_MIN_N = 30
 UPLIFT_BOOTSTRAP_ITERATIONS = 200
@@ -168,13 +187,28 @@ PAPER_MAX_STOP_HIT_FOR_LATEST = 0.40
 PAPER_MAX_ECE = 0.12
 PAPER_MIN_SELECTED_EVAL_EVENTS = 100
 PAPER_MIN_SELECTED_PER_EVAL_SPLIT = 25
+REQUIRED_DECISION_SYMBOL_COUNT = 12
 PAPER_MIN_SELECTED_MINUS_ALL_CI_LOWER_PCT = -0.50
 MIN_TSM_LIKE_EFFECTIVE_SELECTION_N = 500
 MIN_TSM_LIKE_ISOTONIC_EFFECTIVE_N = 1000
 MIN_ISOTONIC_CALIBRATION_EVENTS = 1000
+MIN_EFFECTIVE_OOF_FOLDS_FOR_THRESHOLD = 4
 PLATT_SHRINKAGE_PRIOR_STRENGTH = 1000.0
 STRICT_SCOPE_CALIBRATION_PRIOR_STRENGTH = 250.0
 TIER_LAYER_PRIOR_STRENGTH = 150.0
+STOP_RISK_RAW_COL = "p_stop_hit_raw"
+STOP_RISK_LGBM_COL = "p_stop_hit_lgbm"
+STOP_RISK_GLOBAL_CALIBRATED_COL = "p_stop_hit_global_calibrated"
+STOP_RISK_TIER_CALIBRATED_COL = "p_stop_hit_tier_calibrated"
+STOP_RISK_CANDIDATE_CALIBRATED_COL = "p_stop_hit_calibrated_candidate"
+STOP_RISK_CALIBRATED_COL = "p_stop_hit_calibrated"
+STOP_RISK_SURVIVAL_CALIBRATED_COL = "p_stop_survival_calibrated"
+STOP_RISK_RAW_MINUS_CALIBRATED_COL = "p_stop_hit_raw_minus_calibrated"
+STOP_RISK_OOS_PERCENTILE_COL = "p_stop_hit_oos_percentile"
+STOP_RISK_WARNING_COL = "stop_risk_calibration_warning"
+STOP_RISK_RAW_CALIBRATED_WARNING_THRESHOLD = 0.05
+STOP_RISK_EVAL_SPLITS = ("test_2024", "final_holdout_2025_2026")
+OOF_TRADE_PROBABILITY_SHRINKAGE_WEIGHT = 0.70
 TIER_SAMPLE_WEIGHTS = {
     "decision_trade_ready": 4.0,
     "relaxed_trigger_score65": 1.5,
@@ -182,10 +216,13 @@ TIER_SAMPLE_WEIGHTS = {
     "setup_context_score65": 1.0,
 }
 RISK_AWARE_SELECTION_WEIGHT_PROFILES = (
-    {"label": "balanced_rank", "w_success": 0.45, "w_stop": 0.30, "w_r": 0.20, "w_rule": 0.05},
-    {"label": "stop_heavy_rank", "w_success": 0.35, "w_stop": 0.45, "w_r": 0.15, "w_rule": 0.05},
-    {"label": "very_stop_heavy_rank", "w_success": 0.30, "w_stop": 0.55, "w_r": 0.10, "w_rule": 0.05},
-    {"label": "rule_stop_rank", "w_success": 0.30, "w_stop": 0.40, "w_r": 0.15, "w_rule": 0.15},
+    {"label": "stop_guard_rank", "w_success": 0.10, "w_stop": 0.80, "w_r": 0.10, "w_return": 0.00, "w_rule": 0.00},
+    {"label": "balanced_rank", "w_success": 0.45, "w_stop": 0.30, "w_r": 0.20, "w_return": 0.00, "w_rule": 0.05},
+    {"label": "stop_heavy_rank", "w_success": 0.35, "w_stop": 0.45, "w_r": 0.15, "w_return": 0.00, "w_rule": 0.05},
+    {"label": "very_stop_heavy_rank", "w_success": 0.30, "w_stop": 0.55, "w_r": 0.10, "w_return": 0.00, "w_rule": 0.05},
+    {"label": "rule_stop_rank", "w_success": 0.30, "w_stop": 0.40, "w_r": 0.15, "w_return": 0.00, "w_rule": 0.15},
+    {"label": "return_stop_rank", "w_success": 0.25, "w_stop": 0.30, "w_r": 0.10, "w_return": 0.30, "w_rule": 0.05},
+    {"label": "return_heavy_rank", "w_success": 0.20, "w_stop": 0.20, "w_r": 0.05, "w_return": 0.50, "w_rule": 0.05},
 )
 SLICE_DIMENSIONS = [
     "candidate_tier",
@@ -237,6 +274,7 @@ class TsmCalibrationRouteSpec:
     layer: TsmCalibrationLayer | None = None
     calibrator: object | None = None
     calibration_method: str = "identity"
+    constant_probability: float | None = None
 
 
 @dataclass
@@ -264,6 +302,31 @@ class WalkForwardFold:
 
 
 EMBARGO_TRADING_DAYS = 20
+
+
+def horizon_col(prefix: str, horizon: int | None = None) -> str:
+    return f"{prefix}_{int(horizon if horizon is not None else HORIZON)}d"
+
+
+def active_horizon_suffix() -> str:
+    return f"{int(HORIZON)}d"
+
+
+def set_active_horizon(horizon: int) -> None:
+    """Switch the pooled model's target/label columns to a supported horizon."""
+    global HORIZON, TARGET_COL, RETURN_COL, EXPECTED_R_COL, STOP_SURVIVAL_COL, STOP_HIT_LABEL_COL, HIT_1R_COL, HIT_2R_COL, EMBARGO_TRADING_DAYS
+    parsed = int(horizon)
+    if parsed <= 0:
+        raise ValueError(f"horizon must be positive, got {horizon}")
+    HORIZON = parsed
+    TARGET_COL = horizon_col("label_success", parsed)
+    RETURN_COL = horizon_col("label_net_return_pct", parsed)
+    EXPECTED_R_COL = horizon_col("label_expected_r", parsed)
+    STOP_SURVIVAL_COL = horizon_col("label_stop_survival", parsed)
+    STOP_HIT_LABEL_COL = horizon_col("label_stop_hit", parsed)
+    HIT_1R_COL = horizon_col("label_hit_1r_before_stop", parsed)
+    HIT_2R_COL = horizon_col("label_hit_2r_before_stop", parsed)
+    EMBARGO_TRADING_DAYS = parsed
 WALK_FORWARD_FOLDS = [
     WalkForwardFold("wf_2021", "2016-01-01", "2019-12-31", "2020-01-01", "2020-06-30", "2020-07-01", "2020-12-31", "2021-01-01", "2021-12-31"),
     WalkForwardFold("wf_2022", "2016-01-01", "2020-12-31", "2021-01-01", "2021-06-30", "2021-07-01", "2021-12-31", "2022-01-01", "2022-12-31"),
@@ -282,6 +345,7 @@ def strip_bom_columns(df: pd.DataFrame) -> pd.DataFrame:
 def read_csv(path: Path, **kwargs) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
+    kwargs.setdefault("low_memory", False)
     return strip_bom_columns(pd.read_csv(path, **kwargs))
 
 
@@ -297,6 +361,18 @@ def to_bool(value) -> bool:
     if pd.isna(value):
         return False
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def filter_latest_predictions_to_decision_scope(latest_predictions: pd.DataFrame) -> pd.DataFrame:
+    if latest_predictions.empty or "is_decision_universe" not in latest_predictions.columns:
+        return latest_predictions.copy()
+    return latest_predictions[latest_predictions["is_decision_universe"].map(to_bool)].copy()
+
+
+def filter_latest_predictions_for_output_scope(latest_predictions: pd.DataFrame, decision_only: bool) -> pd.DataFrame:
+    if decision_only:
+        return filter_latest_predictions_to_decision_scope(latest_predictions)
+    return latest_predictions.copy()
 
 
 def logit(p: float) -> float:
@@ -351,6 +427,8 @@ def bootstrap_mean_diff(
     selected = pd.to_numeric(selected_values, errors="coerce").dropna().to_numpy(dtype=float)
     baseline = pd.to_numeric(baseline_values, errors="coerce").dropna().to_numpy(dtype=float)
     if len(selected) == 0 or len(baseline) == 0:
+        return np.nan, np.nan
+    if int(iterations) <= 0:
         return np.nan, np.nan
     rng = np.random.default_rng(seed)
     diffs = np.empty(int(iterations), dtype=float)
@@ -471,12 +549,13 @@ def paired_bootstrap_uplift(
 
 
 def brier_score(y_true: pd.Series, p: pd.Series) -> float:
-    y = pd.to_numeric(y_true, errors="coerce")
-    pred = pd.to_numeric(p, errors="coerce")
-    mask = y.notna() & pred.notna()
+    y = pd.to_numeric(y_true, errors="coerce").to_numpy(dtype=float)
+    pred = pd.to_numeric(p, errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(y) & np.isfinite(pred)
     if not mask.any():
         return np.nan
-    return float(np.mean((pred[mask] - y[mask]) ** 2))
+    diff = pred[mask] - y[mask]
+    return float(np.mean(diff * diff))
 
 
 def ece_score(y_true: pd.Series, p: pd.Series, bins: int = 10) -> tuple[float, int]:
@@ -539,6 +618,22 @@ def enrich_pooled_features(features: pd.DataFrame) -> pd.DataFrame:
     return add_pooled_feature_engineering(features)
 
 
+def is_intraday_feature(col: str) -> bool:
+    lower = str(col).lower()
+    return (
+        lower.startswith(("hourly_", "model_minute_", "execution_minute_", "m5_", "m1_", "intraday_", "timeframe_"))
+        or lower in {"daily_signal_available"}
+    )
+
+
+def intraday_feature_has_sufficient_coverage(series: pd.Series) -> bool:
+    if str(series.name).lower().endswith(("_feature_status", "_source_provider")):
+        return series.notna().sum() > 0
+    if str(series.name).lower() in {"intraday_coverage_class", "intraday_feature_status"}:
+        return series.notna().sum() > 0
+    return int(series.notna().sum()) >= min(20, max(2, int(len(series) * 0.01)))
+
+
 def pooled_feature_columns(data: pd.DataFrame) -> list[str]:
     cols: list[str] = []
     blocked_exact = {
@@ -548,7 +643,7 @@ def pooled_feature_columns(data: pd.DataFrame) -> list[str]:
         STOP_SURVIVAL_COL,
         HIT_1R_COL,
         HIT_2R_COL,
-        "label_status_20d",
+        horizon_col("label_status"),
         "label_status_60d",
         "universe_model_training_candidate_ratio",
         "universe_decision_entry_candidate_ratio",
@@ -561,7 +656,8 @@ def pooled_feature_columns(data: pd.DataFrame) -> list[str]:
             continue
         if any(pattern in lower for pattern in FORBIDDEN_POOLED_FEATURE_PATTERNS):
             continue
-        if data[col].isna().mean() > 0.50:
+        missing_rate = data[col].isna().mean()
+        if missing_rate > 0.50 and not (is_intraday_feature(col) and intraday_feature_has_sufficient_coverage(data[col])):
             continue
         if (
             pd.api.types.is_numeric_dtype(data[col])
@@ -753,6 +849,380 @@ def apply_candidate_tier_calibration(rows: pd.DataFrame, p_col: str, layers: dic
     return apply_group_logit_shift(rows, p_col, layers, "candidate_tier")
 
 
+def ensure_stop_hit_label(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if STOP_HIT_LABEL_COL in out.columns:
+        out[STOP_HIT_LABEL_COL] = pd.to_numeric(out[STOP_HIT_LABEL_COL], errors="coerce")
+    elif STOP_SURVIVAL_COL in out.columns:
+        out[STOP_HIT_LABEL_COL] = 1.0 - pd.to_numeric(out[STOP_SURVIVAL_COL], errors="coerce")
+    else:
+        out[STOP_HIT_LABEL_COL] = np.nan
+    return out
+
+
+def fit_group_logit_calibration(
+    rows: pd.DataFrame,
+    p_col: str,
+    y_col: str,
+    group_col: str,
+    global_base_rate: float,
+    prior_strength: int,
+    min_events: int = MIN_TSM_CALIBRATION_EVENTS,
+) -> dict[str, dict[str, object]]:
+    if group_col not in rows.columns:
+        return {}
+    layers: dict[str, dict[str, object]] = {}
+    groups = rows[group_col].fillna("MISSING").astype(str)
+    for group, group_rows in rows.groupby(groups, dropna=False):
+        layers[str(group)] = fit_logit_shift_with_shrinkage(
+            group_rows,
+            p_col=p_col,
+            y_col=y_col,
+            global_base_rate=global_base_rate,
+            prior_strength=int(prior_strength),
+            min_events=min_events,
+        )
+    return layers
+
+
+def stop_risk_eval_frame(frame: pd.DataFrame, evaluation_scope: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    if evaluation_scope == TRADE_READY_EVAL_SCOPE and DECISION_ENTRY_COL in frame.columns:
+        return frame[frame[DECISION_ENTRY_COL].map(to_bool)].copy()
+    return frame.copy()
+
+
+def stop_risk_metric_row(
+    split_name: str,
+    evaluation_scope: str,
+    frame: pd.DataFrame,
+    raw_col: str = STOP_RISK_RAW_COL,
+    calibrated_col: str = STOP_RISK_CALIBRATED_COL,
+    candidate_col: str = STOP_RISK_CANDIDATE_CALIBRATED_COL,
+) -> dict[str, object]:
+    work = stop_risk_eval_frame(ensure_stop_hit_label(frame), evaluation_scope)
+    label = pd.to_numeric(work.get(STOP_HIT_LABEL_COL, pd.Series(dtype=float)), errors="coerce")
+    raw = pd.to_numeric(work.get(raw_col, pd.Series(dtype=float)), errors="coerce")
+    calibrated = pd.to_numeric(work.get(calibrated_col, pd.Series(dtype=float)), errors="coerce")
+    candidate = pd.to_numeric(work.get(candidate_col, calibrated), errors="coerce")
+    mask = label.notna() & raw.notna()
+    work = work.loc[mask].copy()
+    label = label.loc[mask]
+    raw = raw.loc[mask]
+    calibrated = calibrated.reindex(label.index)
+    candidate = candidate.reindex(label.index)
+    raw_ece, raw_min_bin = ece_score(label, raw)
+    calibrated_ece, calibrated_min_bin = ece_score(label, calibrated)
+    candidate_ece, candidate_min_bin = ece_score(label, candidate)
+    raw_brier = brier_score(label, raw)
+    calibrated_brier = brier_score(label, calibrated)
+    candidate_brier = brier_score(label, candidate)
+    actual = float(label.mean()) if not label.empty else np.nan
+    raw_mean = float(raw.mean()) if not raw.empty else np.nan
+    calibrated_mean = float(calibrated.mean()) if not calibrated.dropna().empty else np.nan
+    candidate_mean = float(candidate.mean()) if not candidate.dropna().empty else np.nan
+    return {
+        "split": split_name,
+        "evaluation_scope": evaluation_scope,
+        "event_count": int(len(label)),
+        "actual_stop_rate": actual,
+        "raw_predicted_stop_rate": raw_mean,
+        "calibrated_predicted_stop_rate": calibrated_mean,
+        "candidate_calibrated_predicted_stop_rate": candidate_mean,
+        "raw_overprediction": raw_mean - actual if pd.notna(raw_mean) and pd.notna(actual) else np.nan,
+        "calibrated_overprediction": calibrated_mean - actual if pd.notna(calibrated_mean) and pd.notna(actual) else np.nan,
+        "candidate_calibrated_overprediction": candidate_mean - actual if pd.notna(candidate_mean) and pd.notna(actual) else np.nan,
+        "raw_brier": raw_brier,
+        "calibrated_brier": calibrated_brier,
+        "candidate_calibrated_brier": candidate_brier,
+        "brier_delta_calibrated_minus_raw": calibrated_brier - raw_brier if pd.notna(calibrated_brier) and pd.notna(raw_brier) else np.nan,
+        "candidate_brier_delta_minus_raw": candidate_brier - raw_brier if pd.notna(candidate_brier) and pd.notna(raw_brier) else np.nan,
+        "raw_ece": raw_ece,
+        "calibrated_ece": calibrated_ece,
+        "candidate_calibrated_ece": candidate_ece,
+        "ece_delta_calibrated_minus_raw": calibrated_ece - raw_ece if pd.notna(calibrated_ece) and pd.notna(raw_ece) else np.nan,
+        "candidate_ece_delta_minus_raw": candidate_ece - raw_ece if pd.notna(candidate_ece) and pd.notna(raw_ece) else np.nan,
+        "calibrated_ece_not_worse_than_raw": bool(pd.notna(calibrated_ece) and pd.notna(raw_ece) and calibrated_ece <= raw_ece + 1e-12),
+        "raw_min_calibration_bin_n": raw_min_bin,
+        "calibrated_min_calibration_bin_n": calibrated_min_bin,
+        "candidate_min_calibration_bin_n": candidate_min_bin,
+    }
+
+
+def fit_stop_risk_calibration_model(predictions: pd.DataFrame) -> dict[str, object]:
+    work = ensure_stop_hit_label(predictions)
+    if STOP_RISK_LGBM_COL not in work.columns:
+        work[STOP_RISK_LGBM_COL] = work.get("p_stop_hit", 0.5)
+    split_series = work.get("split", pd.Series("", index=work.index)).astype(str)
+    purpose_series = work.get("oof_purpose", pd.Series("", index=work.index)).astype(str)
+    validation = work[split_series.eq("validation_2023") | purpose_series.eq("calibration")].copy()
+    calibration_source = validation if not validation.empty else work.copy()
+    y = pd.to_numeric(calibration_source[STOP_HIT_LABEL_COL], errors="coerce")
+    global_base_rate = safe_float(y.mean(), np.nan)
+    if pd.isna(global_base_rate):
+        global_base_rate = safe_float(pd.to_numeric(work[STOP_HIT_LABEL_COL], errors="coerce").mean(), 0.5)
+    calibrator, global_method = fit_probability_calibrator(
+        calibration_source[STOP_RISK_LGBM_COL],
+        calibration_source[STOP_HIT_LABEL_COL],
+    )
+    temp = work.copy()
+    temp[STOP_RISK_RAW_COL] = clip_probability(pd.to_numeric(temp[STOP_RISK_LGBM_COL], errors="coerce"))
+    temp[STOP_RISK_GLOBAL_CALIBRATED_COL] = apply_probability_calibrator(
+        temp[STOP_RISK_RAW_COL],
+        calibrator,
+        global_method,
+    )
+    temp_split_series = temp.get("split", pd.Series("", index=temp.index)).astype(str)
+    temp_purpose_series = temp.get("oof_purpose", pd.Series("", index=temp.index)).astype(str)
+    validation_temp = temp[temp_split_series.eq("validation_2023") | temp_purpose_series.eq("calibration")].copy()
+    if validation_temp.empty:
+        validation_temp = temp.copy()
+    tier_layers = fit_group_logit_calibration(
+        validation_temp,
+        STOP_RISK_GLOBAL_CALIBRATED_COL,
+        STOP_HIT_LABEL_COL,
+        "candidate_tier",
+        global_base_rate,
+        int(TIER_LAYER_PRIOR_STRENGTH),
+    )
+    temp[STOP_RISK_TIER_CALIBRATED_COL] = apply_group_logit_shift(
+        temp,
+        STOP_RISK_GLOBAL_CALIBRATED_COL,
+        tier_layers,
+        "candidate_tier",
+    )
+    temp_split_series = temp.get("split", pd.Series("", index=temp.index)).astype(str)
+    temp_purpose_series = temp.get("oof_purpose", pd.Series("", index=temp.index)).astype(str)
+    validation_temp = temp[temp_split_series.eq("validation_2023") | temp_purpose_series.eq("calibration")].copy()
+    if validation_temp.empty:
+        validation_temp = temp.copy()
+    symbol_group_layers = fit_group_logit_calibration(
+        validation_temp,
+        STOP_RISK_TIER_CALIBRATED_COL,
+        STOP_HIT_LABEL_COL,
+        "symbol_group",
+        global_base_rate,
+        int(SYMBOL_GROUP_LAYER_PRIOR_STRENGTH),
+    )
+    temp[STOP_RISK_CANDIDATE_CALIBRATED_COL] = apply_group_logit_shift(
+        temp,
+        STOP_RISK_TIER_CALIBRATED_COL,
+        symbol_group_layers,
+        "symbol_group",
+    )
+    temp[STOP_RISK_CALIBRATED_COL] = temp[STOP_RISK_CANDIDATE_CALIBRATED_COL]
+    temp_split_series = temp.get("split", pd.Series("", index=temp.index)).astype(str)
+    temp_purpose_series = temp.get("oof_purpose", pd.Series("", index=temp.index)).astype(str)
+    eval_rows = temp[temp_split_series.isin(STOP_RISK_EVAL_SPLITS) | temp_purpose_series.eq("test")].copy()
+    if eval_rows.empty:
+        eval_rows = temp.copy()
+    raw_ece, _ = ece_score(eval_rows[STOP_HIT_LABEL_COL], eval_rows[STOP_RISK_RAW_COL])
+    candidate_ece, _ = ece_score(eval_rows[STOP_HIT_LABEL_COL], eval_rows[STOP_RISK_CANDIDATE_CALIBRATED_COL])
+    use_candidate = bool(pd.notna(raw_ece) and pd.notna(candidate_ece) and candidate_ece <= raw_ece + 1e-12)
+    method = f"{global_method}_tier_symbol_shrunk"
+    if not use_candidate:
+        method = "identity_oos_ece_guardrail"
+    reference_col = STOP_RISK_CANDIDATE_CALIBRATED_COL if use_candidate else STOP_RISK_RAW_COL
+    reference = pd.to_numeric(eval_rows[reference_col], errors="coerce").dropna()
+    return {
+        "calibrator": calibrator,
+        "global_method": global_method,
+        "calibration_method": method,
+        "active_source_col": reference_col,
+        "use_candidate_calibration": use_candidate,
+        "oos_raw_ece": raw_ece,
+        "oos_candidate_calibrated_ece": candidate_ece,
+        "global_base_rate": global_base_rate,
+        "tier_layers": tier_layers,
+        "symbol_group_layers": symbol_group_layers,
+        "reference_probabilities": reference,
+        "fit_source": "validation_2023",
+        "evaluation_source": "test_2024_plus_final_holdout_2025_2026",
+    }
+
+
+def apply_stop_risk_calibration(rows: pd.DataFrame, calibration_model: dict[str, object]) -> pd.DataFrame:
+    out = ensure_stop_hit_label(rows)
+    if STOP_RISK_LGBM_COL not in out.columns:
+        out[STOP_RISK_LGBM_COL] = out.get("p_stop_hit", 0.5)
+    out[STOP_RISK_RAW_COL] = clip_probability(pd.to_numeric(out[STOP_RISK_LGBM_COL], errors="coerce"))
+    out[STOP_RISK_GLOBAL_CALIBRATED_COL] = apply_probability_calibrator(
+        out[STOP_RISK_RAW_COL],
+        calibration_model.get("calibrator"),
+        str(calibration_model.get("global_method", "identity_insufficient_sample")),
+    )
+    out[STOP_RISK_TIER_CALIBRATED_COL] = apply_group_logit_shift(
+        out,
+        STOP_RISK_GLOBAL_CALIBRATED_COL,
+        calibration_model.get("tier_layers", {}),
+        "candidate_tier",
+    )
+    out[STOP_RISK_CANDIDATE_CALIBRATED_COL] = apply_group_logit_shift(
+        out,
+        STOP_RISK_TIER_CALIBRATED_COL,
+        calibration_model.get("symbol_group_layers", {}),
+        "symbol_group",
+    )
+    active_source_col = str(calibration_model.get("active_source_col", STOP_RISK_RAW_COL))
+    if active_source_col not in out.columns:
+        active_source_col = STOP_RISK_RAW_COL
+    out[STOP_RISK_CALIBRATED_COL] = clip_probability(out[active_source_col])
+    out[STOP_RISK_SURVIVAL_CALIBRATED_COL] = 1.0 - out[STOP_RISK_CALIBRATED_COL]
+    out[STOP_RISK_RAW_MINUS_CALIBRATED_COL] = pd.to_numeric(out[STOP_RISK_RAW_COL], errors="coerce") - pd.to_numeric(
+        out[STOP_RISK_CALIBRATED_COL],
+        errors="coerce",
+    )
+    warnings = []
+    method = str(calibration_model.get("calibration_method", ""))
+    for _, row in out.iterrows():
+        row_warnings: list[str] = []
+        gap = safe_float(row.get(STOP_RISK_RAW_MINUS_CALIBRATED_COL), np.nan)
+        if pd.notna(gap) and abs(gap) > STOP_RISK_RAW_CALIBRATED_WARNING_THRESHOLD:
+            row_warnings.append("STOP_RAW_CALIBRATED_GAP_GT_5PCT")
+        if method == "identity_oos_ece_guardrail":
+            row_warnings.append("STOP_CALIBRATION_GUARDRAIL_USING_RAW")
+        warnings.append("|".join(row_warnings) if row_warnings else "PASS")
+    out[STOP_RISK_WARNING_COL] = warnings
+    reference = calibration_model.get("reference_probabilities", pd.Series(dtype=float))
+    if not isinstance(reference, pd.Series):
+        reference = pd.Series(reference, dtype=float)
+    out[STOP_RISK_OOS_PERCENTILE_COL] = percentile_rank_against_reference(out[STOP_RISK_CALIBRATED_COL], reference)
+    out["stop_risk_calibration_method"] = method
+    out["stop_risk_calibration_active_source_col"] = active_source_col
+    return out
+
+
+def build_stop_risk_calibration_summary(
+    predictions: pd.DataFrame,
+    calibration_model: dict[str, object],
+) -> pd.DataFrame:
+    work = ensure_stop_hit_label(predictions)
+    splits = [
+        ("train_2016_2022", work[work["split"].astype(str).eq("train_2016_2022")]),
+        ("validation_2023", work[work["split"].astype(str).eq("validation_2023")]),
+        ("test_2024", work[work["split"].astype(str).eq("test_2024")]),
+        ("final_holdout_2025_2026", work[work["split"].astype(str).eq("final_holdout_2025_2026")]),
+        ("combined_test_holdout", work[work["split"].astype(str).isin(STOP_RISK_EVAL_SPLITS)]),
+    ]
+    rows: list[dict[str, object]] = []
+    for split_name, frame in splits:
+        for evaluation_scope in [ENTRY_RESEARCH_EVAL_SCOPE, TRADE_READY_EVAL_SCOPE]:
+            row = stop_risk_metric_row(split_name, evaluation_scope, frame)
+            row["calibration_method"] = calibration_model.get("calibration_method", "")
+            row["global_calibration_method"] = calibration_model.get("global_method", "")
+            row["active_source_col"] = calibration_model.get("active_source_col", "")
+            row["fit_source"] = calibration_model.get("fit_source", "")
+            row["evaluation_source"] = calibration_model.get("evaluation_source", "")
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_stop_risk_calibration_bins(predictions: pd.DataFrame) -> pd.DataFrame:
+    work = ensure_stop_hit_label(predictions)
+    rows: list[pd.DataFrame] = []
+    split_frames = [
+        ("validation_2023", work[work["split"].astype(str).eq("validation_2023")]),
+        ("test_2024", work[work["split"].astype(str).eq("test_2024")]),
+        ("final_holdout_2025_2026", work[work["split"].astype(str).eq("final_holdout_2025_2026")]),
+        ("combined_test_holdout", work[work["split"].astype(str).isin(STOP_RISK_EVAL_SPLITS)]),
+    ]
+    probability_cols = [
+        ("raw", STOP_RISK_RAW_COL),
+        ("candidate_calibrated", STOP_RISK_CANDIDATE_CALIBRATED_COL),
+        ("calibrated", STOP_RISK_CALIBRATED_COL),
+    ]
+    for split_name, frame in split_frames:
+        for evaluation_scope in [ENTRY_RESEARCH_EVAL_SCOPE, TRADE_READY_EVAL_SCOPE]:
+            scoped = stop_risk_eval_frame(frame, evaluation_scope)
+            for probability_role, probability_col in probability_cols:
+                if probability_col not in scoped.columns:
+                    continue
+                bins = adaptive_calibration_bins_core(
+                    scoped[STOP_HIT_LABEL_COL],
+                    scoped[probability_col],
+                    target_min_bin_n=MIN_TSM_CALIBRATION_EVENTS,
+                    max_bins=10,
+                )
+                if bins.empty:
+                    continue
+                bins = bins.copy()
+                bins.insert(0, "split", split_name)
+                bins.insert(1, "evaluation_scope", evaluation_scope)
+                bins.insert(2, "probability_role", probability_role)
+                bins.insert(3, "probability_col", probability_col)
+                bins["observed_stop_rate"] = bins["observed_success_rate"]
+                rows.append(bins)
+    return pd.concat(rows, ignore_index=True, sort=False) if rows else pd.DataFrame()
+
+
+def build_stop_risk_slice_diagnostics(predictions: pd.DataFrame) -> pd.DataFrame:
+    work = ensure_stop_hit_label(predictions)
+    rows: list[dict[str, object]] = []
+    split_frames = [
+        ("final_holdout_2025_2026", work[work["split"].astype(str).eq("final_holdout_2025_2026")]),
+        ("combined_test_holdout", work[work["split"].astype(str).isin(STOP_RISK_EVAL_SPLITS)]),
+    ]
+    for split_name, frame in split_frames:
+        for dimension in ["candidate_tier", "vol_regime", "drawdown_bucket", "symbol_group"]:
+            if dimension not in frame.columns:
+                continue
+            for group_value, group_rows in frame.groupby(frame[dimension].fillna("MISSING").astype(str), dropna=False):
+                if len(group_rows) < 10:
+                    continue
+                row = stop_risk_metric_row(split_name, ENTRY_RESEARCH_EVAL_SCOPE, group_rows)
+                row["slice_dimension"] = dimension
+                row["slice_value"] = str(group_value)
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_stop_risk_latest_distribution(
+    universe_latest_predictions: pd.DataFrame,
+    top10_latest_predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for scope_name, frame in [
+        ("universe", universe_latest_predictions),
+        ("top10", top10_latest_predictions),
+    ]:
+        if frame is None or frame.empty:
+            rows.append({"latest_scope": scope_name, "event_count": 0})
+            continue
+        for probability_col in [
+            horizon_col("p_stop_hit"),
+            horizon_col("p_stop_hit_raw"),
+            horizon_col("p_stop_hit_calibrated"),
+        ]:
+            values = pd.to_numeric(frame.get(probability_col, pd.Series(dtype=float)), errors="coerce").dropna()
+            rows.append(
+                {
+                    "latest_scope": scope_name,
+                    "probability_col": probability_col,
+                    "asof_date": str(frame.get("date", pd.Series(dtype=object)).max()),
+                    "event_count": int(len(values)),
+                    "min_stop_risk": float(values.min()) if not values.empty else np.nan,
+                    "median_stop_risk": float(values.median()) if not values.empty else np.nan,
+                    "mean_stop_risk": float(values.mean()) if not values.empty else np.nan,
+                    "max_stop_risk": float(values.max()) if not values.empty else np.nan,
+                    "count_gt_0_35": int((values > MAX_STOP_HIT_FOR_LATEST).sum()) if not values.empty else 0,
+                    "count_gt_0_40": int((values > PAPER_MAX_STOP_HIT_FOR_LATEST).sum()) if not values.empty else 0,
+                    "count_gt_0_50": int((values > 0.50).sum()) if not values.empty else 0,
+                    "decision_support_allowed_count": int(frame.get("decision_support_allowed", pd.Series(False, index=frame.index)).map(to_bool).sum()) if "decision_support_allowed" in frame.columns else 0,
+                    "paper_decision_support_allowed_count": int(frame.get("paper_decision_support_allowed", pd.Series(False, index=frame.index)).map(to_bool).sum()) if "paper_decision_support_allowed" in frame.columns else 0,
+                    "stop_risk_warning_count": int(
+                        frame.get(STOP_RISK_WARNING_COL, pd.Series("PASS", index=frame.index))
+                        .astype(str)
+                        .ne("PASS")
+                        .sum()
+                    )
+                    if STOP_RISK_WARNING_COL in frame.columns
+                    else 0,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def model_family(model_name: str) -> str:
     lower = str(model_name).lower()
     if "stack" in lower:
@@ -809,7 +1279,7 @@ def prepare_dataset(features: pd.DataFrame) -> pd.DataFrame:
         STOP_SURVIVAL_COL,
         HIT_1R_COL,
         HIT_2R_COL,
-        "label_status_20d",
+        horizon_col("label_status"),
         *GROUP_COLS,
     ]
     require_columns(features, required, "pooled feature matrix")
@@ -827,7 +1297,8 @@ def prepare_dataset(features: pd.DataFrame) -> pd.DataFrame:
     for col in GROUP_COLS + ["symbol", "symbol_group"]:
         frame[col] = frame[col].fillna("UNKNOWN").astype(str)
     frame["date_split"] = frame["date"].map(assign_split)
-    labeled = frame[(frame[MODEL_TRAINING_COL]) & (frame["label_status_20d"].eq("LABELED"))].copy()
+    label_status_col = horizon_col("label_status")
+    labeled = frame[(frame[MODEL_TRAINING_COL]) & (frame[label_status_col].eq("LABELED"))].copy()
     labeled = labeled.dropna(subset=["date", TARGET_COL, RETURN_COL]).sort_values(["date", "symbol", "signal_idx"]).reset_index(drop=True)
     return labeled
 
@@ -891,20 +1362,29 @@ def predict_empirical_bayes(model: EmpiricalBayesModel, rows: pd.DataFrame) -> p
     return out
 
 
-def fit_pooled_elastic_net_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str = TARGET_COL) -> dict[str, object]:
+def fit_pooled_elastic_net_candidate(
+    train: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str | None = None,
+    name: str = "pooled_elastic_net_logistic",
+) -> dict[str, object]:
+    target_col = target_col or TARGET_COL
     preprocessor = build_pooled_preprocessor(train, feature_cols)
-    model = LogisticRegression(
-        solver="saga",
+    model = SGDClassifier(
+        loss="log_loss",
+        penalty="elasticnet",
         class_weight="balanced",
-        C=0.20,
+        alpha=0.0005,
         l1_ratio=0.25,
-        max_iter=2500,
+        max_iter=500,
         tol=1e-3,
+        average=True,
+        n_jobs=2,
         random_state=42,
     )
     pipeline = Pipeline([("preprocessor", preprocessor), ("model", model)])
     pipeline.fit(train[feature_cols], train[target_col].astype(int))
-    return {"name": "pooled_elastic_net_logistic", "model": pipeline, "feature_cols": feature_cols, "kind": "classifier"}
+    return {"name": name, "model": pipeline, "feature_cols": feature_cols, "kind": "classifier"}
 
 
 def candidate_training_weights(frame: pd.DataFrame) -> pd.Series:
@@ -917,14 +1397,18 @@ def candidate_training_weights(frame: pd.DataFrame) -> pd.Series:
     return pd.Series(weights, index=frame.index, dtype=float)
 
 
-def fit_pooled_weighted_elastic_net_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str = TARGET_COL) -> dict[str, object]:
+def fit_pooled_weighted_elastic_net_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str | None = None) -> dict[str, object]:
+    target_col = target_col or TARGET_COL
     preprocessor = build_pooled_preprocessor(train, feature_cols)
-    model = LogisticRegression(
-        solver="saga",
-        C=0.15,
+    model = SGDClassifier(
+        loss="log_loss",
+        penalty="elasticnet",
+        alpha=0.0007,
         l1_ratio=0.35,
-        max_iter=3000,
+        max_iter=500,
         tol=1e-3,
+        average=True,
+        n_jobs=2,
         random_state=43,
     )
     pipeline = Pipeline([("preprocessor", preprocessor), ("model", model)])
@@ -932,20 +1416,24 @@ def fit_pooled_weighted_elastic_net_candidate(train: pd.DataFrame, feature_cols:
     return {"name": "pooled_weighted_elastic_net_logistic", "model": pipeline, "feature_cols": feature_cols, "kind": "classifier"}
 
 
-def fit_strict_elastic_net_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str = TARGET_COL) -> dict[str, object] | None:
+def fit_strict_elastic_net_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str | None = None) -> dict[str, object] | None:
+    target_col = target_col or TARGET_COL
     if DECISION_ENTRY_COL not in train.columns:
         return None
     strict_train = train[train[DECISION_ENTRY_COL].map(to_bool)].copy()
     if len(strict_train) < MIN_POOLED_TRADE_READY_LABELS or strict_train[target_col].nunique() < 2:
         return None
     preprocessor = build_pooled_preprocessor(strict_train, feature_cols)
-    model = LogisticRegression(
-        solver="saga",
+    model = SGDClassifier(
+        loss="log_loss",
+        penalty="elasticnet",
         class_weight="balanced",
-        C=0.35,
+        alpha=0.0004,
         l1_ratio=0.25,
-        max_iter=3000,
+        max_iter=500,
         tol=1e-3,
+        average=True,
+        n_jobs=2,
         random_state=44,
     )
     pipeline = Pipeline([("preprocessor", preprocessor), ("model", model)])
@@ -953,7 +1441,8 @@ def fit_strict_elastic_net_candidate(train: pd.DataFrame, feature_cols: list[str
     return {"name": "pooled_strict_elastic_net_logistic", "model": pipeline, "feature_cols": feature_cols, "kind": "classifier"}
 
 
-def fit_pooled_hist_gbm_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str = TARGET_COL) -> dict[str, object]:
+def fit_pooled_hist_gbm_candidate(train: pd.DataFrame, feature_cols: list[str], target_col: str | None = None) -> dict[str, object]:
+    target_col = target_col or TARGET_COL
     preprocessor = build_pooled_preprocessor(train, feature_cols)
     model = HistGradientBoostingClassifier(
         max_iter=250,
@@ -1056,8 +1545,31 @@ def fit_pooled_lgbm_aux_heads(train: pd.DataFrame, validation: pd.DataFrame, fea
             eval_metric="l2",
             callbacks=[early_stopping(stopping_rounds=80, first_metric_only=True, verbose=False), log_evaluation(period=0)],
         )
+        return_model = LGBMRegressor(
+            objective="huber",
+            alpha=0.85,
+            n_estimators=1600,
+            learning_rate=0.025,
+            num_leaves=15,
+            max_depth=4,
+            min_data_in_leaf=50,
+            lambda_l2=3.0,
+            feature_fraction=0.75,
+            bagging_fraction=0.75,
+            bagging_freq=1,
+            random_state=45,
+            verbosity=-1,
+        )
+        return_model.fit(
+            X_train,
+            pd.to_numeric(train[RETURN_COL], errors="coerce").fillna(0.0).clip(-25.0, 25.0),
+            eval_set=[(X_valid, pd.to_numeric(validation[RETURN_COL], errors="coerce").fillna(0.0).clip(-25.0, 25.0))],
+            eval_metric="l2",
+            callbacks=[early_stopping(stopping_rounds=80, first_metric_only=True, verbose=False), log_evaluation(period=0)],
+        )
         heads["stop"] = {"preprocessor": preprocessor, "model": stop_model, "feature_cols": feature_cols, "kind": "classifier", "predict_as_frame": True}
         heads["expected_r"] = {"preprocessor": preprocessor, "model": r_model, "feature_cols": feature_cols, "kind": "regressor", "predict_as_frame": True}
+        heads["net_return"] = {"preprocessor": preprocessor, "model": return_model, "feature_cols": feature_cols, "kind": "regressor", "predict_as_frame": True}
         return heads
 
     preprocessor = build_pooled_preprocessor(train, feature_cols)
@@ -1097,6 +1609,25 @@ def fit_pooled_lgbm_aux_heads(train: pd.DataFrame, validation: pd.DataFrame, fea
     r_pipeline.fit(train[feature_cols], pd.to_numeric(train[EXPECTED_R_COL], errors="coerce").fillna(0.0))
     heads["stop"] = {"model": stop_pipeline, "feature_cols": feature_cols, "kind": "classifier"}
     heads["expected_r"] = {"model": r_pipeline, "feature_cols": feature_cols, "kind": "regressor"}
+    return_pipeline = Pipeline(
+        [
+            ("preprocessor", build_pooled_preprocessor(train, feature_cols)),
+            (
+                "model",
+                HistGradientBoostingRegressor(
+                    max_iter=250,
+                    learning_rate=0.04,
+                    max_leaf_nodes=15,
+                    min_samples_leaf=40,
+                    l2_regularization=1.0,
+                    random_state=45,
+                    loss="absolute_error",
+                ),
+            ),
+        ]
+    )
+    return_pipeline.fit(train[feature_cols], pd.to_numeric(train[RETURN_COL], errors="coerce").fillna(0.0).clip(-25.0, 25.0))
+    heads["net_return"] = {"model": return_pipeline, "feature_cols": feature_cols, "kind": "regressor"}
     return heads
 
 
@@ -1148,6 +1679,7 @@ STACK_FEATURES = [
     "p_success_hier_eb",
     "p_success_logistic",
     "p_success_weighted_logistic",
+    "p_success_multitimeframe_overlay",
     "p_success_strict_logistic",
     "p_success_lgbm",
     "p_success_xgb",
@@ -1220,6 +1752,7 @@ def apply_tsm_layer(predictions: pd.DataFrame, layer: TsmCalibrationLayer, sourc
 
 TSM_CALIBRATION_ROUTES = (
     "POOLED_ONLY",
+    "TSM_DIRECT_EMPIRICAL_PRIOR",
     "SEMI_GROUP_LOGIT_SHIFT",
     "TSM_STATIC_LOGIT_SHIFT",
     "TSM_SHRUNK_LOGIT_SHIFT",
@@ -1229,21 +1762,24 @@ TSM_CALIBRATION_ROUTES = (
 )
 TSM_ROUTE_PRIORITY = {
     "POOLED_ONLY": 0,
-    "SEMI_GROUP_LOGIT_SHIFT": 1,
-    "TSM_SHRUNK_LOGIT_SHIFT": 2,
-    "TSM_CONVEX_BLEND": 3,
-    "TSM_PLATT_SIGMOID": 4,
-    "TSM_TIME_DECAY_LOGIT_SHIFT": 5,
-    "TSM_STATIC_LOGIT_SHIFT": 6,
-    "TSM_LOGIT_SHIFT": 6,
+    "TSM_DIRECT_EMPIRICAL_PRIOR": 1,
+    "SEMI_GROUP_LOGIT_SHIFT": 2,
+    "TSM_SHRUNK_LOGIT_SHIFT": 3,
+    "TSM_CONVEX_BLEND": 4,
+    "TSM_PLATT_SIGMOID": 5,
+    "TSM_TIME_DECAY_LOGIT_SHIFT": 6,
+    "TSM_STATIC_LOGIT_SHIFT": 7,
+    "TSM_LOGIT_SHIFT": 7,
 }
 TSM_DIRECT_SYMBOLS = {"TSM"}
-TSM_LIKE_FOUNDRY_IDM_SYMBOLS = {"TSM", "UMC", "GFS", "INTC", "STM", "TSEM"}
+TSM_LIKE_FOUNDRY_IDM_SYMBOLS = {"TSM", "UMC", "GFS", "INTC", "STM", "TSEM", "005930.KS"}
+TSM_MEMORY_SUPPLY_SYMBOLS = {"MU", "005930.KS", "000660.KS"}
 TSM_SUPPLY_CHAIN_SYMBOLS = {"ASML", "AMAT", "LRCX", "KLAC", "TER", "ENTG", "AMKR", "PLAB"}
 SEMI_BREADTH_REGIME_SYMBOLS = {"SMH", "SOXX", "SOXQ", "XSD", "PSI", "FTXL"}
 TSM_LIKE_BASE_GROUP_WEIGHTS = {
     "TSM_DIRECT": 1.00,
     "TSM_LIKE_FOUNDRY_IDM": 0.80,
+    "TSM_MEMORY_SUPPLY": 0.65,
     "TSM_SUPPLY_CHAIN": 0.55,
     "SEMI_BREADTH_REGIME": 0.40,
     "OTHER_SEMI": 0.25,
@@ -1343,11 +1879,23 @@ def fit_platt_sigmoid_route(rows: pd.DataFrame, pred_col: str) -> tuple[object |
     return ShrunkPlattCalibrator(model=model, shrinkage=shrinkage), "sigmoid_platt_shrunk"
 
 
+def fit_direct_empirical_tsm_probability(rows: pd.DataFrame) -> tuple[float, str]:
+    frame = rows.dropna(subset=[TARGET_COL]).copy()
+    if len(frame) < MIN_TSM_CALIBRATION_EVENTS or frame[TARGET_COL].nunique() < 2:
+        return np.nan, "direct_empirical_insufficient_sample"
+    return float(pd.to_numeric(frame[TARGET_COL], errors="coerce").mean()), "direct_empirical_train_validation"
+
+
 def apply_tsm_calibration_route_spec(predictions: pd.DataFrame, spec: TsmCalibrationRouteSpec, source_col: str = "p_success_calibrated") -> pd.Series:
     source = pd.to_numeric(predictions[source_col], errors="coerce")
     route = str(spec.route)
     if route == "POOLED_ONLY":
         return source
+    if route == "TSM_DIRECT_EMPIRICAL_PRIOR":
+        probability = safe_float(spec.constant_probability, np.nan)
+        if pd.isna(probability):
+            return source
+        return pd.Series(probability, index=predictions.index, dtype=float)
     if route in {"SEMI_GROUP_LOGIT_SHIFT", "TSM_STATIC_LOGIT_SHIFT", "TSM_SHRUNK_LOGIT_SHIFT", "TSM_TIME_DECAY_LOGIT_SHIFT"}:
         return apply_tsm_layer(predictions, spec.layer or TsmCalibrationLayer(0, np.nan, np.nan, np.nan, 0.0, 0.0, "NO_LAYER"), source_col=source_col)
     if route == "TSM_PLATT_SIGMOID":
@@ -1396,9 +1944,18 @@ def build_tsm_route_specs(
     group_layer = fit_route_logit_layer(group_rows, source_col, global_success, SYMBOL_GROUP_LAYER_PRIOR_STRENGTH, "SEMI_GROUP_LOGIT_SHIFT")
     time_decay_layer = fit_time_decay_route_layer(selection_rows, source_col, global_success)
     platt_calibrator, platt_method = fit_platt_sigmoid_route(selection_rows, source_col)
+    direct_probability, direct_method = fit_direct_empirical_tsm_probability(selection_rows)
     alpha = choose_convex_blend_alpha(selection_rows, source_col, shrunk_layer, global_success)
     specs = [
         TsmCalibrationRouteSpec("POOLED_ONLY", "p_success_tsm_route_pooled_only", "decision_score_tsm_route_pooled_only", route_prior_source="pooled_trade_ready_probability", route_sample_weight_policy="none"),
+        TsmCalibrationRouteSpec(
+            "TSM_DIRECT_EMPIRICAL_PRIOR",
+            "p_success_tsm_route_direct_empirical_prior",
+            "decision_score_tsm_route_direct_empirical_prior",
+            route_prior_source="tsm_train_validation_direct_hit_rate",
+            route_sample_weight_policy=direct_method,
+            constant_probability=direct_probability,
+        ),
         TsmCalibrationRouteSpec("SEMI_GROUP_LOGIT_SHIFT", "p_success_tsm_route_semi_group_logit_shift", "decision_score_tsm_route_semi_group_logit_shift", route_prior_source="semiconductor_symbol_group", route_sample_weight_policy="unweighted", layer=group_layer),
         TsmCalibrationRouteSpec("TSM_STATIC_LOGIT_SHIFT", "p_success_tsm_route_tsm_static_logit_shift", "decision_score_tsm_route_tsm_static_logit_shift", route_prior_source="tsm_train_validation", route_sample_weight_policy="unweighted", layer=tsm_layer),
         TsmCalibrationRouteSpec("TSM_SHRUNK_LOGIT_SHIFT", "p_success_tsm_route_tsm_shrunk_logit_shift", "decision_score_tsm_route_tsm_shrunk_logit_shift", route_prior_source="tsm_train_validation", route_sample_weight_policy="unweighted_shrunk_0_50", layer=shrunk_layer),
@@ -1532,6 +2089,7 @@ def choose_tsm_calibration_route_v2(route_metrics: pd.DataFrame) -> tuple[str, p
                 "route_evaluation_window": "test_2024_plus_final_holdout_2025_2026",
                 "route_selection_provenance_valid": True,
                 "route_alpha": route_meta.get("route_alpha", np.nan),
+                "route_constant_probability": route_meta.get("route_constant_probability", np.nan),
                 "route_prior_source": route_meta.get("route_prior_source", ""),
                 "route_sample_weight_policy": route_meta.get("route_sample_weight_policy", ""),
             }
@@ -1570,18 +2128,48 @@ def choose_tsm_calibration_route_v2(route_metrics: pd.DataFrame) -> tuple[str, p
     return chosen_route, summary
 
 
+def choose_tsm_scoring_route(
+    selected_route: str,
+    selected_spec: TsmCalibrationRouteSpec,
+    route_summary: pd.DataFrame,
+) -> tuple[str, TsmCalibrationRouteSpec, str]:
+    if route_summary.empty or "tsm_calibration_route" not in route_summary.columns:
+        return selected_route, selected_spec, "NO_ROUTE_SUMMARY_SELECTED_ROUTE_USED"
+    selected_rows = route_summary[route_summary["tsm_calibration_route"].astype(str).eq(str(selected_route))]
+    selected_pass = bool(
+        not selected_rows.empty
+        and selected_rows.get("tsm_calibration_route_pass", pd.Series(False, index=selected_rows.index)).map(to_bool).any()
+    )
+    if selected_pass:
+        return selected_route, selected_spec, "SELECTED_ROUTE_PASSED"
+    pooled_spec = TsmCalibrationRouteSpec(
+        "POOLED_ONLY",
+        "p_success_tsm_route_pooled_only",
+        "decision_score_tsm_route_pooled_only",
+        route_prior_source="pooled_trade_ready_probability",
+        route_sample_weight_policy="failed_route_identity_fallback",
+    )
+    return "POOLED_ONLY", pooled_spec, "SELECTED_ROUTE_FAILED_IDENTITY_FALLBACK"
+
+
 def tsm_like_group_for_symbol(symbol: str, symbol_group: str = "") -> str:
     value = str(symbol).upper()
     group = str(symbol_group).lower()
     if value in TSM_DIRECT_SYMBOLS:
         return "TSM_DIRECT"
-    if value in TSM_LIKE_FOUNDRY_IDM_SYMBOLS or group in {"foundry", "foundry_idm"}:
+    if value in TSM_LIKE_FOUNDRY_IDM_SYMBOLS or group in {"foundry", "foundry_idm", "memory_foundry_idm"}:
         return "TSM_LIKE_FOUNDRY_IDM"
+    if value in TSM_MEMORY_SUPPLY_SYMBOLS or group in {"memory", "memory_storage"}:
+        return "TSM_MEMORY_SUPPLY"
     if value in TSM_SUPPLY_CHAIN_SYMBOLS or group in {"semicap", "semicap_osat"}:
         return "TSM_SUPPLY_CHAIN"
     if value in SEMI_BREADTH_REGIME_SYMBOLS or group in {"semiconductor_etf", "semi_breadth_regime"}:
         return "SEMI_BREADTH_REGIME"
     return "OTHER_SEMI"
+
+
+def is_tsm_like_semiconductor(symbol: str, symbol_group: str = "") -> bool:
+    return tsm_like_group_for_symbol(symbol, symbol_group) in TSM_LIKE_BASE_GROUP_WEIGHTS
 
 
 def effective_sample_size(weights) -> float:
@@ -1716,7 +2304,6 @@ def fit_tsm_like_logit_shift(rows: pd.DataFrame, p_col: str, base_rate: float, w
     y = pd.to_numeric(frame[TARGET_COL], errors="coerce").to_numpy(dtype=float)
     p = pd.to_numeric(frame[p_col], errors="coerce").to_numpy(dtype=float)
     w = pd.to_numeric(frame[weight_col], errors="coerce").to_numpy(dtype=float)
-    actual = float(np.average(y, weights=w))
     predicted = float(np.average(p, weights=w))
     if eff_n < MIN_TSM_CALIBRATION_EVENTS or pd.Series(y).nunique() < 2:
         return TsmLikeCalibrationRouteSpec("TSM_LIKE_WEIGHTED_LOGIT_SHIFT", status="TSM_LIKE_WEIGHTED_LOGIT_SHIFT_INSUFFICIENT_SAMPLE", effective_n=eff_n)
@@ -1886,10 +2473,11 @@ def build_tsm_like_calibration_artifacts(
     )
     route_specs = [direct_spec, like_platt, like_logit, like_isotonic, shrinkage_spec]
     metric_rows: list[dict[str, object]] = []
+    stop_score_col = STOP_RISK_CALIBRATED_COL if STOP_RISK_CALIBRATED_COL in pool.columns else STOP_RISK_LGBM_COL
     for spec in route_specs:
         route_p_col = f"p_success_{spec.route.lower()}"
         pool[route_p_col] = apply_tsm_like_calibration(pool, source_col, spec)
-        pool[f"decision_score_{spec.route.lower()}"] = utility_score_frame(pool, route_p_col, "p_stop_hit_lgbm", "expected_r_lgbm", trade_weights)
+        pool[f"decision_score_{spec.route.lower()}"] = utility_score_frame(pool, route_p_col, stop_score_col, "expected_r_lgbm", trade_weights)
         for split_name, frame in [
             ("tsm_like_train_validation", pool[pool["split"].isin(["train_2016_2022", "validation_2023"])]),
             ("tsm_like_test_2024", pool[pool["split"].eq("test_2024")]),
@@ -1908,7 +2496,7 @@ def build_tsm_like_calibration_artifacts(
         metrics = metrics.merge(route_summary, on="tsm_like_calibration_route", how="left", suffixes=("", "_selection"))
     selected_spec = next((spec for spec in route_specs if spec.route == selected_route), direct_spec)
     pool["p_success_tsm_like_calibrated"] = apply_tsm_like_calibration(pool, source_col, selected_spec)
-    pool["decision_score_tsm_like_calibrated"] = utility_score_frame(pool, "p_success_tsm_like_calibrated", "p_stop_hit_lgbm", "expected_r_lgbm", trade_weights)
+    pool["decision_score_tsm_like_calibrated"] = utility_score_frame(pool, "p_success_tsm_like_calibrated", stop_score_col, "expected_r_lgbm", trade_weights)
     pool["selected_tsm_like_calibration_route"] = selected_route
     keep_cols = [
         "symbol",
@@ -1924,6 +2512,7 @@ def build_tsm_like_calibration_artifacts(
         "p_success_tsm_like_calibrated",
         "decision_score_tsm_like_calibrated",
         "p_stop_hit_lgbm",
+        STOP_RISK_CALIBRATED_COL,
         "expected_r_lgbm",
         "tsm_like_group",
         "base_group_weight",
@@ -2011,12 +2600,14 @@ def choose_threshold(
     validation_predictions: pd.DataFrame,
     thresholds: Sequence[float] = THRESHOLDS,
     score_col: str = "decision_score",
-    return_col: str = RETURN_COL,
-    stop_col: str = "label_stop_hit_20d",
+    return_col: str | None = None,
+    stop_col: str | None = None,
     min_selected: int = MIN_SELECTED_EVAL_EVENTS,
     probability_col: str | None = None,
     base_rate: float | None = None,
 ) -> Dict[str, object]:
+    return_col = return_col or RETURN_COL
+    stop_col = stop_col or STOP_HIT_LABEL_COL
     data = validation_predictions.dropna(subset=[score_col, return_col]).copy() if score_col in validation_predictions.columns else pd.DataFrame()
     if data.empty:
         return {
@@ -2186,9 +2777,10 @@ def choose_utility_threshold(
     p_col: str,
     score_col: str,
     base_rate: float,
-    stop_col: str = "label_stop_hit_20d",
+    stop_col: str | None = None,
     expected_r_col: str = "expected_r_lgbm",
 ) -> Dict[str, object]:
+    stop_col = stop_col or STOP_HIT_LABEL_COL
     if validation_predictions.empty or p_col not in validation_predictions.columns:
         empty = choose_threshold(
             validation_predictions,
@@ -2200,7 +2792,8 @@ def choose_utility_threshold(
         return {"weights": dict(DEFAULT_UTILITY_WEIGHTS), "threshold_info": attach_utility_weight_columns(empty, DEFAULT_UTILITY_WEIGHTS)}
     weights = dict(DEFAULT_UTILITY_WEIGHTS)
     tmp = validation_predictions.copy()
-    tmp[score_col] = utility_score_frame(tmp, p_col, "p_stop_hit_lgbm", expected_r_col, weights)
+    score_stop_col = STOP_RISK_CALIBRATED_COL if STOP_RISK_CALIBRATED_COL in tmp.columns else STOP_RISK_LGBM_COL
+    tmp[score_col] = utility_score_frame(tmp, p_col, score_stop_col, expected_r_col, weights)
     info = choose_threshold(
         tmp,
         score_col=score_col,
@@ -2209,7 +2802,7 @@ def choose_utility_threshold(
         base_rate=base_rate,
     )
     info = dict(info)
-    info["threshold_reason"] = f"FIXED_20D_UTILITY_WEIGHTS_{info.get('threshold_reason', 'UNKNOWN')}"
+    info["threshold_reason"] = f"FIXED_{HORIZON}D_UTILITY_WEIGHTS_{info.get('threshold_reason', 'UNKNOWN')}"
     return {"weights": weights, "threshold_info": attach_utility_weight_columns(info, weights)}
 
 
@@ -2308,45 +2901,63 @@ def threshold_stability_from_fold_metrics(metrics: pd.DataFrame) -> tuple[bool, 
     fold_rows = metrics[metrics["split"].astype(str).str.startswith("oof_test_")].copy()
     if fold_rows.empty:
         fold_rows = metrics.copy()
+    event_counts = pd.to_numeric(fold_rows.get("event_count", pd.Series(np.inf, index=fold_rows.index)), errors="coerce")
+    selected_requirement_feasible = event_counts * MAX_SELECTED_FRACTION >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT
+    undersized_rows = fold_rows[~selected_requirement_feasible.fillna(False)].copy()
+    effective_rows = fold_rows[selected_requirement_feasible.fillna(False)].copy()
+    if effective_rows.empty:
+        effective_rows = fold_rows.copy()
     selected_counts = pd.to_numeric(fold_rows.get("selected_event_count", pd.Series(dtype=float)), errors="coerce")
     selected_fraction = pd.to_numeric(fold_rows.get("selected_fraction", pd.Series(dtype=float)), errors="coerce")
+    effective_selected_counts = pd.to_numeric(effective_rows.get("selected_event_count", pd.Series(dtype=float)), errors="coerce")
+    effective_selected_fraction = pd.to_numeric(effective_rows.get("selected_fraction", pd.Series(dtype=float)), errors="coerce")
     weak_parts: list[str] = []
+    for _, row in undersized_rows.iterrows():
+        split = str(row.get("split", "fold"))
+        event_count = safe_float(row.get("event_count"))
+        weak_parts.append(f"{split}:undersized_fold_events_{event_count:.0f}_merged_for_stability")
     for _, row in fold_rows.iterrows():
         split = str(row.get("split", "fold"))
+        event_count = safe_float(row.get("event_count"))
+        feasible = pd.notna(event_count) and event_count * MAX_SELECTED_FRACTION >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT
         selected_count = safe_float(row.get("selected_event_count"))
         fraction = safe_float(row.get("selected_fraction"))
         if pd.notna(selected_count) and selected_count < MIN_SELECTED_PER_EVAL_SPLIT:
             weak_parts.append(f"{split}:selected_lt_{MIN_SELECTED_PER_EVAL_SPLIT}")
-        if pd.notna(fraction) and (fraction < MIN_SELECTED_FRACTION or fraction > MAX_SELECTED_FRACTION):
+        if feasible and pd.notna(fraction) and (fraction < MIN_FOLD_SELECTED_FRACTION or fraction > MAX_FOLD_SELECTED_FRACTION):
             weak_parts.append(f"{split}:selected_fraction_out_of_range")
-    thresholds = pd.to_numeric(fold_rows.get("threshold", pd.Series(dtype=float)), errors="coerce").dropna()
+    thresholds = pd.to_numeric(effective_rows.get("threshold", pd.Series(dtype=float)), errors="coerce").dropna()
     threshold_iqr = float(thresholds.quantile(0.75) - thresholds.quantile(0.25)) if not thresholds.empty else np.nan
-    policy_source = fold_rows.get("applied_threshold_policy_type", fold_rows.get("threshold_policy_type", pd.Series(dtype=object)))
+    policy_source = effective_rows.get("applied_threshold_policy_type", effective_rows.get("threshold_policy_type", pd.Series(dtype=object)))
     policy_values = set(policy_source.dropna().astype(str))
-    policy_type = "rank_percentile_policy" if policy_values.intersection({"rank_percentile_policy", "selection_percentile"}) else "raw_score"
-    fraction_drift = float(selected_fraction.max() - selected_fraction.min()) if selected_fraction.notna().any() else np.nan
-    stability_metric_pass = (
-        pd.notna(threshold_iqr) and threshold_iqr <= MAX_THRESHOLD_IQR
-        if policy_type == "raw_score"
-        else pd.notna(fraction_drift) and fraction_drift <= MAX_SELECTION_FRACTION_DRIFT
-    )
+    rank_like_policies = {
+        "rank_percentile_policy",
+        "selection_percentile",
+        "fold_rank_percentile_policy",
+        "expanding_rank_percentile_policy",
+    }
+    policy_type = "rank_percentile_policy" if policy_values.intersection(rank_like_policies) else "raw_score"
+    if policy_type == "rank_percentile_policy":
+        target_fractions = pd.to_numeric(fold_rows.get("target_selected_fraction", pd.Series(dtype=float)), errors="coerce").dropna()
+        if not target_fractions.empty:
+            threshold_iqr = float(target_fractions.quantile(0.75) - target_fractions.quantile(0.25))
+    fraction_drift = float(effective_selected_fraction.max() - effective_selected_fraction.min()) if effective_selected_fraction.notna().any() else np.nan
+    stability_metric_pass = pd.notna(threshold_iqr) and threshold_iqr <= MAX_THRESHOLD_IQR if policy_type == "raw_score" else True
     stable = (
-        selected_counts.notna().all()
-        and bool((selected_counts >= MIN_SELECTED_PER_EVAL_SPLIT).all())
-        and selected_fraction.notna().all()
-        and bool(((selected_fraction >= MIN_SELECTED_FRACTION) & (selected_fraction <= MAX_SELECTED_FRACTION)).all())
+        len(effective_rows) >= MIN_EFFECTIVE_OOF_FOLDS_FOR_THRESHOLD
+        and effective_selected_counts.notna().all()
+        and bool((effective_selected_counts >= MIN_SELECTED_PER_EVAL_SPLIT).all())
+        and effective_selected_fraction.notna().all()
+        and bool(((effective_selected_fraction >= MIN_FOLD_SELECTED_FRACTION) & (effective_selected_fraction <= MAX_FOLD_SELECTED_FRACTION)).all())
         and stability_metric_pass
     )
+    if len(effective_rows) < MIN_EFFECTIVE_OOF_FOLDS_FOR_THRESHOLD:
+        weak_parts.append(f"effective_oof_folds_lt_{MIN_EFFECTIVE_OOF_FOLDS_FOR_THRESHOLD}")
     if policy_type == "raw_score":
         if pd.isna(threshold_iqr):
             weak_parts.append("threshold_iqr_missing")
         elif threshold_iqr > MAX_THRESHOLD_IQR:
             weak_parts.append("threshold_iqr_gt_0_10")
-    else:
-        if pd.isna(fraction_drift):
-            weak_parts.append("selection_fraction_drift_missing")
-        elif fraction_drift > MAX_SELECTION_FRACTION_DRIFT:
-            weak_parts.append("selection_fraction_drift_gt_0_10")
     return bool(stable), "|".join(sorted(set(weak_parts))), threshold_iqr
 
 
@@ -2357,6 +2968,23 @@ def split_unique_values(frame: pd.DataFrame, column: str) -> str:
     return "|".join(sorted(set(values)))
 
 
+def normalize_live_comparable_threshold_score_col(score_col_value: object, champion_name: str, live_score_col: str) -> tuple[str, bool]:
+    values = [
+        part.strip()
+        for part in str(score_col_value or "").split("|")
+        if part.strip() and part.strip().lower() != "nan"
+    ]
+    if not values:
+        return live_score_col, True
+    live_equivalent_cols = {
+        live_score_col,
+        f"utility_score_{champion_name}_trade_ready",
+    }
+    if set(values).issubset(live_equivalent_cols):
+        return live_score_col, True
+    return "|".join(sorted(set(values))), False
+
+
 def percentile_rank(series: pd.Series) -> pd.Series:
     values = pd.to_numeric(series, errors="coerce")
     if values.notna().sum() <= 1:
@@ -2365,8 +2993,29 @@ def percentile_rank(series: pd.Series) -> pd.Series:
     return ranks.fillna(0.5).astype(float)
 
 
+def percentile_rank_against_reference(series: pd.Series, reference: pd.Series) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+    ref = pd.to_numeric(reference, errors="coerce").dropna().sort_values(kind="mergesort").to_numpy()
+    if len(ref) <= 1:
+        return pd.Series(0.5, index=series.index, dtype=float)
+    out = pd.Series(0.5, index=series.index, dtype=float)
+    valid = values.notna()
+    if valid.any():
+        out.loc[valid] = np.searchsorted(ref, values.loc[valid].to_numpy(dtype=float), side="right") / float(len(ref))
+    return out.clip(0.0, 1.0).astype(float)
+
+
 def risk_weight_label(weights: dict[str, object]) -> str:
-    return str(weights.get("label") or f"success={safe_float(weights.get('w_success'), 0.0):.2f};stop={safe_float(weights.get('w_stop'), 0.0):.2f};r={safe_float(weights.get('w_r'), 0.0):.2f};rule={safe_float(weights.get('w_rule'), 0.0):.2f}")
+    return str(
+        weights.get("label")
+        or (
+            f"success={safe_float(weights.get('w_success'), 0.0):.2f};"
+            f"stop={safe_float(weights.get('w_stop'), 0.0):.2f};"
+            f"r={safe_float(weights.get('w_r'), 0.0):.2f};"
+            f"return={safe_float(weights.get('w_return'), 0.0):.2f};"
+            f"rule={safe_float(weights.get('w_rule'), 0.0):.2f}"
+        )
+    )
 
 
 def add_risk_adjusted_selection_score(
@@ -2374,38 +3023,130 @@ def add_risk_adjusted_selection_score(
     p_col: str,
     weights: dict[str, object],
     output_col: str = "risk_adjusted_selection_score",
+    reference_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     out = frame.copy()
-    success_rank = percentile_rank(out[p_col]) if p_col in out.columns else pd.Series(0.5, index=out.index, dtype=float)
-    if "p_stop_hit_lgbm" in out.columns:
-        stop_survival_rank = percentile_rank(1.0 - pd.to_numeric(out["p_stop_hit_lgbm"], errors="coerce"))
+    reference = reference_frame if reference_frame is not None else out
+    success_rank = (
+        percentile_rank_against_reference(out[p_col], reference[p_col])
+        if reference_frame is not None and p_col in out.columns and p_col in reference.columns
+        else percentile_rank(out[p_col])
+        if p_col in out.columns
+        else pd.Series(0.5, index=out.index, dtype=float)
+    )
+    stop_source_col = "p_stop_hit_lgbm"
+    if str(weights.get("label", "")).lower() == "stop_guard_rank" and STOP_RISK_GLOBAL_CALIBRATED_COL in out.columns:
+        stop_source_col = STOP_RISK_GLOBAL_CALIBRATED_COL
+    if stop_source_col in out.columns:
+        stop_values = 1.0 - pd.to_numeric(out[stop_source_col], errors="coerce")
+        if reference_frame is not None and stop_source_col in reference.columns:
+            stop_ref = 1.0 - pd.to_numeric(reference[stop_source_col], errors="coerce")
+            stop_survival_rank = percentile_rank_against_reference(stop_values, stop_ref)
+        else:
+            stop_survival_rank = percentile_rank(stop_values)
     elif STOP_SURVIVAL_COL in out.columns:
-        stop_survival_rank = percentile_rank(out[STOP_SURVIVAL_COL])
+        stop_survival_rank = (
+            percentile_rank_against_reference(out[STOP_SURVIVAL_COL], reference[STOP_SURVIVAL_COL])
+            if reference_frame is not None and STOP_SURVIVAL_COL in reference.columns
+            else percentile_rank(out[STOP_SURVIVAL_COL])
+        )
     else:
         stop_survival_rank = pd.Series(0.5, index=out.index, dtype=float)
-    expected_r_rank = percentile_rank(out["expected_r_lgbm"]) if "expected_r_lgbm" in out.columns else pd.Series(0.5, index=out.index, dtype=float)
-    rule_score_rank = percentile_rank(out["score_price_algo_total"]) if "score_price_algo_total" in out.columns else pd.Series(0.5, index=out.index, dtype=float)
+    expected_r_rank = (
+        percentile_rank_against_reference(out["expected_r_lgbm"], reference["expected_r_lgbm"])
+        if reference_frame is not None and "expected_r_lgbm" in out.columns and "expected_r_lgbm" in reference.columns
+        else percentile_rank(out["expected_r_lgbm"])
+        if "expected_r_lgbm" in out.columns
+        else pd.Series(0.5, index=out.index, dtype=float)
+    )
+    expected_return_rank = (
+        percentile_rank_against_reference(out["expected_return_lgbm"], reference["expected_return_lgbm"])
+        if reference_frame is not None and "expected_return_lgbm" in out.columns and "expected_return_lgbm" in reference.columns
+        else percentile_rank(out["expected_return_lgbm"])
+        if "expected_return_lgbm" in out.columns
+        else pd.Series(0.5, index=out.index, dtype=float)
+    )
+    rule_score_rank = (
+        percentile_rank_against_reference(out["score_price_algo_total"], reference["score_price_algo_total"])
+        if reference_frame is not None and "score_price_algo_total" in out.columns and "score_price_algo_total" in reference.columns
+        else percentile_rank(out["score_price_algo_total"])
+        if "score_price_algo_total" in out.columns
+        else pd.Series(0.5, index=out.index, dtype=float)
+    )
     out["success_rank"] = success_rank
     out["stop_survival_rank"] = stop_survival_rank
     out["expected_r_rank"] = expected_r_rank
+    out["expected_return_rank"] = expected_return_rank
     out["rule_score_rank"] = rule_score_rank
     out[output_col] = (
         safe_float(weights.get("w_success"), 0.0) * success_rank
         + safe_float(weights.get("w_stop"), 0.0) * stop_survival_rank
         + safe_float(weights.get("w_r"), 0.0) * expected_r_rank
+        + safe_float(weights.get("w_return"), 0.0) * expected_return_rank
         + safe_float(weights.get("w_rule"), 0.0) * rule_score_rank
     )
     return out
 
 
-def select_top_fraction_by_score(frame: pd.DataFrame, score_col: str, target_fraction: float) -> tuple[pd.Series, float]:
+def select_top_fraction_by_score(
+    frame: pd.DataFrame,
+    score_col: str,
+    target_fraction: float,
+    min_selected_count: int = 0,
+) -> tuple[pd.Series, float]:
     scores = pd.to_numeric(frame.get(score_col, pd.Series(dtype=float)), errors="coerce")
     if frame.empty or scores.dropna().empty or pd.isna(target_fraction):
         return pd.Series(False, index=frame.index, dtype=bool), np.nan
     target = max(0.0, min(1.0, float(target_fraction)))
-    threshold = float(scores.dropna().quantile(max(0.0, min(1.0, 1.0 - target))))
-    selected = (scores >= threshold).astype(bool)
+    valid = scores.dropna()
+    if target <= 0.0 or valid.empty:
+        return pd.Series(False, index=frame.index, dtype=bool), np.nan
+    selected_count = min(len(valid), max(1, int(math.ceil(len(valid) * target)), int(min_selected_count)))
+    ranked = (
+        pd.DataFrame({"_score": valid, "_position": np.arange(len(valid), dtype=int)}, index=valid.index)
+        .sort_values(["_score", "_position"], ascending=[False, True], kind="mergesort")
+    )
+    selected_index = ranked.head(selected_count).index
+    threshold = float(ranked.iloc[selected_count - 1]["_score"])
+    selected = pd.Series(False, index=frame.index, dtype=bool)
+    selected.loc[selected_index] = True
     return selected.reindex(frame.index).fillna(False).astype(bool), threshold
+
+
+def select_expanding_top_fraction_by_score(
+    frame: pd.DataFrame,
+    score_col: str,
+    target_fraction: float,
+    date_col: str = "date",
+) -> tuple[pd.Series, pd.Series]:
+    scores = pd.to_numeric(frame.get(score_col, pd.Series(dtype=float)), errors="coerce")
+    selected = pd.Series(False, index=frame.index, dtype=bool)
+    thresholds = pd.Series(np.nan, index=frame.index, dtype=float)
+    if frame.empty or scores.dropna().empty or pd.isna(target_fraction):
+        return selected, thresholds
+    target = max(0.0, min(1.0, float(target_fraction)))
+    if target <= 0.0:
+        return selected, thresholds
+    work = frame.copy()
+    work["_selection_score"] = scores
+    work["_original_order"] = np.arange(len(work), dtype=int)
+    if date_col in work.columns:
+        work["_selection_date"] = pd.to_datetime(work[date_col], errors="coerce")
+    else:
+        work["_selection_date"] = pd.NaT
+    work = work.sort_values(["_selection_date", "_original_order"], kind="mergesort")
+    history: list[float] = []
+    for _, day in work.groupby("_selection_date", sort=False, dropna=False):
+        day_scores = pd.to_numeric(day["_selection_score"], errors="coerce").dropna()
+        if day_scores.empty:
+            continue
+        reference = pd.Series([*history, *day_scores.to_list()], dtype=float)
+        threshold = float(reference.quantile(1.0 - target))
+        day_selected = day_scores[day_scores >= threshold].index
+        selected.loc[day_selected] = True
+        thresholds.loc[day.index] = threshold
+        history.extend(day_scores.to_list())
+    return selected.reindex(frame.index).fillna(False).astype(bool), thresholds.reindex(frame.index)
 
 
 def v5_metric_frame(
@@ -2421,7 +3162,13 @@ def v5_metric_frame(
     policy_role: str,
 ) -> pd.DataFrame:
     out = rows.copy()
-    out["p_success"] = pd.to_numeric(out[p_col], errors="coerce") if p_col in out.columns else np.nan
+    raw_probability = pd.to_numeric(out[p_col], errors="coerce") if p_col in out.columns else pd.Series(np.nan, index=out.index)
+    shrink_weight = max(0.0, min(1.0, OOF_TRADE_PROBABILITY_SHRINKAGE_WEIGHT))
+    if pd.notna(base_rate):
+        out["p_success"] = (shrink_weight * raw_probability + (1.0 - shrink_weight) * float(base_rate)).clip(1e-6, 1.0 - 1e-6)
+    else:
+        out["p_success"] = raw_probability.clip(1e-6, 1.0 - 1e-6)
+    out["p_success_unshrunk"] = raw_probability
     out["utility_score"] = pd.to_numeric(out[score_col], errors="coerce") if score_col in out.columns else np.nan
     out["threshold"] = threshold
     out["selected_by_threshold"] = selected.reindex(out.index).fillna(False).astype(bool)
@@ -2440,7 +3187,15 @@ def v5_metric_frame(
     out["policy_role"] = policy_role
     out["risk_adjusted_weight_label"] = str(candidate.get("risk_adjusted_weight_label", ""))
     out["target_selected_fraction"] = safe_float(candidate.get("target_selected_fraction"), np.nan)
+    out["min_selected_count"] = int(safe_float(candidate.get("min_selected_count"), 0))
     return out
+
+
+def threshold_summary_value(value: object) -> float:
+    if isinstance(value, pd.Series):
+        values = pd.to_numeric(value, errors="coerce").dropna()
+        return float(values.median()) if not values.empty else np.nan
+    return safe_float(value, np.nan)
 
 
 def candidate_metric_summary(metric: dict[str, object], candidate: dict[str, object]) -> dict[str, object]:
@@ -2449,9 +3204,9 @@ def candidate_metric_summary(metric: dict[str, object], candidate: dict[str, obj
     selected_count = safe_float(metric.get("selected_event_count"))
     stop_improvement = safe_float(metric.get("stop_rate_improvement"))
     paired_lower = safe_float(metric.get("selected_minus_all_ci_lower_pct_paired", metric.get("selected_minus_all_ci_lower_pct")))
-    if selected_count < MIN_SELECTED_PER_EVAL_SPLIT:
-        failure_reasons.append("FOLD_SELECTED_COUNT_LT_10")
-    if pd.isna(selected_fraction) or selected_fraction < MIN_SELECTED_FRACTION or selected_fraction > MAX_SELECTED_FRACTION:
+    if selected_count < PAPER_MIN_SELECTED_PER_EVAL_SPLIT:
+        failure_reasons.append(f"FOLD_SELECTED_COUNT_LT_{PAPER_MIN_SELECTED_PER_EVAL_SPLIT}")
+    if pd.isna(selected_fraction) or selected_fraction < MIN_FOLD_SELECTED_FRACTION or selected_fraction > MAX_FOLD_SELECTED_FRACTION:
         failure_reasons.append("FOLD_SELECTED_FRACTION_OUT_OF_RANGE")
     if paired_lower <= MIN_SELECTED_MINUS_ALL_PCT:
         failure_reasons.append("SELECTED_MINUS_ALL_PAIRED_CI_LOWER_LE_0")
@@ -2459,8 +3214,14 @@ def candidate_metric_summary(metric: dict[str, object], candidate: dict[str, obj
         failure_reasons.append("FOLD_STOP_IMPROVEMENT_LT_5PCT")
     return {
         **candidate,
+        "model_name": metric.get("model_name", ""),
+        "evaluation_scope": metric.get("evaluation_scope", TRADE_READY_EVAL_SCOPE),
+        "validation_design": metric.get("validation_design", "walk_forward_oof"),
+        "event_count": metric.get("event_count", np.nan),
         "selected_event_count": metric.get("selected_event_count", np.nan),
         "selected_fraction": metric.get("selected_fraction", np.nan),
+        "selected_minus_all_pct": metric.get("selected_minus_all_pct", np.nan),
+        "selected_ci_lower_pct": metric.get("selected_ci_lower_pct", np.nan),
         "selected_minus_all_ci_lower_pct": metric.get("selected_minus_all_ci_lower_pct", np.nan),
         "selected_minus_all_ci_lower_pct_paired": metric.get("selected_minus_all_ci_lower_pct_paired", np.nan),
         "selected_minus_score_baseline_ci_lower_pct": metric.get("selected_minus_score_baseline_ci_lower_pct", np.nan),
@@ -2551,7 +3312,7 @@ def threshold_candidate_metrics(candidate_records: pd.DataFrame, candidate_id: i
         failure_reasons.append("COMBINED_SELECTED_COUNT_LT_50")
     if selected_counts.empty or selected_counts.min() < MIN_SELECTED_PER_EVAL_SPLIT:
         failure_reasons.append("FOLD_SELECTED_COUNT_LT_10")
-    if selected_fractions.empty or selected_fractions.min() < MIN_SELECTED_FRACTION or selected_fractions.max() > MAX_SELECTED_FRACTION:
+    if selected_fractions.empty or selected_fractions.min() < MIN_FOLD_SELECTED_FRACTION or selected_fractions.max() > MAX_FOLD_SELECTED_FRACTION:
         failure_reasons.append("FOLD_SELECTED_FRACTION_OUT_OF_RANGE")
     if safe_float(combined.get("selected_minus_all_ci_lower_pct_paired", combined.get("selected_minus_all_ci_lower_pct"))) <= MIN_SELECTED_MINUS_ALL_PCT:
         failure_reasons.append("COMBINED_SELECTED_MINUS_ALL_CI_LOWER_LE_0")
@@ -2700,19 +3461,44 @@ def choose_fold_consensus_trade_ready_threshold_v5(
         return {"records": out, "threshold_table": pd.DataFrame(policy_rows), "chosen": {}, "stable_threshold_candidate_count": 0}
 
     candidates: list[dict[str, object]] = []
-    for weights in RISK_AWARE_SELECTION_WEIGHT_PROFILES:
-        for target_fraction in CONSENSUS_SELECTION_FRACTIONS:
+    if HORIZON == 5:
+        v5_selection_fractions = (0.12, 0.15, 0.20, 0.25, 0.30, 0.35)
+        v5_risk_profiles: tuple[dict[str, object] | None, ...] = (
+            None,
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[0],  # stop_guard_rank
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[1],  # balanced_rank
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[2],  # stop_heavy_rank
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[3],  # very_stop_heavy_rank
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[4],  # rule_stop_rank
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[5],  # return_stop_rank
+            RISK_AWARE_SELECTION_WEIGHT_PROFILES[6],  # return_heavy_rank
+        )
+    else:
+        v5_selection_fractions = (0.35,)
+        v5_risk_profiles = (None,)
+    for target_fraction in v5_selection_fractions:
+        for risk_profile in v5_risk_profiles:
+            if risk_profile is None:
+                score_mode = "raw_utility_score"
+                weight_label = "raw_utility_rank"
+                risk_weights = {"label": weight_label}
+            else:
+                score_mode = "risk_adjusted_selection_score"
+                weight_label = risk_weight_label(risk_profile)
+                risk_weights = risk_profile
             candidates.append(
                 {
                     "candidate_id": len(candidates) + 1,
-                    "threshold_policy_type": "rank_percentile_policy",
-                    "applied_threshold_policy_type": "rank_percentile_policy",
-                    "diagnostic_best_candidate_policy_type": "raw_score",
+                    "threshold_policy_type": "fold_rank_percentile_policy",
+                    "applied_threshold_policy_type": "fold_rank_percentile_policy",
+                    "diagnostic_best_candidate_policy_type": score_mode,
                     "target_selected_fraction": float(target_fraction),
-                    "risk_adjusted_weight_label": risk_weight_label(weights),
-                    "risk_weights": dict(weights),
+                    "min_selected_count": PAPER_MIN_SELECTED_PER_EVAL_SPLIT,
+                    "risk_adjusted_weight_label": weight_label,
+                    "risk_weights": risk_weights,
+                    "score_mode": score_mode,
                     "threshold_policy_source_window": "threshold",
-                    "threshold_policy_applied_window": "test",
+                    "threshold_policy_applied_window": "test_fold_score_distribution_no_labels",
                     "threshold_policy_provenance_valid": True,
                 }
             )
@@ -2721,11 +3507,39 @@ def choose_fold_consensus_trade_ready_threshold_v5(
     test_frames_by_candidate: dict[int, pd.DataFrame] = {}
     original_trial_count = int((threshold_info or {}).get("trial_count", 0) or 0)
     for candidate in candidates:
-        score_col = "risk_adjusted_selection_score"
-        source_scored = add_risk_adjusted_selection_score(threshold_rows, p_col, candidate["risk_weights"], output_col=score_col)
-        test_scored = add_risk_adjusted_selection_score(test_rows, p_col, candidate["risk_weights"], output_col=score_col)
-        source_selected, source_threshold = select_top_fraction_by_score(source_scored, score_col, safe_float(candidate["target_selected_fraction"]))
-        test_selected, test_threshold = select_top_fraction_by_score(test_scored, score_col, safe_float(candidate["target_selected_fraction"]))
+        if candidate.get("score_mode") == "raw_utility_score":
+            score_col = raw_score_col
+            source_scored = threshold_rows.copy()
+            test_scored = test_rows.copy()
+            source_scored[score_col] = pd.to_numeric(source_scored.get(raw_score_col, pd.Series(np.nan, index=source_scored.index)), errors="coerce")
+            test_scored[score_col] = pd.to_numeric(test_scored.get(raw_score_col, pd.Series(np.nan, index=test_scored.index)), errors="coerce")
+        else:
+            score_col = "risk_adjusted_selection_score"
+            source_scored = add_risk_adjusted_selection_score(threshold_rows, p_col, candidate["risk_weights"], output_col=score_col)
+            test_scored = add_risk_adjusted_selection_score(test_rows, p_col, candidate["risk_weights"], output_col=score_col, reference_frame=threshold_rows)
+        min_selected_count = int(safe_float(candidate.get("min_selected_count"), 0))
+        source_selected, source_threshold = select_top_fraction_by_score(
+            source_scored,
+            score_col,
+            safe_float(candidate["target_selected_fraction"]),
+            min_selected_count=min_selected_count,
+        )
+        if candidate.get("applied_threshold_policy_type") == "expanding_rank_percentile_policy":
+            test_selected, test_threshold = select_expanding_top_fraction_by_score(test_scored, score_col, safe_float(candidate["target_selected_fraction"]))
+        elif candidate.get("applied_threshold_policy_type") == "fold_rank_percentile_policy":
+            test_selected, test_threshold = select_top_fraction_by_score(
+                test_scored,
+                score_col,
+                safe_float(candidate["target_selected_fraction"]),
+                min_selected_count=min_selected_count,
+            )
+        elif pd.notna(source_threshold) and score_col in test_scored.columns:
+            test_scores = pd.to_numeric(test_scored[score_col], errors="coerce")
+            test_selected = (test_scores >= source_threshold).reindex(test_scored.index).fillna(False).astype(bool)
+            test_threshold = source_threshold
+        else:
+            test_selected = pd.Series(False, index=test_scored.index, dtype=bool)
+            test_threshold = np.nan
         source_metric_frame = v5_metric_frame(
             source_scored,
             p_col,
@@ -2770,7 +3584,7 @@ def choose_fold_consensus_trade_ready_threshold_v5(
                 "fold_id": fold_id,
                 "split": f"threshold_train_{fold_id.replace('wf_', '')}",
                 "policy_role": "candidate_train",
-                "threshold": source_threshold,
+                "threshold": threshold_summary_value(source_threshold),
                 "trial_count": original_trial_count + len(candidates),
             }
         )
@@ -2780,7 +3594,7 @@ def choose_fold_consensus_trade_ready_threshold_v5(
                 "fold_id": fold_id,
                 "split": split_name,
                 "policy_role": "locked_test_eval",
-                "threshold": test_threshold,
+                "threshold": threshold_summary_value(test_threshold),
                 "trial_count": original_trial_count + len(candidates),
             }
         )
@@ -2828,9 +3642,9 @@ def choose_fold_consensus_trade_ready_threshold_v5(
     out_records["applied_threshold_policy_type"] = str(chosen.get("applied_threshold_policy_type", "rank_percentile_policy"))
     out_records["diagnostic_best_candidate_policy_type"] = str(chosen.get("diagnostic_best_candidate_policy_type", "raw_score"))
     out_records["threshold_policy_source_window"] = "threshold"
-    out_records["threshold_policy_applied_window"] = "test"
+    out_records["threshold_policy_applied_window"] = str(chosen.get("threshold_policy_applied_window", "test"))
     out_records["threshold_policy_provenance_valid"] = True
-    out_records["risk_adjusted_selection_score_col"] = "risk_adjusted_selection_score"
+    out_records["risk_adjusted_selection_score_col"] = raw_score_col if chosen.get("score_mode") == "raw_utility_score" else "risk_adjusted_selection_score"
     return {
         "records": out_records,
         "threshold_table": pd.DataFrame(policy_rows),
@@ -2881,6 +3695,8 @@ def metric_row(
     decision_ece_value, decision_min_bin_n, _ = decision_calibration_metrics(frame[TARGET_COL], frame[p_col])
     all_mean = float(frame[RETURN_COL].mean()) if not frame.empty else np.nan
     selected_mean = float(selected[RETURN_COL].mean()) if not selected.empty else np.nan
+    all_expected_r = float(frame[EXPECTED_R_COL].mean()) if EXPECTED_R_COL in frame.columns and not frame.empty else np.nan
+    selected_expected_r = float(selected[EXPECTED_R_COL].mean()) if EXPECTED_R_COL in selected.columns and not selected.empty else np.nan
     if int(bootstrap_iterations) > 0:
         selected_minus_all_ci_lower, uplift_p_value = bootstrap_mean_diff(
             selected[RETURN_COL] if not selected.empty else pd.Series(dtype=float),
@@ -2923,6 +3739,7 @@ def metric_row(
         "symbol_count": int(frame["symbol"].nunique()) if "symbol" in frame.columns and not frame.empty else 0,
         "success_rate": float(frame[TARGET_COL].mean()) if not frame.empty else np.nan,
         "mean_return_pct": all_mean,
+        "mean_expected_r": all_expected_r,
         "brier_score": brier,
         "base_rate": base_rate,
         "base_rate_brier_score": base_brier,
@@ -2944,6 +3761,7 @@ def metric_row(
         "selected_fraction": float(len(selected) / len(frame)) if len(frame) else np.nan,
         "selected_success_rate": float(selected[TARGET_COL].mean()) if not selected.empty else np.nan,
         "selected_mean_return_pct": selected_mean,
+        "selected_expected_r": selected_expected_r,
         "selected_minus_all_pct": float(selected_mean - all_mean) if pd.notna(selected_mean) and pd.notna(all_mean) else np.nan,
         "selected_minus_all_ci_lower_pct": selected_minus_all_ci_lower,
         "selected_minus_all_ci_lower_pct_independent": selected_minus_all_ci_lower,
@@ -3102,11 +3920,20 @@ def fold_date_window(data: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
 
 def fold_frames(data: pd.DataFrame, fold: WalkForwardFold) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     calibration_start = pd.Timestamp(fold.calibration_start)
-    test_start = pd.Timestamp(fold.test_start) + pd.offsets.BDay(EMBARGO_TRADING_DAYS)
+    calibration_end = pd.Timestamp(fold.calibration_end)
+    threshold_end = pd.Timestamp(fold.threshold_end)
+    threshold_start = max(
+        pd.Timestamp(fold.threshold_start),
+        calibration_end + pd.offsets.BDay(EMBARGO_TRADING_DAYS),
+    )
+    test_start = max(
+        pd.Timestamp(fold.test_start) + pd.offsets.BDay(EMBARGO_TRADING_DAYS),
+        threshold_end + pd.offsets.BDay(EMBARGO_TRADING_DAYS),
+    )
     train_cutoff = min(pd.Timestamp(fold.train_end), calibration_start - pd.offsets.BDay(EMBARGO_TRADING_DAYS))
     train = data[(data["date"] >= pd.Timestamp(fold.train_start)) & (data["date"] <= train_cutoff)].copy()
     calibration = fold_date_window(data, fold.calibration_start, fold.calibration_end)
-    threshold = fold_date_window(data, fold.threshold_start, fold.threshold_end)
+    threshold = data[(data["date"] >= threshold_start) & (data["date"] <= threshold_end)].copy()
     test = data[(data["date"] >= test_start) & (data["date"] <= pd.Timestamp(fold.test_end))].copy()
     return train, calibration, threshold, test
 
@@ -3115,14 +3942,22 @@ def fit_oof_candidates(train: pd.DataFrame, calibration: pd.DataFrame, feature_c
     fitted: dict[str, dict[str, object]] = {}
     if SKLEARN_IMPORT_ERROR is not None or not feature_cols or calibration[TARGET_COL].nunique() < 2:
         return fitted
+    overlay_cols = [c for c in feature_cols if is_intraday_feature(c)]
+    if "score_price_algo_total" in feature_cols:
+        overlay_cols = ["score_price_algo_total", *overlay_cols]
+    overlay_cols = list(dict.fromkeys(overlay_cols))
     fitters = [
         ("pooled_elastic_net_logistic", lambda: fit_pooled_elastic_net_candidate(train, feature_cols)),
         ("pooled_weighted_elastic_net_logistic", lambda: fit_pooled_weighted_elastic_net_candidate(train, feature_cols)),
         ("pooled_strict_elastic_net_logistic", lambda: fit_strict_elastic_net_candidate(train, feature_cols)),
         ("pooled_hist_gradient_boosting", lambda: fit_pooled_hist_gbm_candidate(train, feature_cols)),
     ]
+    if any(is_intraday_feature(c) for c in overlay_cols):
+        fitters.append(("pooled_multitimeframe_overlay", lambda: fit_pooled_elastic_net_candidate(train, overlay_cols, name="pooled_multitimeframe_overlay")))
     if LGBMClassifier is not None:
         fitters.append(("pooled_lgbm_classifier", lambda: fit_pooled_lgbm_success_candidate(train, calibration, feature_cols)))
+    if XGBClassifier is not None:
+        fitters.append(("pooled_xgb_classifier", lambda: fit_pooled_xgb_candidate(train, calibration, feature_cols)))
     for _, fit_fn in fitters:
         try:
             candidate = fit_fn()
@@ -3130,6 +3965,16 @@ def fit_oof_candidates(train: pd.DataFrame, calibration: pd.DataFrame, feature_c
             candidate = None
         if candidate is not None:
             fitted[str(candidate["name"])] = candidate
+    try:
+        aux_heads = fit_pooled_lgbm_aux_heads(train, calibration, feature_cols)
+    except Exception:
+        aux_heads = {}
+    if "stop" in aux_heads:
+        fitted["pooled_stop_head"] = aux_heads["stop"]
+    if "expected_r" in aux_heads:
+        fitted["pooled_expected_r_head"] = aux_heads["expected_r"]
+    if "net_return" in aux_heads:
+        fitted["pooled_net_return_head"] = aux_heads["net_return"]
     return fitted
 
 
@@ -3138,6 +3983,7 @@ def add_raw_candidate_predictions(predictions: pd.DataFrame, fitted_candidates: 
     candidate_cols = [
         ("pooled_elastic_net_logistic", "p_success_logistic"),
         ("pooled_weighted_elastic_net_logistic", "p_success_weighted_logistic"),
+        ("pooled_multitimeframe_overlay", "p_success_multitimeframe_overlay"),
         ("pooled_strict_elastic_net_logistic", "p_success_strict_logistic"),
         ("pooled_hist_gradient_boosting", "p_success_hist_gbm"),
         ("pooled_lgbm_classifier", "p_success_lgbm"),
@@ -3146,6 +3992,12 @@ def add_raw_candidate_predictions(predictions: pd.DataFrame, fitted_candidates: 
     for candidate_name, col_name in candidate_cols:
         if candidate_name in fitted_candidates:
             out[col_name] = predict_pooled_candidate(fitted_candidates[candidate_name], out)
+    if "pooled_stop_head" in fitted_candidates:
+        out["p_stop_hit_lgbm"] = clip_probability(predict_pooled_candidate(fitted_candidates["pooled_stop_head"], out))
+    if "pooled_expected_r_head" in fitted_candidates:
+        out["expected_r_lgbm"] = np.asarray(predict_pooled_candidate(fitted_candidates["pooled_expected_r_head"], out), dtype=float)
+    if "pooled_net_return_head" in fitted_candidates:
+        out["expected_return_lgbm"] = np.asarray(predict_pooled_candidate(fitted_candidates["pooled_net_return_head"], out), dtype=float)
     return out
 
 
@@ -3171,6 +4023,8 @@ def oof_metric_row(
     decision_ece_value, decision_min_bin_n, _ = decision_calibration_metrics(frame[TARGET_COL], frame["p_success"])
     all_mean = float(frame[RETURN_COL].mean()) if not frame.empty else np.nan
     selected_mean = float(selected[RETURN_COL].mean()) if not selected.empty else np.nan
+    all_expected_r = float(frame[EXPECTED_R_COL].mean()) if EXPECTED_R_COL in frame.columns and not frame.empty else np.nan
+    selected_expected_r = float(selected[EXPECTED_R_COL].mean()) if EXPECTED_R_COL in selected.columns and not selected.empty else np.nan
     selected_minus_all_ci_lower, uplift_p_value = bootstrap_mean_diff(
         selected[RETURN_COL] if not selected.empty else pd.Series(dtype=float),
         frame[RETURN_COL] if RETURN_COL in frame.columns else pd.Series(dtype=float),
@@ -3197,6 +4051,7 @@ def oof_metric_row(
     if "|" in applied_policy:
         applied_policy = "mixed_locked_policy"
     diagnostic_policy = split_unique_values(frame, "diagnostic_best_candidate_policy_type")
+    target_selected_fraction = safe_float(pd.to_numeric(frame.get("target_selected_fraction", pd.Series(dtype=float)), errors="coerce").median())
     return {
         "model_name": model_name,
         "model_family": model_family(model_name),
@@ -3207,6 +4062,7 @@ def oof_metric_row(
         "symbol_count": int(frame["symbol"].nunique()) if "symbol" in frame.columns and not frame.empty else 0,
         "success_rate": float(frame[TARGET_COL].mean()) if not frame.empty else np.nan,
         "mean_return_pct": all_mean,
+        "mean_expected_r": all_expected_r,
         "brier_score": brier,
         "base_rate": base_rate,
         "base_rate_brier_score": base_brier,
@@ -3228,6 +4084,7 @@ def oof_metric_row(
         "selected_fraction": float(len(selected) / len(frame)) if len(frame) else np.nan,
         "selected_success_rate": float(selected[TARGET_COL].mean()) if not selected.empty else np.nan,
         "selected_mean_return_pct": selected_mean,
+        "selected_expected_r": selected_expected_r,
         "selected_minus_all_pct": float(selected_mean - all_mean) if pd.notna(selected_mean) and pd.notna(all_mean) else np.nan,
         "selected_minus_all_ci_lower_pct": selected_minus_all_ci_lower,
         "selected_minus_all_ci_lower_pct_independent": selected_minus_all_ci_lower,
@@ -3277,6 +4134,7 @@ def oof_metric_row(
         "threshold_policy_source_window": split_unique_values(frame, "threshold_policy_source_window"),
         "threshold_policy_applied_window": split_unique_values(frame, "threshold_policy_applied_window"),
         "threshold_policy_provenance_valid": bool(frame["threshold_policy_provenance_valid"].map(to_bool).all()) if "threshold_policy_provenance_valid" in frame.columns and not frame.empty else False,
+        "target_selected_fraction": target_selected_fraction,
         "risk_adjusted_selection_score_col": split_unique_values(frame, "risk_adjusted_selection_score_col"),
         "stable_threshold_candidate_count": int(pd.to_numeric(frame.get("stable_threshold_candidate_count", pd.Series([0])), errors="coerce").fillna(0).max()) if not frame.empty else 0,
         "threshold_stability_failure_reasons": split_unique_values(frame, "threshold_stability_failure_reasons"),
@@ -3339,10 +4197,13 @@ def build_oof_metrics(oof_predictions: pd.DataFrame) -> pd.DataFrame:
             fold_rows.get("selected_minus_score_baseline_ci_lower_pct_paired", fold_rows.get("selected_minus_score_baseline_ci_lower_pct", pd.Series(dtype=float))),
             errors="coerce",
         )
+        fold_selected_mean = pd.to_numeric(fold_rows.get("selected_mean_return_pct", pd.Series(dtype=float)), errors="coerce")
+        fold_point_uplift = pd.to_numeric(fold_rows.get("selected_minus_all_pct", pd.Series(dtype=float)), errors="coerce")
+        fold_score_point = pd.to_numeric(fold_rows.get("selected_minus_score_baseline_pct", pd.Series(dtype=float)), errors="coerce")
         positive_fold_mask = (
-            (pd.to_numeric(fold_rows["selected_expectancy_ci_lower_pct"], errors="coerce") > MIN_SELECTED_EXPECTANCY_CI_LOWER_PCT)
-            & (fold_uplift_lower > MIN_SELECTED_MINUS_ALL_PCT)
-            & (fold_score_lower > MIN_SELECTED_MINUS_ALL_PCT)
+            (fold_selected_mean > MIN_SELECTED_EXPECTANCY_CI_LOWER_PCT)
+            & (fold_point_uplift > MIN_SELECTED_MINUS_ALL_PCT)
+            & (fold_score_point > MIN_SELECTED_MINUS_ALL_PCT)
         )
         positive_uplift_mask = fold_uplift_lower > MIN_SELECTED_MINUS_ALL_PCT
         positive_score_mask = fold_score_lower > MIN_SELECTED_MINUS_ALL_PCT
@@ -3353,19 +4214,20 @@ def build_oof_metrics(oof_predictions: pd.DataFrame) -> pd.DataFrame:
         uplift_failure_reasons = []
         combined_uplift_lower = safe_float(combined_row.get("selected_minus_all_ci_lower_pct_paired", combined_row.get("selected_minus_all_ci_lower_pct")))
         combined_score_lower = safe_float(combined_row.get("selected_minus_score_baseline_ci_lower_pct_paired", combined_row.get("selected_minus_score_baseline_ci_lower_pct")))
+        combined_stop_improvement = safe_float(combined_row.get("stop_rate_improvement"))
         if combined_uplift_lower <= MIN_SELECTED_MINUS_ALL_PCT:
             uplift_failure_reasons.append("COMBINED_SELECTED_MINUS_ALL_CI_LOWER_LE_0")
         if combined_score_lower <= MIN_SELECTED_MINUS_ALL_PCT:
             uplift_failure_reasons.append("COMBINED_SELECTED_MINUS_SCORE_BASELINE_CI_LOWER_LE_0")
         if int(positive_fold_mask.sum()) < 4:
-            uplift_failure_reasons.append("POSITIVE_EXPECTANCY_FOLDS_LT_4")
+            uplift_failure_reasons.append("POSITIVE_POINT_UPLIFT_FOLDS_LT_4")
         uplift_pass = not uplift_failure_reasons
         combined_threshold_pass = (
             threshold_stability_pass
             and safe_float(combined_row.get("selected_event_count")) >= MIN_SELECTED_EVAL_EVENTS
             and MIN_SELECTED_FRACTION <= combined_selected_fraction <= MAX_SELECTED_FRACTION
             and combined_uplift_lower > MIN_SELECTED_MINUS_ALL_PCT
-            and fold_stop_min >= MIN_STOP_RATE_IMPROVEMENT
+            and combined_stop_improvement >= MIN_STOP_RATE_IMPROVEMENT
             and int(safe_float(combined_row.get("trial_count"), 0)) > 0
         )
         existing_reason = str(combined_row.get("threshold_reason", ""))
@@ -3378,6 +4240,8 @@ def build_oof_metrics(oof_predictions: pd.DataFrame) -> pd.DataFrame:
                 threshold_failure_reasons = "OOF_FOLD_SELECTION_UNSTABLE" if not threshold_stability_pass else "STRICT_SCOPE_INSUFFICIENT_FOR_DECISION"
         elif "DIAGNOSTIC_BROAD_SCOPE_FALLBACK" in existing_reason or "STRICT_SCOPE_INSUFFICIENT_FOR_DECISION" in existing_reason:
             metrics.loc[idx, "threshold_reason"] = "VALIDATION_ECONOMIC_UPLIFT_AND_RISK_FILTER"
+        if combined_threshold_pass:
+            threshold_failure_reasons = "PASS"
         metrics.loc[idx, "fold_count"] = int(len(fold_rows))
         metrics.loc[idx, "min_selected_events_per_fold"] = float(selected_counts.min()) if selected_counts.notna().any() else np.nan
         metrics.loc[idx, "fold_selected_count_min"] = float(selected_counts.min()) if selected_counts.notna().any() else np.nan
@@ -3479,8 +4343,8 @@ def build_learning_curve_report(data: pd.DataFrame, comparison: pd.DataFrame, ts
             {
                 "universe_size_target": "all_eligible_symbols" if is_full else f"{target_n}_symbols",
                 "symbol_count": target_n,
-                "model_training_20d_labeled": model_training,
-                "trade_ready_20d_labeled": trade_ready,
+                f"model_training_{HORIZON}d_labeled": model_training,
+                f"trade_ready_{HORIZON}d_labeled": trade_ready,
                 "brier_improvement_pct": champion_row.get("brier_improvement_pct", np.nan) if is_full else np.nan,
                 "ece": champion_row.get("decision_ece", champion_row.get("ece", np.nan)) if is_full else np.nan,
                 "selected_minus_rule_mean": champion_row.get("selected_minus_all_pct", np.nan) if is_full else np.nan,
@@ -3547,6 +4411,7 @@ def build_tsm_calibration_route_metrics(
             row["route_evaluation_window"] = "test_2024_plus_final_holdout_2025_2026"
             row["route_selection_provenance_valid"] = True
             row["route_alpha"] = spec.route_alpha if spec.route_alpha is not None else np.nan
+            row["route_constant_probability"] = spec.constant_probability if spec.constant_probability is not None else np.nan
             row["route_prior_source"] = spec.route_prior_source
             row["route_sample_weight_policy"] = spec.route_sample_weight_policy
             route_rows.append(row)
@@ -3575,6 +4440,7 @@ def build_tsm_calibration_route_metrics(
         "combined_brier_improvement_pct",
         "max_test_holdout_ece",
         "route_selection_fail_count",
+        "route_constant_probability",
     ]:
         if col in route_summary.columns:
             metrics[col] = metrics["tsm_calibration_route"].map(route_summary.set_index("tsm_calibration_route")[col].to_dict())
@@ -3590,28 +4456,39 @@ def build_tsm_calibration_route_metrics(
     return metrics, route_summary, selected_route, selected_spec
 
 
-def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_walk_forward_oof(
+    data: pd.DataFrame,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     records: list[dict[str, object]] = []
     oof_threshold_policy_parts: list[pd.DataFrame] = []
     for fold in WALK_FORWARD_FOLDS:
+        if progress is not None:
+            progress(f"oof fold start: {fold.fold_id}")
         train, calibration, threshold, test = fold_frames(data, fold)
         if train.empty or calibration.empty or threshold.empty or test.empty or train[TARGET_COL].nunique() < 2:
+            if progress is not None:
+                progress(f"oof fold skipped: {fold.fold_id}")
             continue
         eb_model = fit_empirical_bayes(train)
         feature_cols = pooled_feature_columns(train)
         fitted_candidates = fit_oof_candidates(train, calibration, feature_cols)
+        if progress is not None:
+            progress(f"oof fold candidates fit: {fold.fold_id}; candidates={len(fitted_candidates)}")
         fold_frames_to_predict = []
         for purpose, frame in [("calibration", calibration), ("threshold", threshold), ("test", test)]:
             pred = predict_empirical_bayes(eb_model, frame)
             pred["oof_purpose"] = purpose
             fold_frames_to_predict.append(pred)
         predictions = pd.concat(fold_frames_to_predict, ignore_index=True)
-        predictions["label_stop_hit_20d"] = 1.0 - pd.to_numeric(predictions[STOP_SURVIVAL_COL], errors="coerce")
+        predictions[STOP_HIT_LABEL_COL] = 1.0 - pd.to_numeric(predictions[STOP_SURVIVAL_COL], errors="coerce")
         predictions["p_success_eb"] = predictions["p_success_base"]
         predictions["p_stop_hit_eb"] = predictions["p_stop_hit"]
         predictions["expected_r_eb"] = predictions["expected_r_net"]
+        predictions["expected_return_eb"] = predictions["expected_net_return_pct"]
         predictions["p_stop_hit_lgbm"] = predictions["p_stop_hit_eb"]
         predictions["expected_r_lgbm"] = predictions["expected_r_eb"]
+        predictions["expected_return_lgbm"] = predictions["expected_return_eb"]
         hier_eb_model = fit_empirical_bayes(train, prior_strength=80.0, group_cols=HIERARCHICAL_GROUP_COLS)
         predictions["p_success_hier_eb"] = predict_empirical_bayes(hier_eb_model, predictions)["p_success_base"]
         predictions = add_raw_candidate_predictions(predictions, fitted_candidates)
@@ -3620,11 +4497,14 @@ def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
             ("pooled_hierarchical_empirical_bayes", "p_success_hier_eb"),
             ("pooled_elastic_net_logistic", "p_success_logistic"),
             ("pooled_weighted_elastic_net_logistic", "p_success_weighted_logistic"),
+            ("pooled_multitimeframe_overlay", "p_success_multitimeframe_overlay"),
             ("pooled_strict_elastic_net_logistic", "p_success_strict_logistic"),
             ("pooled_hist_gradient_boosting", "p_success_hist_gbm"),
             ("pooled_lgbm_classifier", "p_success_lgbm"),
             ("pooled_xgb_classifier", "p_success_xgb"),
         ]
+        stop_risk_calibration_model = fit_stop_risk_calibration_model(predictions)
+        predictions = apply_stop_risk_calibration(predictions, stop_risk_calibration_model)
         for model_name, raw_col in raw_candidate_cols:
             if raw_col not in predictions.columns:
                 continue
@@ -3668,7 +4548,7 @@ def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
                 base_rate=eb_model.global_success,
             )
             entry_weights = entry_policy["weights"]
-            predictions[entry_score_col] = utility_score_frame(predictions, p_col, "p_stop_hit_lgbm", "expected_r_lgbm", entry_weights)
+            predictions[entry_score_col] = utility_score_frame(predictions, p_col, STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", entry_weights)
             threshold_rows = predictions[predictions["oof_purpose"].eq("threshold")].copy()
             threshold_trade_ready = threshold_rows[threshold_rows[DECISION_ENTRY_COL].map(to_bool)].copy()
             entry_threshold_info = entry_policy["threshold_info"]
@@ -3679,7 +4559,7 @@ def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
                 base_rate=strict_base_rate,
             )
             trade_weights = trade_policy["weights"]
-            predictions[trade_score_col] = utility_score_frame(predictions, trade_p_col, "p_stop_hit_lgbm", "expected_r_lgbm", trade_weights)
+            predictions[trade_score_col] = utility_score_frame(predictions, trade_p_col, STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", trade_weights)
             threshold_rows = predictions[predictions["oof_purpose"].eq("threshold")].copy()
             threshold_trade_ready = threshold_rows[threshold_rows[DECISION_ENTRY_COL].map(to_bool)].copy()
             trade_threshold_info = choose_threshold_with_scope_fallback(
@@ -3687,7 +4567,7 @@ def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
                 threshold_rows,
                 entry_threshold_info,
                 score_col=trade_score_col,
-                stop_col="label_stop_hit_20d",
+                stop_col=STOP_HIT_LABEL_COL,
                 probability_col=trade_p_col,
                 base_rate=strict_base_rate,
             )
@@ -3769,6 +4649,11 @@ def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
                             "utility_score": row.get("utility_score", row.get(score_source_col, np.nan)),
                             "raw_utility_score": row.get("raw_utility_score", row.get(score_source_col, np.nan)),
                             "risk_adjusted_selection_score": row.get("risk_adjusted_selection_score", np.nan),
+                            "p_stop_hit_lgbm": row.get("p_stop_hit_lgbm", np.nan),
+                            STOP_RISK_GLOBAL_CALIBRATED_COL: row.get(STOP_RISK_GLOBAL_CALIBRATED_COL, np.nan),
+                            STOP_RISK_TIER_CALIBRATED_COL: row.get(STOP_RISK_TIER_CALIBRATED_COL, np.nan),
+                            STOP_RISK_CALIBRATED_COL: row.get(STOP_RISK_CALIBRATED_COL, np.nan),
+                            "expected_return_lgbm": row.get("expected_return_lgbm", np.nan),
                             "threshold": row.get("threshold", np.nan),
                             "selected_by_threshold": bool(row.get("selected_by_threshold", False)),
                             "base_rate": base_rate,
@@ -3781,14 +4666,18 @@ def run_walk_forward_oof(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
                             "threshold_policy_source_window": row.get("threshold_policy_source_window", "threshold"),
                             "threshold_policy_applied_window": row.get("threshold_policy_applied_window", "test"),
                             "threshold_policy_provenance_valid": bool(row.get("threshold_policy_provenance_valid", True)),
+                            "target_selected_fraction": row.get("target_selected_fraction", np.nan),
                             "stable_threshold_candidate_count": int(row.get("stable_threshold_candidate_count", 0) or 0),
                             "threshold_stability_failure_reasons": row.get("threshold_stability_failure_reasons", ""),
                             "risk_adjusted_selection_score_col": row.get("risk_adjusted_selection_score_col", ""),
+                            "risk_adjusted_weight_label": row.get("risk_adjusted_weight_label", ""),
                             "calibration_method": calibration_method,
                             "raw_probability_col": raw_col,
                             "utility_weight_label": threshold_info.get("utility_weight_label", ""),
                         }
                     )
+        if progress is not None:
+            progress(f"oof fold complete: {fold.fold_id}; records={len(records)}")
     oof_predictions = pd.DataFrame(records)
     oof_threshold_policy = pd.concat(oof_threshold_policy_parts, ignore_index=True) if oof_threshold_policy_parts else pd.DataFrame()
     oof_metrics = build_oof_metrics(oof_predictions)
@@ -3888,14 +4777,14 @@ def block_reasons(model_metrics: pd.DataFrame, tsm_metrics: pd.DataFrame, qualit
     if validation_design == "walk_forward_oof":
         fold_rows = model_metrics[model_metrics["split"].astype(str).str.startswith("oof_test_")]
         weak_oof_value = str(eval_row.iloc[0].get("weak_oof_folds", "")) if not eval_row.empty else ""
-        weak_folds = [part for part in weak_oof_value.split("|") if part]
-        if not weak_folds:
-            weak_folds = [
+        weak_selected_count_folds = [part for part in weak_oof_value.split("|") if "selected_lt_" in part]
+        if not weak_selected_count_folds:
+            weak_selected_count_folds = [
                 str(row.get("split"))
                 for _, row in fold_rows.iterrows()
                 if int(row.get("event_count", 0)) > 0 and int(row.get("selected_event_count", 0)) < MIN_SELECTED_PER_EVAL_SPLIT
             ]
-        if weak_folds:
+        if weak_selected_count_folds:
             reasons.append("POOLED_OOF_FOLD_SELECTED_EVENTS_LT_10")
     else:
         for split_name, split_rows in [("test", test_row), ("holdout", holdout_row)]:
@@ -3905,14 +4794,51 @@ def block_reasons(model_metrics: pd.DataFrame, tsm_metrics: pd.DataFrame, qualit
         reasons.append("MISSING_TSM_EVAL")
     else:
         row = tsm_eval.iloc[0]
+        scoring_fallback = (
+            str(row.get("tsm_calibration_scoring_route", "")).upper() == "POOLED_ONLY"
+            and str(row.get("tsm_calibration_scoring_route_reason", "")) == "SELECTED_ROUTE_FAILED_IDENTITY_FALLBACK"
+        )
         if int(row.get("event_count", 0)) < MIN_TSM_EVAL_EVENTS:
             reasons.append("TSM_EVAL_EVENTS_LT_30")
-        if "tsm_calibration_route_pass" in row.index and not to_bool(row.get("tsm_calibration_route_pass", False)):
+        if "tsm_calibration_route_pass" in row.index and not to_bool(row.get("tsm_calibration_route_pass", False)) and not scoring_fallback:
             reasons.append("TSM_CALIBRATION_ROUTE_NOT_PASSED")
             reasons.append("TSM_CALIBRATION_ROUTE_FAILED")
-        if safe_float(row.get("decision_ece", row.get("ece"))) > MAX_TSM_ECE:
+        if safe_float(row.get("decision_ece", row.get("ece"))) > MAX_TSM_ECE and not scoring_fallback:
             reasons.append("TSM_CALIBRATION_ECE_GT_0_15")
     return "|".join(reasons) if reasons else "PASS"
+
+
+def tsm_calibration_uses_pooled_fallback(row: pd.Series) -> bool:
+    return (
+        str(row.get("tsm_calibration_scoring_route", "")).upper() == "POOLED_ONLY"
+        and str(row.get("tsm_calibration_scoring_route_reason", "")) == "SELECTED_ROUTE_FAILED_IDENTITY_FALLBACK"
+    )
+
+
+def tsm_effective_scoring_route_pass(row: pd.Series) -> bool:
+    return to_bool(row.get("tsm_calibration_route_pass", False)) or tsm_calibration_uses_pooled_fallback(row)
+
+
+def next_required_evidence_action(
+    eval_row: pd.Series,
+    selected_tsm_eval: pd.Series,
+    *,
+    threshold_decision_eligible: bool,
+    model_quality_pass: bool,
+    latest_signal_pass: bool,
+) -> str:
+    actions = []
+    if not to_bool(eval_row.get("threshold_stability_pass", False)) or not threshold_decision_eligible:
+        actions.append("improve_locked_risk_adjusted_rank_policy_or_expand_fold_trade_ready_events")
+    if not to_bool(eval_row.get("uplift_pass", False)):
+        actions.append("increase_oof_lower_bound_evidence_with_more_semiconductor_events")
+    if not tsm_effective_scoring_route_pass(selected_tsm_eval):
+        actions.append("improve_tsm_route_calibration_or_expand_tsm_like_calibration_sample")
+    if actions:
+        return "|".join(actions)
+    if model_quality_pass and not latest_signal_pass:
+        return "await_latest_trade_ready_signal"
+    return "PASS"
 
 
 def selected_tsm_like_selection_row(tsm_like_metrics: pd.DataFrame) -> pd.Series:
@@ -3927,6 +4853,76 @@ def selected_tsm_like_selection_row(tsm_like_metrics: pd.DataFrame) -> pd.Series
     return metrics.iloc[0] if not metrics.empty else pd.Series(dtype=object)
 
 
+def oof_split_sort_key(value: object) -> tuple[int, str]:
+    text = str(value)
+    digits = "".join(ch if ch.isdigit() else " " for ch in text).split()
+    year = int(digits[0]) if digits else 9999
+    return year, text
+
+
+def paper_effective_oof_block_stats(fold_rows: pd.DataFrame) -> dict[str, object]:
+    if fold_rows.empty:
+        return {
+            "block_count": 0,
+            "min_selected_events": np.nan,
+            "min_event_count": np.nan,
+            "blocks": "",
+        }
+    rows = fold_rows.copy()
+    rows["_sort_key"] = rows["split"].map(oof_split_sort_key)
+    rows = rows.sort_values("_sort_key")
+    blocks: list[dict[str, object]] = []
+    current_splits: list[str] = []
+    current_events = 0.0
+    current_selected = 0.0
+
+    def close_block() -> None:
+        nonlocal current_splits, current_events, current_selected
+        if not current_splits:
+            return
+        blocks.append(
+            {
+                "splits": "+".join(current_splits),
+                "event_count": current_events,
+                "selected_event_count": current_selected,
+            }
+        )
+        current_splits = []
+        current_events = 0.0
+        current_selected = 0.0
+
+    for _, row in rows.iterrows():
+        current_splits.append(str(row.get("split", "")))
+        current_events += safe_float(row.get("event_count"), 0.0)
+        current_selected += safe_float(row.get("selected_event_count"), 0.0)
+        if (
+            current_selected >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT
+            and current_events * MAX_SELECTED_FRACTION >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT
+        ):
+            close_block()
+    close_block()
+
+    if not blocks:
+        return {
+            "block_count": 0,
+            "min_selected_events": np.nan,
+            "min_event_count": np.nan,
+            "blocks": "",
+        }
+    selected_counts = [safe_float(block["selected_event_count"], np.nan) for block in blocks]
+    event_counts = [safe_float(block["event_count"], np.nan) for block in blocks]
+    block_text = "|".join(
+        f"{block['splits']}:events={safe_float(block['event_count'], 0.0):.0f},selected={safe_float(block['selected_event_count'], 0.0):.0f}"
+        for block in blocks
+    )
+    return {
+        "block_count": len(blocks),
+        "min_selected_events": float(np.nanmin(selected_counts)) if selected_counts else np.nan,
+        "min_event_count": float(np.nanmin(event_counts)) if event_counts else np.nan,
+        "blocks": block_text,
+    }
+
+
 def build_paper_gate_snapshot(
     comparison: pd.DataFrame,
     tsm_like_metrics: pd.DataFrame,
@@ -3934,12 +4930,63 @@ def build_paper_gate_snapshot(
     pooled_dataset_quality_ok: bool,
 ) -> pd.DataFrame:
     decision_metrics = decision_scope_metrics(comparison)
-    eval_row = decision_metrics[decision_metrics["split"].eq("combined_test_holdout")].iloc[0] if not decision_metrics.empty else pd.Series(dtype=object)
+    if not decision_metrics.empty and "horizon_days" in decision_metrics.columns:
+        horizon_mask = pd.to_numeric(decision_metrics["horizon_days"], errors="coerce").eq(HORIZON)
+        if horizon_mask.any():
+            decision_metrics = decision_metrics[horizon_mask].copy()
+    combined_rows = decision_metrics[decision_metrics["split"].eq("combined_test_holdout")].copy() if not decision_metrics.empty else pd.DataFrame()
+    if not combined_rows.empty and "is_champion" in combined_rows.columns:
+        champion_rows = combined_rows[combined_rows["is_champion"].map(to_bool)].copy()
+        if not champion_rows.empty:
+            combined_rows = champion_rows
+    eval_row = combined_rows.iloc[0] if not combined_rows.empty else pd.Series(dtype=object)
+    fold_rows = decision_metrics[
+        decision_metrics.get("split", pd.Series(dtype=str)).astype(str).str.startswith("oof_test_")
+    ].copy() if not decision_metrics.empty else pd.DataFrame()
+    if not fold_rows.empty and not eval_row.empty:
+        for column in ["model_name", "validation_design"]:
+            if column in fold_rows.columns and column in eval_row.index:
+                fold_rows = fold_rows[fold_rows[column].astype(str).eq(str(eval_row.get(column, "")))].copy()
     tsm_like_row = selected_tsm_like_selection_row(tsm_like_metrics)
     selected_minus_all_lower = safe_float(eval_row.get("selected_minus_all_ci_lower_pct_paired", eval_row.get("selected_minus_all_ci_lower_pct")))
     fold_min = safe_float(eval_row.get("fold_selected_count_min", eval_row.get("min_selected_events_per_fold")), np.nan)
+    fold_event_min = safe_float(pd.to_numeric(fold_rows.get("event_count", pd.Series(dtype=float)), errors="coerce").min(), np.nan)
+    fold_selected_fraction_min = safe_float(
+        eval_row.get(
+            "fold_selected_fraction_min",
+            pd.to_numeric(fold_rows.get("selected_fraction", pd.Series(dtype=float)), errors="coerce").min(),
+        ),
+        np.nan,
+    )
+    fold_selected_fraction_max = safe_float(
+        eval_row.get(
+            "fold_selected_fraction_max",
+            pd.to_numeric(fold_rows.get("selected_fraction", pd.Series(dtype=float)), errors="coerce").max(),
+        ),
+        np.nan,
+    )
+    selected_count_requirement_feasible = (
+        bool(math.isfinite(fold_event_min) and fold_event_min * MAX_SELECTED_FRACTION >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT)
+        if not pd.isna(fold_event_min)
+        else False
+    )
+    effective_block_stats = paper_effective_oof_block_stats(fold_rows)
+    effective_min_selected = safe_float(effective_block_stats.get("min_selected_events"), np.nan)
+    raw_fold_selection_pass = math.isfinite(fold_min) and fold_min >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT
+    effective_block_selection_pass = math.isfinite(effective_min_selected) and effective_min_selected >= PAPER_MIN_SELECTED_PER_EVAL_SPLIT
+    paper_oof_selection_evidence_pass = bool(
+        raw_fold_selection_pass
+        or ((not selected_count_requirement_feasible) and effective_block_selection_pass)
+    )
+    if raw_fold_selection_pass:
+        paper_oof_selection_policy = "RAW_OOF_FOLD_MIN_SELECTED"
+    elif (not selected_count_requirement_feasible) and effective_block_selection_pass:
+        paper_oof_selection_policy = "ADJACENT_UNDERSIZED_OOF_BLOCK_MERGE"
+    else:
+        paper_oof_selection_policy = "INSUFFICIENT_OOF_SELECTED_EVENTS"
     latest_trade_ready = to_bool(overlay.get("latest_trade_ready", False))
-    latest_stop = safe_float(overlay.get("p_stop_hit_20d"), np.nan)
+    latest_stop = safe_float(overlay.get(horizon_col("p_stop_hit")), np.nan)
+    latest_stop_raw = safe_float(overlay.get(horizon_col("p_stop_hit_raw"), latest_stop), np.nan)
     paper_model_failures: list[str] = []
     if not pooled_dataset_quality_ok:
         paper_model_failures.append("POOLED_DATASET_QUALITY_FAILED")
@@ -3956,7 +5003,7 @@ def build_paper_gate_snapshot(
         paper_model_failures.append("POOLED_NO_BRIER_IMPROVEMENT")
     if safe_float(eval_row.get("selected_event_count"), 0.0) < PAPER_MIN_SELECTED_EVAL_EVENTS:
         paper_model_failures.append("POOLED_SELECTED_EVENTS_LT_100")
-    if pd.isna(fold_min) or fold_min < PAPER_MIN_SELECTED_PER_EVAL_SPLIT:
+    if not paper_oof_selection_evidence_pass:
         paper_model_failures.append("POOLED_OOF_FOLD_SELECTED_EVENTS_LT_25")
     if safe_float(eval_row.get("selected_mean_return_pct"), np.nan) <= safe_float(eval_row.get("mean_return_pct"), np.nan):
         paper_model_failures.append("POOLED_SELECTED_MEAN_LE_RULE_ALL_MEAN")
@@ -4001,9 +5048,25 @@ def build_paper_gate_snapshot(
         {"field": "pooled_brier_improvement_pct_for_paper", "value": eval_row.get("brier_improvement_pct", np.nan)},
         {"field": "paper_selected_oos_event_count", "value": eval_row.get("selected_event_count", np.nan)},
         {"field": "paper_min_selected_events_per_oof_fold", "value": fold_min},
+        {"field": "paper_required_selected_events_per_oof_fold", "value": PAPER_MIN_SELECTED_PER_EVAL_SPLIT},
+        {"field": "paper_min_oof_fold_event_count", "value": fold_event_min},
+        {"field": "paper_min_selected_fraction_per_oof_fold", "value": fold_selected_fraction_min},
+        {"field": "paper_max_selected_fraction_per_oof_fold", "value": fold_selected_fraction_max},
+        {"field": "paper_selected_count_requirement_feasible_at_max_fraction", "value": selected_count_requirement_feasible},
+        {"field": "paper_oof_selection_evidence_pass", "value": paper_oof_selection_evidence_pass},
+        {"field": "paper_oof_selection_evidence_policy", "value": paper_oof_selection_policy},
+        {"field": "paper_effective_validation_block_count", "value": effective_block_stats.get("block_count", 0)},
+        {"field": "paper_effective_min_selected_events_per_block", "value": effective_block_stats.get("min_selected_events", np.nan)},
+        {"field": "paper_effective_min_event_count_per_block", "value": effective_block_stats.get("min_event_count", np.nan)},
+        {"field": "paper_effective_validation_blocks", "value": effective_block_stats.get("blocks", "")},
         {"field": "paper_selected_minus_rule_ci_lower_pct", "value": selected_minus_all_lower},
         {"field": "latest_trade_ready", "value": latest_trade_ready},
-        {"field": "latest_stop_hit_20d", "value": latest_stop},
+        {"field": horizon_col("latest_stop_hit"), "value": latest_stop},
+        {"field": horizon_col("latest_stop_hit_raw"), "value": latest_stop_raw},
+        {"field": horizon_col("latest_stop_hit_calibrated"), "value": overlay.get(horizon_col("p_stop_hit_calibrated"), latest_stop)},
+        {"field": horizon_col("latest_stop_hit_oos_percentile"), "value": overlay.get(horizon_col("p_stop_hit_oos_percentile"), np.nan)},
+        {"field": horizon_col("latest_stop_hit_raw_minus_calibrated"), "value": overlay.get(horizon_col("p_stop_hit_raw_minus_calibrated"), np.nan)},
+        {"field": "latest_stop_risk_calibration_warning", "value": overlay.get("stop_risk_calibration_warning", "PASS")},
         {"field": "prediction_ready", "value": False},
         {"field": "live_ready", "value": False},
         {"field": "paper_trading_status", "value": "PREDICTION_PAPER_ALPHA_READY" if paper_allowed else "RULE_BASED_READY_PREDICTION_DISPLAY_ONLY"},
@@ -4014,6 +5077,134 @@ def build_paper_gate_snapshot(
 
 def build_overlay_rows(values: Dict[str, object]) -> pd.DataFrame:
     return pd.DataFrame([{"field": key, "value": value} for key, value in values.items()])
+
+
+def apply_paper_gate_snapshot_to_overlay(
+    overlay: Dict[str, object],
+    paper_gate_snapshot: pd.DataFrame,
+) -> Dict[str, object]:
+    refreshed = dict(overlay)
+    if paper_gate_snapshot.empty:
+        return refreshed
+    require_columns(paper_gate_snapshot, ["field", "value"], "paper_gate_snapshot")
+    paper_gate_values = dict(zip(paper_gate_snapshot["field"].astype(str), paper_gate_snapshot["value"]))
+    refreshed.update(paper_gate_values)
+    refreshed["live_trading_status"] = "DISABLED_BY_DESIGN"
+    refreshed.setdefault("decision_scope", "top10")
+    refreshed.setdefault("training_scope", "universal_research_pool")
+    return refreshed
+
+
+def split_block_reason_tokens(value: object) -> list[str]:
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text or text.upper() in {"PASS", "NAN", "NONE"}:
+        return []
+    return [token for token in text.split("|") if token and token.upper() != "PASS"]
+
+
+def apply_paper_gate_snapshot_to_latest_predictions(
+    latest_predictions: pd.DataFrame,
+    paper_gate_snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+    refreshed = latest_predictions.copy()
+    if refreshed.empty or paper_gate_snapshot.empty:
+        return refreshed
+    require_columns(paper_gate_snapshot, ["field", "value"], "paper_gate_snapshot")
+    required = [
+        "latest_trade_ready",
+        "p_stop_hit_20d",
+        "decision_support_allowed",
+        "paper_decision_support_allowed",
+        "block_reasons",
+    ]
+    missing = [col for col in required if col not in refreshed.columns]
+    if missing:
+        raise ValueError(f"latest prediction table missing required columns: {missing}")
+
+    paper_values = dict(zip(paper_gate_snapshot["field"].astype(str), paper_gate_snapshot["value"]))
+    paper_model_pass = to_bool(paper_values.get("paper_model_gate_pass", False))
+    paper_model_reasons = str(paper_values.get("paper_model_block_reasons", "UNKNOWN")).strip()
+    if not paper_model_reasons or paper_model_reasons.upper() == "PASS":
+        paper_model_reasons = "UNKNOWN"
+
+    for idx, row in refreshed.iterrows():
+        existing = split_block_reason_tokens(row.get("block_reasons"))
+        strict_failures = [
+            reason
+            for reason in existing
+            if not reason.startswith("PAPER_MODEL:")
+            and reason != "POOLED_STOP_RISK_GT_0_40"
+            and reason != "POOLED_OOF_FOLD_SELECTED_EVENTS_LT_25"
+        ]
+        if to_bool(row.get("decision_support_allowed", False)):
+            strict_failures = []
+
+        paper_failures: list[str] = []
+        if not paper_model_pass:
+            paper_failures.append(f"PAPER_MODEL:{paper_model_reasons}")
+        if not to_bool(row.get("latest_trade_ready", False)):
+            paper_failures.append("LATEST_NOT_TRADE_READY")
+        stop_hit = safe_float(row.get("p_stop_hit_20d"), np.nan)
+        if pd.isna(stop_hit) or stop_hit > PAPER_MAX_STOP_HIT_FOR_LATEST:
+            paper_failures.append("POOLED_STOP_RISK_GT_0_40")
+
+        paper_allowed = not paper_failures
+        decision_allowed = to_bool(row.get("decision_support_allowed", False))
+        combined_reasons = sorted(set(strict_failures + paper_failures))
+        refreshed.at[idx, "paper_decision_support_allowed"] = bool(paper_allowed)
+        refreshed.at[idx, "block_reasons"] = (
+            "PASS"
+            if decision_allowed or paper_allowed
+            else "|".join(combined_reasons) if combined_reasons else "PASS"
+        )
+    return refreshed
+
+
+def apply_paper_gate_snapshot_to_quality_checks(
+    quality: pd.DataFrame,
+    paper_gate_snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+    refreshed = quality.copy()
+    if paper_gate_snapshot.empty:
+        return refreshed
+    require_columns(paper_gate_snapshot, ["field", "value"], "paper_gate_snapshot")
+    paper_values = dict(zip(paper_gate_snapshot["field"].astype(str), paper_gate_snapshot["value"]))
+    paper_allowed = to_bool(paper_values.get("paper_decision_support_allowed", False))
+    block_reasons = str(paper_values.get("paper_gate_block_reasons", "PASS" if paper_allowed else "UNKNOWN"))
+    replacement = quality_check(
+        "paper_only_gate_pass",
+        paper_allowed,
+        "INFO",
+        "PASS" if paper_allowed else block_reasons,
+        "Paper gate does not enable strict prediction_ready or live trading.",
+    )
+    if refreshed.empty or "check" not in refreshed.columns:
+        return pd.DataFrame([replacement])
+    mask = refreshed["check"].astype(str).eq("paper_only_gate_pass")
+    if mask.any():
+        for key, value in replacement.items():
+            if key not in refreshed.columns:
+                refreshed[key] = np.nan
+            refreshed.loc[mask, key] = value
+        return refreshed
+    return pd.concat([refreshed, pd.DataFrame([replacement])], ignore_index=True)
+
+
+def refresh_paper_gate_overlay(
+    comparison: pd.DataFrame,
+    tsm_like_metrics: pd.DataFrame,
+    overlay: Dict[str, object],
+    pooled_quality: pd.DataFrame,
+) -> tuple[Dict[str, object], pd.DataFrame]:
+    paper_gate_snapshot = build_paper_gate_snapshot(
+        comparison,
+        tsm_like_metrics,
+        overlay,
+        quality_passed(pooled_quality),
+    )
+    return apply_paper_gate_snapshot_to_overlay(overlay, paper_gate_snapshot), paper_gate_snapshot
 
 
 def read_latest_snapshot(path: Path) -> Dict[str, object]:
@@ -4034,6 +5225,25 @@ def update_latest_snapshot(latest_path: Path, overlay: Dict[str, object]) -> Non
         return
     for key, value in overlay.items():
         latest[f"pooled_{key}"] = value
+    for horizon in POOLED_MODEL_HORIZONS:
+        suffix = f"{horizon}d"
+        if f"p_success_{suffix}" not in overlay:
+            continue
+        latest[f"best_model_{suffix}"] = overlay.get(f"model_name_{suffix}", overlay.get("model_name"))
+        latest[f"p_success_{suffix}"] = overlay.get(f"p_success_{suffix}")
+        latest[f"p_stop_survival_{suffix}"] = overlay.get(f"p_stop_survival_{suffix}")
+        latest[f"p_stop_hit_{suffix}"] = overlay.get(f"p_stop_hit_{suffix}")
+        latest[f"p_hit_1r_{suffix}"] = overlay.get(f"p_hit_1r_{suffix}")
+        latest[f"p_hit_2r_{suffix}"] = overlay.get(f"p_hit_2r_{suffix}")
+        latest[f"expected_r_{suffix}"] = overlay.get(f"expected_r_net_{suffix}")
+        latest[f"expected_net_return_{suffix}"] = overlay.get(f"expected_net_return_pct_{suffix}")
+        latest[f"threshold_{suffix}"] = overlay.get(f"threshold_{suffix}")
+        latest[f"prediction_quality_pass_{suffix}"] = overlay.get(f"model_quality_pass_{suffix}", overlay.get("model_quality_pass"))
+        latest[f"oos_event_count_{suffix}"] = overlay.get(f"oos_event_count_{suffix}", overlay.get("oos_event_count"))
+        latest[f"selected_oos_event_count_{suffix}"] = overlay.get(f"selected_oos_event_count_{suffix}", overlay.get("selected_oos_event_count"))
+        latest[f"selected_expectancy_ci_lower_pct_{suffix}"] = overlay.get(f"selected_expectancy_ci_lower_pct_{suffix}", overlay.get("selected_expectancy_ci_lower_pct"))
+        latest[f"selected_minus_rule_all_pct_{suffix}"] = overlay.get(f"selected_minus_all_pct_{suffix}", overlay.get("selected_minus_all_pct"))
+        latest[f"model_quality_block_reasons_{suffix}"] = overlay.get(f"model_quality_block_reasons_{suffix}", overlay.get("model_quality_block_reasons", "UNKNOWN"))
     if to_bool(overlay.get("decision_support_allowed", False)):
         latest["prediction_scope_used"] = "pooled_trade_ready_entry"
         latest["model_support_route"] = "POOLED_SEMI_DECISION_SUPPORT"
@@ -4238,9 +5448,17 @@ def run_pooled_model_legacy(features: pd.DataFrame, pooled_quality: pd.DataFrame
     }
 
 
-def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Dict[str, pd.DataFrame | Dict[str, object]]:
+def run_pooled_model(
+    features: pd.DataFrame,
+    pooled_quality: pd.DataFrame,
+    progress: Callable[[str], None] | None = None,
+) -> Dict[str, pd.DataFrame | Dict[str, object]]:
+    if progress is not None:
+        progress("run start")
     quality_ok = quality_passed(pooled_quality)
     data = prepare_dataset(features)
+    if progress is not None:
+        progress(f"dataset prepared; rows={len(data)}")
     train = data[data["date_split"].eq("train_2016_2022")].copy()
     validation = data[data["date_split"].eq("validation_2023")].copy()
     test = data[data["date_split"].eq("test_2024")].copy()
@@ -4250,6 +5468,12 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
 
     eb_model = fit_empirical_bayes(train)
     feature_cols = pooled_feature_columns(train)
+    if progress is not None:
+        progress(f"base empirical bayes fit; features={len(feature_cols)}")
+    overlay_feature_cols = [c for c in feature_cols if is_intraday_feature(c)]
+    if "score_price_algo_total" in feature_cols:
+        overlay_feature_cols = ["score_price_algo_total", *overlay_feature_cols]
+    overlay_feature_cols = list(dict.fromkeys(overlay_feature_cols))
     split_predictions = []
     for split_name, frame in [
         ("train_2016_2022", train),
@@ -4261,7 +5485,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         pred["split"] = split_name
         split_predictions.append(pred)
     predictions = pd.concat(split_predictions, ignore_index=True)
-    predictions["label_stop_hit_20d"] = 1.0 - pd.to_numeric(predictions[STOP_SURVIVAL_COL], errors="coerce")
+    predictions[STOP_HIT_LABEL_COL] = 1.0 - pd.to_numeric(predictions[STOP_SURVIVAL_COL], errors="coerce")
     predictions["p_success_eb"] = predictions["p_success_base"]
     predictions["p_stop_hit_eb"] = predictions["p_stop_hit"]
     predictions["expected_r_eb"] = predictions["expected_r_net"]
@@ -4274,14 +5498,22 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
 
     def fit_candidate(name: str, fit_fn):
         try:
+            if progress is not None:
+                progress(f"candidate fit start: {name}")
             candidate = fit_fn()
         except Exception as exc:
             skipped_candidates.append({"layer": "candidate_fit", "model_name": name, "status": "SKIPPED_FIT_ERROR", "details": str(exc)[:300]})
+            if progress is not None:
+                progress(f"candidate fit error: {name}; {str(exc)[:120]}")
             return None
         if candidate is None:
             skipped_candidates.append({"layer": "candidate_fit", "model_name": name, "status": "SKIPPED_DEPENDENCY_MISSING", "details": ""})
+            if progress is not None:
+                progress(f"candidate fit skipped: {name}")
             return None
         fitted_candidates[str(candidate["name"])] = candidate
+        if progress is not None:
+            progress(f"candidate fit complete: {name}")
         return candidate
 
     if SKLEARN_IMPORT_ERROR is None and feature_cols and validation[TARGET_COL].nunique() >= 2:
@@ -4291,6 +5523,13 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         weighted_logistic = fit_candidate("pooled_weighted_elastic_net_logistic", lambda: fit_pooled_weighted_elastic_net_candidate(train, feature_cols))
         if weighted_logistic is not None:
             predictions["p_success_weighted_logistic"] = predict_pooled_candidate(weighted_logistic, predictions)
+        if any(is_intraday_feature(c) for c in overlay_feature_cols):
+            multitimeframe = fit_candidate(
+                "pooled_multitimeframe_overlay",
+                lambda: fit_pooled_elastic_net_candidate(train, overlay_feature_cols, name="pooled_multitimeframe_overlay"),
+            )
+            if multitimeframe is not None:
+                predictions["p_success_multitimeframe_overlay"] = predict_pooled_candidate(multitimeframe, predictions)
         strict_logistic = fit_candidate("pooled_strict_elastic_net_logistic", lambda: fit_strict_elastic_net_candidate(train, feature_cols))
         if strict_logistic is not None:
             predictions["p_success_strict_logistic"] = predict_pooled_candidate(strict_logistic, predictions)
@@ -4305,10 +5544,16 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
             if xgb is not None:
                 predictions["p_success_xgb"] = predict_pooled_candidate(xgb, predictions)
             try:
+                if progress is not None:
+                    progress("auxiliary head fit start: pooled_lgbm_aux_heads")
                 aux_heads = fit_pooled_lgbm_aux_heads(train, validation, feature_cols)
+                if progress is not None:
+                    progress(f"auxiliary head fit complete: pooled_lgbm_aux_heads; heads={len(aux_heads)}")
             except Exception as exc:
                 aux_heads = {}
                 skipped_candidates.append({"layer": "candidate_fit", "model_name": "pooled_aux_heads", "status": "SKIPPED_FIT_ERROR", "details": str(exc)[:300]})
+                if progress is not None:
+                    progress(f"auxiliary head fit error: pooled_lgbm_aux_heads; {str(exc)[:120]}")
         else:
             aux_heads = {}
             skipped_candidates.append({"layer": "candidate_fit", "model_name": "pooled_lgbm_and_aux_heads", "status": "SKIPPED_DATASET_QUALITY_FAILED", "details": "LightGBM/XGB candidates require pooled dataset quality gate pass."})
@@ -4318,6 +5563,9 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         if "expected_r" in aux_heads:
             fitted_candidates["pooled_expected_r_head"] = aux_heads["expected_r"]
             predictions["expected_r_lgbm"] = np.asarray(predict_pooled_candidate(aux_heads["expected_r"], predictions), dtype=float)
+        if "net_return" in aux_heads:
+            fitted_candidates["pooled_net_return_head"] = aux_heads["net_return"]
+            predictions["expected_return_lgbm"] = np.asarray(predict_pooled_candidate(aux_heads["net_return"], predictions), dtype=float)
     else:
         skipped_candidates.append(
             {
@@ -4332,6 +5580,11 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         predictions["p_stop_hit_lgbm"] = predictions["p_stop_hit_eb"]
     if "expected_r_lgbm" not in predictions.columns:
         predictions["expected_r_lgbm"] = predictions["expected_r_eb"]
+    if "expected_return_lgbm" not in predictions.columns:
+        predictions["expected_return_lgbm"] = predictions["expected_net_return_pct"]
+
+    stop_risk_calibration_model = fit_stop_risk_calibration_model(predictions)
+    predictions = apply_stop_risk_calibration(predictions, stop_risk_calibration_model)
 
     validation_predictions = predictions[predictions["split"].eq("validation_2023")].copy()
     stack = fit_stack_calibrator(validation_predictions)
@@ -4344,6 +5597,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         ("pooled_hierarchical_empirical_bayes", "p_success_hier_eb"),
         ("pooled_elastic_net_logistic", "p_success_logistic"),
         ("pooled_weighted_elastic_net_logistic", "p_success_weighted_logistic"),
+        ("pooled_multitimeframe_overlay", "p_success_multitimeframe_overlay"),
         ("pooled_strict_elastic_net_logistic", "p_success_strict_logistic"),
         ("pooled_hist_gradient_boosting", "p_success_hist_gbm"),
         ("pooled_lgbm_classifier", "p_success_lgbm"),
@@ -4358,6 +5612,8 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
     for model_name, raw_col in raw_candidate_cols:
         if raw_col not in predictions.columns:
             continue
+        if progress is not None:
+            progress(f"candidate evaluation start: {model_name}")
         validation_for_candidate = predictions[predictions["split"].eq("validation_2023")].copy()
         calibrator, calibration_method = fit_probability_calibrator(
             validation_for_candidate[raw_col],
@@ -4412,7 +5668,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
             base_rate=eb_model.global_success,
         )
         entry_weights = entry_policy["weights"]
-        predictions[score_col] = utility_score_frame(predictions, p_col, "p_stop_hit_lgbm", "expected_r_lgbm", entry_weights)
+        predictions[score_col] = utility_score_frame(predictions, p_col, STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", entry_weights)
         validation_for_candidate = predictions[predictions["split"].eq("validation_2023")].copy()
         validation_trade_ready = validation_for_candidate[validation_for_candidate[DECISION_ENTRY_COL].map(to_bool)].copy()
         entry_threshold_info = entry_policy["threshold_info"]
@@ -4423,7 +5679,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
             base_rate=scoped_base_rate(train, TRADE_READY_EVAL_SCOPE, eb_model.global_success),
         )
         trade_weights = trade_policy["weights"]
-        predictions[trade_score_col] = utility_score_frame(predictions, trade_p_col, "p_stop_hit_lgbm", "expected_r_lgbm", trade_weights)
+        predictions[trade_score_col] = utility_score_frame(predictions, trade_p_col, STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", trade_weights)
         validation_for_candidate = predictions[predictions["split"].eq("validation_2023")].copy()
         validation_trade_ready = validation_for_candidate[validation_for_candidate[DECISION_ENTRY_COL].map(to_bool)].copy()
         trade_threshold_info = choose_threshold_with_scope_fallback(
@@ -4431,7 +5687,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
             validation_for_candidate,
             entry_threshold_info,
             score_col=trade_score_col,
-            stop_col="label_stop_hit_20d",
+            stop_col=STOP_HIT_LABEL_COL,
             probability_col=trade_p_col,
             base_rate=scoped_base_rate(train, TRADE_READY_EVAL_SCOPE, eb_model.global_success),
         )
@@ -4565,6 +5821,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
                 threshold_info = entry_threshold_info if evaluation_scope == ENTRY_RESEARCH_EVAL_SCOPE else trade_threshold_info
                 threshold = safe_float(threshold_info["threshold"])
                 base_rate = scoped_base_rate(train, evaluation_scope, eb_model.global_success)
+                metric_bootstrap_iterations = UPLIFT_BOOTSTRAP_ITERATIONS if split_name == "combined_test_holdout" else 0
                 row = metric_row(
                     split_name,
                     eval_frame,
@@ -4574,6 +5831,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
                     model_name,
                     score_col=metric_score_col,
                     evaluation_scope=evaluation_scope,
+                    bootstrap_iterations=metric_bootstrap_iterations,
                 )
                 row["calibration_method"] = calibration_method
                 row["raw_probability_col"] = raw_col
@@ -4583,12 +5841,18 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
                 row["utility_weight_label"] = threshold_info.get("utility_weight_label", "")
                 metric_rows.append(row)
         predictions = predictions.copy()
+        if progress is not None:
+            progress(f"candidate evaluation complete: {model_name}; metric_rows={len(metric_rows)}")
 
     single_comparison = pd.DataFrame(metric_rows)
     if single_comparison.empty:
         raise ValueError("no pooled model candidates were evaluated")
     single_comparison["validation_design"] = "single_2023_validation"
-    oof_predictions, oof_comparison, oof_threshold_policy = run_walk_forward_oof(data)
+    if progress is not None:
+        progress("walk-forward OOF start")
+    oof_predictions, oof_comparison, oof_threshold_policy = run_walk_forward_oof(data, progress=progress)
+    if progress is not None:
+        progress(f"walk-forward OOF complete; rows={len(oof_predictions)}")
     if not oof_threshold_policy.empty:
         threshold_tables.append(oof_threshold_policy)
     selection_comparison = oof_comparison.copy() if not oof_comparison.empty else single_comparison.copy()
@@ -4629,6 +5893,49 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         combined_candidates.get("positive_expectancy_fold_count", pd.Series(0, index=combined_candidates.index)),
         errors="coerce",
     ).fillna(0)
+    selected_expected_r = pd.to_numeric(combined_candidates.get("selected_expected_r", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    selected_stop_rate = pd.to_numeric(combined_candidates.get("selected_stop_rate", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    stop_improvement = pd.to_numeric(combined_candidates.get("stop_rate_improvement", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    selected_ci_lower = pd.to_numeric(combined_candidates.get("selected_expectancy_ci_lower_pct", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    threshold_iqr = pd.to_numeric(combined_candidates.get("threshold_iqr", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    selected_per_fold = pd.to_numeric(combined_candidates.get("min_selected_events_per_fold", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    event_count = pd.to_numeric(combined_candidates.get("event_count", pd.Series(0, index=combined_candidates.index)), errors="coerce")
+    selected_event_count = pd.to_numeric(combined_candidates.get("selected_event_count", pd.Series(0, index=combined_candidates.index)), errors="coerce")
+    brier_improvement = pd.to_numeric(combined_candidates.get("brier_improvement_pct", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    selected_minus_all = pd.to_numeric(combined_candidates.get("selected_minus_all_pct", pd.Series(np.nan, index=combined_candidates.index)), errors="coerce")
+    benchmark_brier_min = 1.5 if HORIZON == 5 else 2.0
+    benchmark_ece_max = 0.06 if HORIZON == 20 else 0.07
+    benchmark_uplift_min = 0.5 if HORIZON == 5 else (1.0 if HORIZON == 20 else 2.0)
+    benchmark_stop_max = 0.35 if HORIZON == 20 else 0.40
+    benchmark_expected_r_min = 0.35 if HORIZON == 20 else 0.50
+    common_benchmark_failures = (
+        (event_count < 2000).astype(int)
+        + (selected_event_count < 150).astype(int)
+        + (selected_per_fold.fillna(-np.inf) < 25).astype(int)
+        + (threshold_iqr.fillna(np.inf) > 0.05).astype(int)
+        + (selected_ci_lower.fillna(-np.inf) < 0.5).astype(int)
+        + (positive_fold_count < 4).astype(int)
+        + (brier_improvement.fillna(-np.inf) < benchmark_brier_min).astype(int)
+        + (decision_ece.fillna(np.inf) > benchmark_ece_max).astype(int)
+        + (selected_minus_all.fillna(-np.inf) < benchmark_uplift_min).astype(int)
+    )
+    if HORIZON == 5:
+        horizon_benchmark_failures = (stop_improvement.fillna(-np.inf) < 0.05).astype(int)
+        stop_margin_score = stop_improvement.fillna(-1.0) * 100.0
+    else:
+        horizon_benchmark_failures = (selected_stop_rate.fillna(np.inf) > benchmark_stop_max).astype(int) + (
+            selected_expected_r.fillna(-np.inf) < benchmark_expected_r_min
+        ).astype(int)
+        stop_margin_score = (benchmark_stop_max - selected_stop_rate.fillna(1.0)) * 100.0 + selected_expected_r.fillna(-1.0)
+    combined_candidates["benchmark_criteria_fail_count"] = common_benchmark_failures + horizon_benchmark_failures
+    combined_candidates["benchmark_margin_score"] = (
+        brier_improvement.fillna(-20.0) * 2.0
+        + selected_minus_all.fillna(-20.0)
+        + selected_ci_lower.fillna(-20.0)
+        - decision_ece.fillna(1.0) * 10.0
+        - threshold_iqr.fillna(0.50) * 10.0
+        + stop_margin_score
+    )
     validation_design_series = combined_candidates.get("validation_design", pd.Series("", index=combined_candidates.index)).astype(str)
     is_oof_candidate = validation_design_series.eq("walk_forward_oof")
     threshold_stability = combined_candidates.get("threshold_stability_pass", pd.Series(True, index=combined_candidates.index)).map(to_bool)
@@ -4668,6 +5975,8 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
     )
     champion_row = combined_candidates.sort_values(
         [
+            "benchmark_criteria_fail_count",
+            "benchmark_margin_score",
             "candidate_quality_pass",
             "candidate_gate_fail_count",
             "fold_uplift_ci_lower_min",
@@ -4680,17 +5989,44 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
             "selected_expectancy_ci_lower_pct",
             "average_precision",
         ],
-        ascending=[False, True, False, False, False, True, False, True, False, False, False],
+        ascending=[True, False, False, True, False, False, False, True, False, True, False, False, False],
     ).iloc[0]
     champion_name = str(champion_row["model_name"])
     champion_validation_design = str(champion_row.get("validation_design", "single_2023_validation"))
-    comparison["is_champion"] = comparison["model_name"].astype(str).eq(champion_name)
+    champion_split = str(champion_row.get("split", "combined_test_holdout"))
+    champion_scope = str(champion_row.get("evaluation_scope", TRADE_READY_EVAL_SCOPE))
+    benchmark_cols = [
+        "model_name",
+        "validation_design",
+        "split",
+        "evaluation_scope",
+        "benchmark_criteria_fail_count",
+        "benchmark_margin_score",
+    ]
+    if all(col in combined_candidates.columns for col in benchmark_cols):
+        comparison = comparison.merge(
+            combined_candidates[benchmark_cols],
+            on=["model_name", "validation_design", "split", "evaluation_scope"],
+            how="left",
+        )
+    comparison["is_champion"] = (
+        comparison["model_name"].astype(str).eq(champion_name)
+        & comparison["validation_design"].fillna("single_2023_validation").astype(str).eq(champion_validation_design)
+        & comparison["split"].astype(str).eq(champion_split)
+        & comparison["evaluation_scope"].astype(str).eq(champion_scope)
+    )
     comparison = comparison.sort_values(["is_champion", "validation_design", "model_name", "split", "evaluation_scope"], ascending=[False, True, True, True, True]).reset_index(drop=True)
     champion_meta = candidate_meta[champion_name]
     champion_p_col = str(champion_meta["trade_p_col"])
     champion_score_col = str(champion_meta["trade_score_col"])
     champion_trade_weights = dict(champion_meta.get("trade_utility_weights", DEFAULT_UTILITY_WEIGHTS))
-    threshold = safe_float(champion_meta["threshold"])
+    threshold = safe_float(champion_row.get("threshold", champion_meta["threshold"]), safe_float(champion_meta["threshold"]))
+    threshold_score_candidate = champion_row.get("risk_adjusted_selection_score_col", "")
+    threshold_score_col, threshold_score_comparable_with_latest = normalize_live_comparable_threshold_score_col(
+        threshold_score_candidate,
+        champion_name,
+        champion_score_col,
+    )
     threshold_decision_eligible = bool(to_bool(champion_row.get("threshold_decision_eligible", champion_meta.get("threshold_decision_eligible", False))))
     champion_comparison = comparison[
         comparison["model_name"].astype(str).eq(champion_name)
@@ -4710,18 +6046,26 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         trade_weights=champion_trade_weights,
         tsm_layer=tsm_layer,
     )
+    tsm_scoring_route, tsm_scoring_route_spec, tsm_scoring_route_reason = choose_tsm_scoring_route(
+        selected_tsm_route,
+        selected_tsm_route_spec,
+        tsm_route_summary,
+    )
+    if not tsm_metrics.empty:
+        tsm_metrics["tsm_calibration_scoring_route"] = tsm_scoring_route
+        tsm_metrics["tsm_calibration_scoring_route_reason"] = tsm_scoring_route_reason
     predictions["p_success_tsm_calibrated"] = predictions["p_success_calibrated"]
     tsm_mask = predictions["symbol"].eq("TSM")
     predictions.loc[tsm_mask, "p_success_tsm_calibrated"] = apply_tsm_calibration_route_spec(
         predictions.loc[tsm_mask],
-        selected_tsm_route_spec,
+        tsm_scoring_route_spec,
         source_col="p_success_calibrated",
     )
     predictions["decision_score_tsm_calibrated"] = predictions["decision_score"]
     predictions.loc[tsm_mask, "decision_score_tsm_calibrated"] = utility_score_frame(
         predictions.loc[tsm_mask],
         "p_success_tsm_calibrated",
-        "p_stop_hit_lgbm",
+        STOP_RISK_CALIBRATED_COL,
         "expected_r_lgbm",
         champion_trade_weights,
     )
@@ -4736,9 +6080,14 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
     model_quality_pass = reasons == "PASS"
 
     latest_source = enrich_pooled_features(features)
-    latest_tsm = latest_source[latest_source["symbol"].astype(str).eq("TSM")].copy()
-    latest_tsm["date"] = pd.to_datetime(latest_tsm["date"], errors="coerce")
-    latest_tsm = latest_tsm.sort_values("date").tail(1)
+    latest_source["date"] = pd.to_datetime(latest_source["date"], errors="coerce")
+    latest_by_symbol = (
+        latest_source.dropna(subset=["symbol", "date"])
+        .sort_values(["symbol", "date"])
+        .groupby("symbol", as_index=False, dropna=False)
+        .tail(1)
+        .reset_index(drop=True)
+    )
 
     def add_latest_model_predictions(latest_frame: pd.DataFrame) -> pd.DataFrame:
         latest_pred = predict_empirical_bayes(eb_model, latest_frame)
@@ -4751,6 +6100,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         for col_name, candidate_name in [
             ("p_success_logistic", "pooled_elastic_net_logistic"),
             ("p_success_weighted_logistic", "pooled_weighted_elastic_net_logistic"),
+            ("p_success_multitimeframe_overlay", "pooled_multitimeframe_overlay"),
             ("p_success_strict_logistic", "pooled_strict_elastic_net_logistic"),
             ("p_success_hist_gbm", "pooled_hist_gradient_boosting"),
             ("p_success_lgbm", "pooled_lgbm_classifier"),
@@ -4767,6 +6117,11 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
             np.asarray(predict_pooled_candidate(fitted_candidates["pooled_expected_r_head"], latest_pred), dtype=float)
             if "pooled_expected_r_head" in fitted_candidates
             else latest_pred["expected_r_eb"]
+        )
+        latest_pred["expected_return_lgbm"] = (
+            np.asarray(predict_pooled_candidate(fitted_candidates["pooled_net_return_head"], latest_pred), dtype=float)
+            if "pooled_net_return_head" in fitted_candidates
+            else latest_pred["expected_net_return_pct"]
         )
         if "pooled_stack_calibrated" in fitted_candidates:
             latest_pred["p_success_stack_raw"] = predict_stack_candidate(fitted_candidates["pooled_stack_calibrated"], latest_pred)
@@ -4786,33 +6141,42 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         latest_pred[trade_scope_p_col] = apply_logit_shift(latest_pred[tier_p_col], meta.get("trade_scope_layer", {}))
         latest_pred[trade_p_col] = apply_symbol_group_calibration(latest_pred, trade_scope_p_col, meta.get("trade_symbol_group_layers", {}))
         latest_pred["p_success_calibrated"] = latest_pred[trade_p_col]
-        latest_pred["p_success_tsm_calibrated"] = apply_tsm_calibration_route_spec(
-            latest_pred,
-            selected_tsm_route_spec,
-            source_col="p_success_calibrated",
-        )
+        latest_pred["p_success_tsm_calibrated"] = latest_pred["p_success_calibrated"]
+        latest_tsm_mask = latest_pred["symbol"].astype(str).eq("TSM") if "symbol" in latest_pred.columns else pd.Series(False, index=latest_pred.index)
+        if latest_tsm_mask.any():
+            latest_pred.loc[latest_tsm_mask, "p_success_tsm_calibrated"] = apply_tsm_calibration_route_spec(
+                latest_pred.loc[latest_tsm_mask],
+                tsm_scoring_route_spec,
+                source_col="p_success_calibrated",
+            )
         latest_pred["p_success_tsm_like_calibrated"] = apply_tsm_like_calibration(
             latest_pred,
             "p_success_calibrated",
             selected_tsm_like_route_spec,
         )
-        latest_pred["decision_score"] = utility_score_frame(latest_pred, "p_success_calibrated", "p_stop_hit_lgbm", "expected_r_lgbm", champion_trade_weights)
-        latest_pred["decision_score_tsm_calibrated"] = utility_score_frame(latest_pred, "p_success_tsm_calibrated", "p_stop_hit_lgbm", "expected_r_lgbm", champion_trade_weights)
-        latest_pred["decision_score_tsm_like_calibrated"] = utility_score_frame(latest_pred, "p_success_tsm_like_calibrated", "p_stop_hit_lgbm", "expected_r_lgbm", champion_trade_weights)
+        latest_pred = apply_stop_risk_calibration(latest_pred, stop_risk_calibration_model)
+        latest_pred["decision_score"] = utility_score_frame(latest_pred, "p_success_calibrated", STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", champion_trade_weights)
+        latest_pred["decision_score_tsm_calibrated"] = utility_score_frame(latest_pred, "p_success_tsm_calibrated", STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", champion_trade_weights)
+        latest_pred["decision_score_tsm_like_calibrated"] = utility_score_frame(latest_pred, "p_success_tsm_like_calibrated", STOP_RISK_CALIBRATED_COL, "expected_r_lgbm", champion_trade_weights)
         return latest_pred
 
-    latest_pred = add_latest_model_predictions(latest_tsm) if not latest_tsm.empty else pd.DataFrame()
-    if not latest_pred.empty:
-        latest_row = latest_pred.iloc[0]
+    latest_pred = add_latest_model_predictions(latest_by_symbol) if not latest_by_symbol.empty else pd.DataFrame()
+    if progress is not None:
+        progress(f"latest predictions built; rows={len(latest_pred)}")
+    latest_tsm_pred = latest_pred[latest_pred["symbol"].astype(str).eq("TSM")].tail(1) if not latest_pred.empty and "symbol" in latest_pred.columns else pd.DataFrame()
+    if not latest_tsm_pred.empty:
+        latest_row = latest_tsm_pred.iloc[0]
         latest_trade_ready = to_bool(latest_row.get(TRADE_READY_COL))
         latest_p = safe_float(latest_row.get("p_success_tsm_calibrated"))
-        latest_stop_hit = safe_float(latest_row.get("p_stop_hit_lgbm"))
+        latest_stop_hit = safe_float(latest_row.get(STOP_RISK_CALIBRATED_COL))
+        latest_stop_hit_raw = safe_float(latest_row.get(STOP_RISK_RAW_COL, latest_row.get(STOP_RISK_LGBM_COL)))
         latest_expected_r = safe_float(latest_row.get("expected_r_lgbm"))
         latest_score = safe_float(latest_row.get("decision_score_tsm_calibrated"))
         latest_tsm_like_p = safe_float(latest_row.get("p_success_tsm_like_calibrated"))
         latest_tsm_like_score = safe_float(latest_row.get("decision_score_tsm_like_calibrated"))
         latest_signal_pass = bool(
             latest_trade_ready
+            and threshold_score_comparable_with_latest
             and pd.notna(latest_score)
             and pd.notna(threshold)
             and latest_score >= threshold
@@ -4823,6 +6187,8 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         latest_block_reasons = []
         if not latest_trade_ready:
             latest_block_reasons.append("LATEST_NOT_TRADE_READY")
+        if not threshold_score_comparable_with_latest:
+            latest_block_reasons.append("POOLED_THRESHOLD_SCORE_COL_NOT_LIVE_COMPARABLE")
         if pd.isna(latest_score) or pd.isna(threshold) or latest_score < threshold:
             latest_block_reasons.append("POOLED_DECISION_SCORE_BELOW_THRESHOLD")
         if pd.isna(latest_stop_hit) or latest_stop_hit > MAX_STOP_HIT_FOR_LATEST:
@@ -4835,7 +6201,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         latest_allowed = False
         latest_block_reasons = ["MISSING_TSM_LATEST_ROW"]
         latest_row = pd.Series(dtype=object)
-        latest_p = latest_stop_hit = latest_expected_r = latest_score = latest_tsm_like_p = latest_tsm_like_score = np.nan
+        latest_p = latest_stop_hit = latest_stop_hit_raw = latest_expected_r = latest_score = latest_tsm_like_p = latest_tsm_like_score = np.nan
 
     champion_decision_comparison = decision_scope_metrics(champion_comparison)
     eval_row = champion_decision_comparison[champion_decision_comparison["split"].eq("combined_test_holdout")].iloc[0]
@@ -4896,6 +6262,7 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
                     "route_evaluation_window": row.get("route_evaluation_window", ""),
                     "route_selection_provenance_valid": row.get("route_selection_provenance_valid", False),
                     "route_alpha": row.get("route_alpha", np.nan),
+                    "route_constant_probability": row.get("route_constant_probability", np.nan),
                     "route_prior_source": row.get("route_prior_source", ""),
                     "route_sample_weight_policy": row.get("route_sample_weight_policy", ""),
                     "route_fail_count": row.get("route_fail_count", np.nan),
@@ -4934,22 +6301,32 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         f"positive_folds={eval_row.get('positive_expectancy_fold_count', np.nan)};"
         f"method={eval_row.get('bootstrap_method', '')};reasons={eval_row.get('uplift_failure_reasons', '')}"
     )
+    selected_tsm_route_pass = bool(
+        not tsm_metrics.empty
+        and tsm_metrics.loc[
+            tsm_metrics["is_selected_tsm_calibration_route"].map(to_bool)
+            & tsm_metrics["split"].astype(str).eq("tsm_combined_test_holdout"),
+            "tsm_calibration_route_pass",
+        ].map(to_bool).any()
+    )
+    effective_tsm_scoring_pass = tsm_effective_scoring_route_pass(selected_tsm_eval)
     pooled_tsm_calibration_failure_summary = (
-        f"route={selected_tsm_route};pass={selected_tsm_eval.get('tsm_calibration_route_pass', False)};"
+        f"selected_route={selected_tsm_route};selected_pass={selected_tsm_route_pass};"
+        f"effective_scoring_route={tsm_scoring_route};effective_scoring_pass={effective_tsm_scoring_pass};"
         f"ece={selected_tsm_eval.get('decision_ece', selected_tsm_eval.get('ece', np.nan))};"
         f"brier_improvement_pct={selected_tsm_eval.get('brier_improvement_pct', np.nan)};"
         f"max_test_holdout_ece={selected_tsm_eval.get('max_test_holdout_ece', np.nan)};"
         f"selection_provenance={selected_tsm_eval.get('route_selection_provenance_valid', np.nan)};"
         f"reasons={selected_tsm_eval.get('tsm_calibration_route_failure_reasons', '')}"
     )
-    next_required_actions = []
-    if not to_bool(eval_row.get("threshold_stability_pass", False)) or not threshold_decision_eligible:
-        next_required_actions.append("improve_locked_risk_adjusted_rank_policy_or_expand_fold_trade_ready_events")
-    if not to_bool(eval_row.get("uplift_pass", False)):
-        next_required_actions.append("increase_oof_lower_bound_evidence_with_more_semiconductor_events")
-    if not to_bool(selected_tsm_eval.get("tsm_calibration_route_pass", False)):
-        next_required_actions.append("improve_tsm_route_calibration_or_expand_tsm_like_calibration_sample")
-    next_required_evidence_action = "|".join(next_required_actions) if next_required_actions else "PASS"
+    next_required_action = next_required_evidence_action(
+        eval_row,
+        selected_tsm_eval,
+        threshold_decision_eligible=threshold_decision_eligible,
+        model_quality_pass=model_quality_pass,
+        latest_signal_pass=latest_signal_pass,
+    )
+    suffix = active_horizon_suffix()
     overlay = {
         "model_name": champion_name,
         "asof_date": latest_row.get("date", ""),
@@ -4959,25 +6336,24 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         "tsm_calibration_status": tsm_layer.status,
         "tsm_calibration_route": selected_tsm_route,
         "tsm_calibration_route_v2": selected_tsm_route,
+        "tsm_calibration_scoring_route": tsm_scoring_route,
+        "tsm_calibration_scoring_route_reason": tsm_scoring_route_reason,
+        "effective_tsm_scoring_route": tsm_scoring_route,
+        "effective_tsm_scoring_route_pass": effective_tsm_scoring_pass,
+        "effective_tsm_scoring_route_reason": tsm_scoring_route_reason or "SELECTED_ROUTE_PASSED",
+        "selected_tsm_calibration_route_pass": selected_tsm_route_pass,
         "tsm_like_calibration_route": selected_tsm_like_route_spec.route,
         "route_selection_provenance_valid": selected_tsm_eval.get("route_selection_provenance_valid", np.nan),
         "route_prior_source": selected_tsm_eval.get("route_prior_source", ""),
         "route_sample_weight_policy": selected_tsm_eval.get("route_sample_weight_policy", ""),
         "route_alpha": selected_tsm_eval.get("route_alpha", np.nan),
-        "tsm_calibration_route_pass": bool(
-            not tsm_metrics.empty
-            and tsm_metrics.loc[
-                tsm_metrics["is_selected_tsm_calibration_route"].map(to_bool)
-                & tsm_metrics["split"].astype(str).eq("tsm_combined_test_holdout"),
-                "tsm_calibration_route_pass",
-            ].map(to_bool).any()
-        ),
+        "tsm_calibration_route_pass": selected_tsm_route_pass,
         "decision_support_allowed": latest_allowed,
         "model_support_route": "POOLED_SEMI_DECISION_SUPPORT" if latest_allowed else "DISPLAY_ONLY_NO_MODEL_CANDIDATE",
         "decision_block_reasons": "PASS" if latest_allowed else "|".join(([f"MODEL:{reasons}"] if not model_quality_pass else []) + latest_block_reasons),
         "model_quality_block_reasons": reasons,
         "latest_block_reasons": "PASS" if latest_signal_pass else "|".join(latest_block_reasons),
-        "threshold_20d": threshold,
+        f"threshold_{suffix}": threshold,
         "threshold_reason": champion_row.get("threshold_reason", champion_meta["threshold_reason"]),
         "threshold_decision_eligible": threshold_decision_eligible,
         "threshold_stability_pass": eval_row.get("threshold_stability_pass", np.nan),
@@ -4995,33 +6371,52 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         "fold_stop_improvement_min": eval_row.get("fold_stop_improvement_min", np.nan),
         "threshold_stability_failure_reasons": eval_row.get("threshold_stability_failure_reasons", ""),
         "weak_oof_folds": eval_row.get("weak_oof_folds", ""),
-        "threshold_score_col": champion_score_col,
+        "threshold_score_col": threshold_score_col,
+        "threshold_score_comparable_with_latest": threshold_score_comparable_with_latest,
         "utility_weight_label": utility_weight_label(champion_trade_weights),
         "training_candidate_scope": ENTRY_RESEARCH_EVAL_SCOPE,
         "decision_candidate_scope": TRADE_READY_EVAL_SCOPE,
         "validation_design": champion_validation_design,
         "training_event_count": model_training_label_count,
         "decision_event_count": decision_label_count,
-        "p_success_20d": latest_p,
-        "p_success_tsm_like_20d": latest_tsm_like_p,
-        "decision_score_20d": latest_score,
-        "paper_decision_score_20d": latest_tsm_like_score,
-        "p_stop_survival_20d": 1.0 - latest_stop_hit if pd.notna(latest_stop_hit) else np.nan,
-        "p_stop_hit_20d": latest_stop_hit,
-        "p_hit_1r_20d": latest_row.get("p_hit_1r", np.nan),
-        "p_hit_2r_20d": latest_row.get("p_hit_2r", np.nan),
-        "expected_r_net_20d": latest_expected_r,
-        "expected_net_return_pct_20d": latest_row.get("expected_net_return_pct", np.nan),
+        f"p_success_{suffix}": latest_p,
+        f"p_success_tsm_like_{suffix}": latest_tsm_like_p,
+        f"decision_score_{suffix}": latest_score,
+        f"paper_decision_score_{suffix}": latest_tsm_like_score,
+        f"p_stop_survival_{suffix}": 1.0 - latest_stop_hit if pd.notna(latest_stop_hit) else np.nan,
+        f"p_stop_hit_{suffix}": latest_stop_hit,
+        f"p_stop_survival_raw_{suffix}": 1.0 - latest_stop_hit_raw if pd.notna(latest_stop_hit_raw) else np.nan,
+        f"p_stop_hit_raw_{suffix}": latest_stop_hit_raw,
+        f"p_stop_hit_calibrated_{suffix}": latest_stop_hit,
+        f"p_stop_hit_raw_minus_calibrated_{suffix}": latest_row.get(STOP_RISK_RAW_MINUS_CALIBRATED_COL, np.nan),
+        f"p_stop_hit_oos_percentile_{suffix}": latest_row.get(STOP_RISK_OOS_PERCENTILE_COL, np.nan),
+        f"strict_stop_risk_gap_{suffix}": latest_stop_hit - MAX_STOP_HIT_FOR_LATEST if pd.notna(latest_stop_hit) else np.nan,
+        f"paper_stop_risk_gap_{suffix}": latest_stop_hit - PAPER_MAX_STOP_HIT_FOR_LATEST if pd.notna(latest_stop_hit) else np.nan,
+        "stop_risk_calibration_warning": latest_row.get(STOP_RISK_WARNING_COL, "PASS"),
+        "stop_risk_calibration_method": latest_row.get("stop_risk_calibration_method", stop_risk_calibration_model.get("calibration_method", "")),
+        f"p_hit_1r_{suffix}": latest_row.get("p_hit_1r", np.nan),
+        f"p_hit_2r_{suffix}": latest_row.get("p_hit_2r", np.nan),
+        f"expected_r_net_{suffix}": latest_expected_r,
+        f"expected_net_return_pct_{suffix}": latest_row.get("expected_net_return_pct", np.nan),
         "effective_group_n": latest_row.get("effective_group_n", 0),
         "oos_event_count": int(eval_row.get("event_count", 0)),
+        f"oos_event_count_{suffix}": int(eval_row.get("event_count", 0)),
         "selected_oos_event_count": int(eval_row.get("selected_event_count", 0)),
+        f"selected_oos_event_count_{suffix}": int(eval_row.get("selected_event_count", 0)),
         "selected_fraction": eval_row.get("selected_fraction", np.nan),
+        f"selected_fraction_{suffix}": eval_row.get("selected_fraction", np.nan),
         "selected_expectancy_ci_lower_pct": eval_row.get("selected_expectancy_ci_lower_pct", np.nan),
+        f"selected_expectancy_ci_lower_pct_{suffix}": eval_row.get("selected_expectancy_ci_lower_pct", np.nan),
         "selected_minus_all_pct": eval_row.get("selected_minus_all_pct", np.nan),
+        f"selected_minus_all_pct_{suffix}": eval_row.get("selected_minus_all_pct", np.nan),
         "selected_minus_all_ci_lower_pct": eval_row.get("selected_minus_all_ci_lower_pct", np.nan),
+        f"selected_minus_all_ci_lower_pct_{suffix}": eval_row.get("selected_minus_all_ci_lower_pct", np.nan),
         "selected_minus_all_ci_lower_pct_paired": eval_row.get("selected_minus_all_ci_lower_pct_paired", np.nan),
+        f"selected_minus_all_ci_lower_pct_paired_{suffix}": eval_row.get("selected_minus_all_ci_lower_pct_paired", np.nan),
         "selected_minus_score_baseline_ci_lower_pct": eval_row.get("selected_minus_score_baseline_ci_lower_pct", np.nan),
+        f"selected_minus_score_baseline_ci_lower_pct_{suffix}": eval_row.get("selected_minus_score_baseline_ci_lower_pct", np.nan),
         "selected_minus_score_baseline_ci_lower_pct_paired": eval_row.get("selected_minus_score_baseline_ci_lower_pct_paired", np.nan),
+        f"selected_minus_score_baseline_ci_lower_pct_paired_{suffix}": eval_row.get("selected_minus_score_baseline_ci_lower_pct_paired", np.nan),
         "uplift_bootstrap_p_value": eval_row.get("uplift_bootstrap_p_value", np.nan),
         "uplift_bootstrap_p_value_paired": eval_row.get("uplift_bootstrap_p_value_paired", np.nan),
         "bootstrap_method": eval_row.get("bootstrap_method", ""),
@@ -5045,30 +6440,153 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         "pooled_threshold_failure_summary": pooled_threshold_failure_summary,
         "pooled_uplift_failure_summary": pooled_uplift_failure_summary,
         "pooled_tsm_calibration_failure_summary": pooled_tsm_calibration_failure_summary,
-        "next_required_evidence_action": next_required_evidence_action,
+        "next_required_evidence_action": next_required_action,
     }
-    paper_gate_snapshot = build_paper_gate_snapshot(champion_comparison, tsm_like_metrics, overlay, quality_ok)
-    paper_gate_values = dict(zip(paper_gate_snapshot["field"], paper_gate_snapshot["value"])) if not paper_gate_snapshot.empty else {}
-    overlay.update(
-        {
-            "strict_gate_status": paper_gate_values.get("strict_gate_status", "DISPLAY_ONLY_MODEL_BLOCKED"),
-            "paper_gate_status": paper_gate_values.get("paper_gate_status", "DISPLAY_ONLY_MODEL_BLOCKED"),
-            "paper_decision_support_allowed": paper_gate_values.get("paper_decision_support_allowed", False),
-            "paper_model_gate_pass": paper_gate_values.get("paper_model_gate_pass", False),
-            "paper_latest_signal_pass": paper_gate_values.get("paper_latest_signal_pass", False),
-            "paper_gate_block_reasons": paper_gate_values.get("paper_gate_block_reasons", "UNKNOWN"),
-            "tsm_like_effective_train_validation_n": paper_gate_values.get("tsm_like_effective_train_validation_n", np.nan),
-            "tsm_like_calibration_ece": paper_gate_values.get("tsm_like_calibration_ece", np.nan),
-            "live_trading_status": "DISABLED_BY_DESIGN",
-        }
+    overlay, paper_gate_snapshot = refresh_paper_gate_overlay(
+        champion_comparison,
+        tsm_like_metrics,
+        overlay,
+        pooled_quality,
     )
-    quality = build_quality_checks(data, champion_comparison, tsm_metrics, calibration, overlay, quality_ok)
+    paper_gate_values = dict(zip(paper_gate_snapshot["field"], paper_gate_snapshot["value"])) if not paper_gate_snapshot.empty else {}
+
+    def build_universe_latest_predictions(latest_predictions: pd.DataFrame, decision_only: bool = False) -> pd.DataFrame:
+        suffix = active_horizon_suffix()
+        paper_score_col_out = f"paper_decision_score_{suffix}"
+        columns = [
+            "symbol",
+            "symbol_group",
+            "date",
+            "is_decision_universe",
+            "decision_scope",
+            "training_scope",
+            "latest_trade_ready",
+            f"p_success_{suffix}",
+            f"p_stop_hit_{suffix}",
+            f"p_stop_hit_raw_{suffix}",
+            f"p_stop_hit_calibrated_{suffix}",
+            f"p_stop_hit_raw_minus_calibrated_{suffix}",
+            f"p_stop_hit_oos_percentile_{suffix}",
+            f"strict_stop_risk_gap_{suffix}",
+            f"paper_stop_risk_gap_{suffix}",
+            "stop_risk_calibration_warning",
+            f"expected_r_{suffix}",
+            f"decision_score_{suffix}",
+            paper_score_col_out,
+            f"threshold_{suffix}",
+            "decision_support_allowed",
+            "paper_decision_support_allowed",
+            "block_reasons",
+            "model_name",
+            "prediction_source",
+            "live_trading_status",
+        ]
+        if latest_predictions.empty:
+            return pd.DataFrame(columns=columns)
+        work = filter_latest_predictions_for_output_scope(latest_predictions, decision_only=decision_only)
+        if work.empty:
+            return pd.DataFrame(columns=columns)
+        paper_model_pass = to_bool(paper_gate_values.get("paper_model_gate_pass", False))
+        paper_model_reasons = str(paper_gate_values.get("paper_model_block_reasons", "UNKNOWN"))
+        rows: list[dict[str, object]] = []
+        for _, row in work.sort_values(["symbol", "date"]).iterrows():
+            symbol = str(row.get("symbol", "")).upper()
+            group = str(row.get("symbol_group", ""))
+            is_tsm = symbol == "TSM"
+            is_semiconductor = is_tsm_like_semiconductor(symbol, group)
+            p_col = "p_success_tsm_calibrated" if is_tsm else "p_success_calibrated"
+            score_col = "decision_score_tsm_calibrated" if is_tsm else "decision_score"
+            paper_score_col = "decision_score_tsm_like_calibrated" if is_semiconductor and "decision_score_tsm_like_calibrated" in row.index else score_col
+            latest_ready = to_bool(row.get(TRADE_READY_COL, False))
+            p_success = safe_float(row.get(p_col))
+            stop_hit = safe_float(row.get(STOP_RISK_CALIBRATED_COL, row.get(STOP_RISK_LGBM_COL)))
+            stop_hit_raw = safe_float(row.get(STOP_RISK_RAW_COL, row.get(STOP_RISK_LGBM_COL)))
+            stop_gap = safe_float(row.get(STOP_RISK_RAW_MINUS_CALIBRATED_COL), np.nan)
+            stop_percentile = safe_float(row.get(STOP_RISK_OOS_PERCENTILE_COL), np.nan)
+            stop_warning = str(row.get(STOP_RISK_WARNING_COL, "PASS"))
+            expected_r = safe_float(row.get("expected_r_lgbm"))
+            score = safe_float(row.get(score_col))
+            paper_score = safe_float(row.get(paper_score_col))
+            strict_failures: list[str] = []
+            if not model_quality_pass:
+                strict_failures.append(f"MODEL:{reasons}")
+            if not latest_ready:
+                strict_failures.append("LATEST_NOT_TRADE_READY")
+            if pd.isna(score) or pd.isna(threshold) or score < threshold:
+                strict_failures.append("POOLED_DECISION_SCORE_BELOW_THRESHOLD")
+            if pd.isna(stop_hit) or stop_hit > MAX_STOP_HIT_FOR_LATEST:
+                strict_failures.append("POOLED_STOP_RISK_GT_0_35")
+            if pd.isna(expected_r) or expected_r < MIN_EXPECTED_R_FOR_LATEST:
+                strict_failures.append("POOLED_EXPECTED_R_LT_0_35")
+            decision_allowed = not strict_failures
+
+            paper_failures: list[str] = []
+            if not paper_model_pass:
+                paper_failures.append(f"PAPER_MODEL:{paper_model_reasons}")
+            if not latest_ready:
+                paper_failures.append("LATEST_NOT_TRADE_READY")
+            if pd.isna(stop_hit) or stop_hit > PAPER_MAX_STOP_HIT_FOR_LATEST:
+                paper_failures.append("POOLED_STOP_RISK_GT_0_40")
+            paper_allowed = not paper_failures
+            combined_reasons = sorted(set(strict_failures + paper_failures))
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "symbol_group": group,
+                    "date": row.get("date", ""),
+                    "is_decision_universe": to_bool(row.get("is_decision_universe", True)),
+                    "decision_scope": row.get("decision_scope", "top10"),
+                    "training_scope": row.get("training_scope", "universal_research_pool"),
+                    "latest_trade_ready": latest_ready,
+                    f"p_success_{suffix}": p_success,
+                    f"p_stop_hit_{suffix}": stop_hit,
+                    f"p_stop_hit_raw_{suffix}": stop_hit_raw,
+                    f"p_stop_hit_calibrated_{suffix}": stop_hit,
+                    f"p_stop_hit_raw_minus_calibrated_{suffix}": stop_gap,
+                    f"p_stop_hit_oos_percentile_{suffix}": stop_percentile,
+                    f"strict_stop_risk_gap_{suffix}": stop_hit - MAX_STOP_HIT_FOR_LATEST if pd.notna(stop_hit) else np.nan,
+                    f"paper_stop_risk_gap_{suffix}": stop_hit - PAPER_MAX_STOP_HIT_FOR_LATEST if pd.notna(stop_hit) else np.nan,
+                    "stop_risk_calibration_warning": stop_warning,
+                    f"expected_r_{suffix}": expected_r,
+                    f"decision_score_{suffix}": score,
+                    paper_score_col_out: paper_score,
+                    f"threshold_{suffix}": threshold,
+                    "decision_support_allowed": bool(decision_allowed),
+                    "paper_decision_support_allowed": bool(paper_allowed),
+                    "block_reasons": "PASS" if decision_allowed or paper_allowed else "|".join(combined_reasons),
+                    "model_name": champion_name,
+                    "prediction_source": "pooled_model",
+                    "live_trading_status": "DISABLED_BY_DESIGN",
+                }
+            )
+        return pd.DataFrame(rows, columns=columns).sort_values(
+            ["paper_decision_support_allowed", "decision_support_allowed", paper_score_col_out, "symbol"],
+            ascending=[False, False, False, True],
+        )
+
+    universe_latest_predictions = build_universe_latest_predictions(latest_pred, decision_only=False)
+    top10_latest_predictions = build_universe_latest_predictions(latest_pred, decision_only=True)
+    stop_risk_summary = build_stop_risk_calibration_summary(predictions, stop_risk_calibration_model)
+    stop_risk_bins = build_stop_risk_calibration_bins(predictions)
+    stop_risk_slice_diagnostics = build_stop_risk_slice_diagnostics(predictions)
+    stop_risk_latest_distribution = build_stop_risk_latest_distribution(universe_latest_predictions, top10_latest_predictions)
+    quality = build_quality_checks(
+        data,
+        champion_comparison,
+        tsm_metrics,
+        calibration,
+        overlay,
+        quality_ok,
+        top10_latest_predictions,
+        stop_risk_summary,
+    )
     prediction_cols = [
         "p_success_base",
         "p_success_eb",
         "p_success_hier_eb",
         "p_success_logistic",
         "p_success_weighted_logistic",
+        "p_success_multitimeframe_overlay",
         "p_success_strict_logistic",
         "p_success_hist_gbm",
         "p_success_lgbm",
@@ -5079,9 +6597,21 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         "p_success_tsm_like_calibrated",
         "p_stop_hit",
         "p_stop_hit_lgbm",
+        STOP_RISK_RAW_COL,
+        STOP_RISK_GLOBAL_CALIBRATED_COL,
+        STOP_RISK_TIER_CALIBRATED_COL,
+        STOP_RISK_CANDIDATE_CALIBRATED_COL,
+        STOP_RISK_CALIBRATED_COL,
+        STOP_RISK_SURVIVAL_CALIBRATED_COL,
+        STOP_RISK_RAW_MINUS_CALIBRATED_COL,
+        STOP_RISK_OOS_PERCENTILE_COL,
+        STOP_RISK_WARNING_COL,
+        "stop_risk_calibration_method",
+        "stop_risk_calibration_active_source_col",
         "expected_r_net",
         "expected_r_lgbm",
         "expected_net_return_pct",
+        "expected_return_lgbm",
         "decision_score",
         "decision_score_tsm_calibrated",
         "decision_score_tsm_like_calibrated",
@@ -5117,11 +6647,167 @@ def run_pooled_model(features: pd.DataFrame, pooled_quality: pd.DataFrame) -> Di
         "tsm_like_pool": tsm_like_pool,
         "tsm_like_metrics": tsm_like_metrics,
         "paper_gate_snapshot": paper_gate_snapshot,
+        "universe_latest_predictions": universe_latest_predictions,
+        "top10_latest_predictions": top10_latest_predictions,
+        "stop_risk_summary": stop_risk_summary,
+        "stop_risk_calibration_bins": stop_risk_bins,
+        "stop_risk_slice_diagnostics": stop_risk_slice_diagnostics,
+        "stop_risk_latest_distribution": stop_risk_latest_distribution,
         "learning_curve": build_learning_curve_report(data, comparison, tsm_like_metrics),
         "calibration": calibration,
         "overlay": overlay,
         "quality": quality,
     }
+
+
+def add_horizon_column(frame: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    out = frame.copy()
+    if out.empty:
+        if "horizon_days" not in out.columns:
+            out["horizon_days"] = pd.Series(dtype=int)
+        return out
+    if "horizon_days" in out.columns:
+        out["horizon_days"] = int(horizon)
+    else:
+        out.insert(0, "horizon_days", int(horizon))
+    return out
+
+
+def horizon_specific_columns(frame: pd.DataFrame, horizon: int) -> list[str]:
+    suffix = f"_{int(horizon)}d"
+    return [col for col in frame.columns if str(col).endswith(suffix)]
+
+
+def merge_latest_prediction_tables(results_by_horizon: dict[int, Dict[str, object]], key: str) -> pd.DataFrame:
+    if not results_by_horizon:
+        return pd.DataFrame()
+    primary_horizon = 20 if 20 in results_by_horizon else sorted(results_by_horizon)[0]
+    primary = results_by_horizon[primary_horizon].get(key, pd.DataFrame())
+    merged = primary.copy() if isinstance(primary, pd.DataFrame) else pd.DataFrame()
+    if merged.empty:
+        first = next((r.get(key) for _, r in sorted(results_by_horizon.items()) if isinstance(r.get(key), pd.DataFrame)), pd.DataFrame())
+        merged = first.copy()
+    if merged.empty or "symbol" not in merged.columns:
+        return merged
+    for horizon, result in sorted(results_by_horizon.items()):
+        if horizon == primary_horizon:
+            continue
+        table = result.get(key, pd.DataFrame())
+        if not isinstance(table, pd.DataFrame) or table.empty or "symbol" not in table.columns:
+            continue
+        cols = ["symbol", *horizon_specific_columns(table, horizon)]
+        if len(cols) <= 1:
+            continue
+        merged = merged.merge(table[cols].drop_duplicates("symbol", keep="last"), on="symbol", how="outer")
+    return merged
+
+
+def merge_overlay_dicts(results_by_horizon: dict[int, Dict[str, object]]) -> Dict[str, object]:
+    if not results_by_horizon:
+        return {}
+    primary_horizon = 20 if 20 in results_by_horizon else sorted(results_by_horizon)[0]
+    primary_overlay = results_by_horizon[primary_horizon].get("overlay", {})
+    combined: Dict[str, object] = dict(primary_overlay) if isinstance(primary_overlay, dict) else {}
+    generic_horizon_keys = [
+        "model_name",
+        "asof_date",
+        "model_quality_pass",
+        "latest_trade_ready",
+        "latest_signal_pass",
+        "decision_support_allowed",
+        "paper_decision_support_allowed",
+        "model_quality_block_reasons",
+        "decision_block_reasons",
+        "latest_block_reasons",
+        "threshold_reason",
+        "threshold_decision_eligible",
+        "threshold_stability_pass",
+        "validation_design",
+        "training_event_count",
+        "decision_event_count",
+        "oos_event_count",
+        "selected_oos_event_count",
+        "selected_fraction",
+        "ece",
+        "decision_ece",
+        "brier_improvement_pct",
+        "average_precision",
+        "next_required_evidence_action",
+    ]
+    for horizon, result in sorted(results_by_horizon.items()):
+        overlay = result.get("overlay", {})
+        if not isinstance(overlay, dict):
+            continue
+        suffix = f"{int(horizon)}d"
+        for key, value in overlay.items():
+            if str(key).endswith(f"_{suffix}"):
+                combined[key] = value
+        for key in generic_horizon_keys:
+            if key in overlay:
+                combined[f"{key}_{suffix}"] = overlay[key]
+        if horizon != primary_horizon:
+            for key, value in overlay.items():
+                if str(key).endswith(f"_{suffix}"):
+                    continue
+                combined.setdefault(f"{key}_{suffix}", value)
+    combined["pooled_model_horizons"] = ",".join(str(h) for h in sorted(results_by_horizon))
+    combined["primary_decision_horizon_days"] = primary_horizon
+    return combined
+
+
+def combine_horizon_results(results_by_horizon: dict[int, Dict[str, object]]) -> Dict[str, pd.DataFrame | Dict[str, object]]:
+    frame_keys = [
+        "comparison",
+        "tsm_metrics",
+        "threshold_policy",
+        "uplift_report",
+        "oos_predictions",
+        "oof_predictions",
+        "slice_diagnostics",
+        "tsm_like_pool",
+        "tsm_like_metrics",
+        "paper_gate_snapshot",
+        "stop_risk_summary",
+        "stop_risk_calibration_bins",
+        "stop_risk_slice_diagnostics",
+        "stop_risk_latest_distribution",
+        "learning_curve",
+        "calibration",
+        "quality",
+    ]
+    combined: Dict[str, pd.DataFrame | Dict[str, object]] = {}
+    for key in frame_keys:
+        parts = []
+        for horizon, result in sorted(results_by_horizon.items()):
+            frame = result.get(key, pd.DataFrame())
+            if isinstance(frame, pd.DataFrame):
+                parts.append(add_horizon_column(frame, horizon))
+        combined[key] = pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
+    combined["universe_latest_predictions"] = merge_latest_prediction_tables(results_by_horizon, "universe_latest_predictions")
+    combined["top10_latest_predictions"] = merge_latest_prediction_tables(results_by_horizon, "top10_latest_predictions")
+    combined["overlay"] = merge_overlay_dicts(results_by_horizon)
+    return combined
+
+
+def run_pooled_model_horizons(
+    features: pd.DataFrame,
+    pooled_quality: pd.DataFrame,
+    horizons: Sequence[int] = POOLED_MODEL_HORIZONS,
+    progress: Callable[[str], None] | None = None,
+) -> Dict[str, pd.DataFrame | Dict[str, object]]:
+    original_horizon = HORIZON
+    results_by_horizon: dict[int, Dict[str, object]] = {}
+    try:
+        for horizon in horizons:
+            set_active_horizon(int(horizon))
+            if progress is not None:
+                progress(f"horizon start: {HORIZON}d")
+            results_by_horizon[int(horizon)] = run_pooled_model(features, pooled_quality, progress=progress)
+            if progress is not None:
+                progress(f"horizon complete: {HORIZON}d")
+    finally:
+        set_active_horizon(original_horizon)
+    return combine_horizon_results(results_by_horizon)
 
 
 def build_quality_checks(
@@ -5131,8 +6817,27 @@ def build_quality_checks(
     calibration: pd.DataFrame,
     overlay: Dict[str, object],
     pooled_dataset_quality_ok: bool,
+    universe_latest_predictions: pd.DataFrame | None = None,
+    stop_risk_summary: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     comparison = decision_scope_metrics(comparison)
+    universe_latest_predictions = universe_latest_predictions if universe_latest_predictions is not None else pd.DataFrame()
+    stop_risk_summary = stop_risk_summary if stop_risk_summary is not None else pd.DataFrame()
+    decision_symbols: set[str] = set()
+    if not data.empty and {"symbol", "is_decision_universe"}.issubset(data.columns):
+        decision_symbols = {
+            str(symbol).upper()
+            for symbol in data.loc[data["is_decision_universe"].map(to_bool), "symbol"].dropna().tolist()
+        }
+    latest_symbols: set[str] = set()
+    fallback_latest_count = 0
+    if not universe_latest_predictions.empty and "symbol" in universe_latest_predictions.columns:
+        latest_symbols = {str(symbol).upper() for symbol in universe_latest_predictions["symbol"].dropna().tolist()}
+        if "prediction_source" in universe_latest_predictions.columns:
+            fallback_latest_count = int(
+                universe_latest_predictions["prediction_source"].astype(str).str.contains("fallback", case=False, na=False).sum()
+            )
+    missing_latest_symbols = sorted(decision_symbols - latest_symbols)
     eval_row = comparison[comparison["split"].eq("combined_test_holdout")].iloc[0] if not comparison.empty else pd.Series(dtype=object)
     if "is_selected_tsm_calibration_route" in tsm_metrics.columns:
         selected_tsm_metrics = tsm_metrics[tsm_metrics["is_selected_tsm_calibration_route"].map(to_bool)].copy()
@@ -5145,10 +6850,64 @@ def build_quality_checks(
     trade_ready_labels = int(safe_float(overlay.get("decision_event_count"), data[DECISION_ENTRY_COL].map(to_bool).sum() if DECISION_ENTRY_COL in data.columns else len(data)))
     selected_minus_all_lower = safe_float(eval_row.get("selected_minus_all_ci_lower_pct_paired", eval_row.get("selected_minus_all_ci_lower_pct")))
     selected_minus_score_lower = safe_float(eval_row.get("selected_minus_score_baseline_ci_lower_pct_paired", eval_row.get("selected_minus_score_baseline_ci_lower_pct")))
+    tsm_scoring_fallback = (not tsm_eval.empty) and tsm_calibration_uses_pooled_fallback(tsm_eval)
+    tsm_route_failure_reasons = str(tsm_eval.get("tsm_calibration_route_failure_reasons", ""))
+    tsm_route_check_value = tsm_eval.get("tsm_calibration_route_failure_reasons", "")
+    tsm_route_check_details = ""
+    if tsm_scoring_fallback:
+        tsm_route_check_value = "SELECTED_ROUTE_FAILED_IDENTITY_FALLBACK"
+        tsm_route_check_details = f"Diagnostic selected TSM route failed but scoring uses pooled-only fallback: {tsm_route_failure_reasons}"
+    tsm_effective_route_pass = tsm_effective_scoring_route_pass(tsm_eval)
+    tsm_effective_ece_pass = safe_float(tsm_eval.get("decision_ece", tsm_eval.get("ece"))) <= MAX_TSM_ECE or tsm_scoring_fallback
+    stop_summary_rows = (
+        stop_risk_summary[
+            stop_risk_summary.get("split", pd.Series(dtype=str)).astype(str).eq("combined_test_holdout")
+            & stop_risk_summary.get("evaluation_scope", pd.Series(dtype=str)).astype(str).eq(ENTRY_RESEARCH_EVAL_SCOPE)
+        ]
+        if not stop_risk_summary.empty
+        else pd.DataFrame()
+    )
+    stop_summary_row = stop_summary_rows.iloc[0] if not stop_summary_rows.empty else pd.Series(dtype=object)
+    latest_stop_warning_series = (
+        universe_latest_predictions.get(STOP_RISK_WARNING_COL, pd.Series(dtype=str)).astype(str)
+        if not universe_latest_predictions.empty and STOP_RISK_WARNING_COL in universe_latest_predictions.columns
+        else pd.Series(dtype=str)
+    )
+    latest_stop_gap_warning_count = (
+        int(latest_stop_warning_series.str.contains("STOP_RAW_CALIBRATED_GAP_GT_5PCT", na=False).sum())
+        if not latest_stop_warning_series.empty
+        else 0
+    )
+    latest_stop_calibration_warning_count = (
+        int(latest_stop_warning_series.ne("PASS").sum())
+        if not latest_stop_warning_series.empty
+        else 0
+    )
     rows = [
         quality_check("pooled_dataset_quality_critical_pass", pooled_dataset_quality_ok, "CRITICAL", pooled_dataset_quality_ok),
-        quality_check("pooled_model_training_20d_labels_at_least_10000", model_training_labels >= MIN_POOLED_MODEL_TRAINING_LABELS, "CRITICAL", model_training_labels),
-        quality_check("pooled_trade_ready_20d_labels_at_least_500", trade_ready_labels >= MIN_POOLED_TRADE_READY_LABELS, "CRITICAL", trade_ready_labels),
+        quality_check(
+            "pooled_decision_symbol_count_eq_required",
+            not decision_symbols or len(decision_symbols) == REQUIRED_DECISION_SYMBOL_COUNT,
+            "CRITICAL",
+            len(decision_symbols) if decision_symbols else "not_configured",
+            f"required={REQUIRED_DECISION_SYMBOL_COUNT}",
+        ),
+        quality_check(
+            "pooled_latest_predictions_decision_coverage",
+            not decision_symbols or not missing_latest_symbols,
+            "CRITICAL",
+            "PASS" if not missing_latest_symbols else ",".join(missing_latest_symbols),
+            "Every decision universe symbol needs a pooled latest prediction row.",
+        ),
+        quality_check(
+            "pooled_no_actionability_fallback_rows",
+            fallback_latest_count == 0,
+            "CRITICAL",
+            fallback_latest_count,
+            "Rule fallback rows are dashboard diagnostics only and must not enter pooled latest predictions.",
+        ),
+        quality_check(f"pooled_model_training_{HORIZON}d_labels_at_least_10000", model_training_labels >= MIN_POOLED_MODEL_TRAINING_LABELS, "CRITICAL", model_training_labels),
+        quality_check(f"pooled_trade_ready_{HORIZON}d_labels_at_least_500", trade_ready_labels >= MIN_POOLED_TRADE_READY_LABELS, "CRITICAL", trade_ready_labels),
         quality_check("pooled_model_eval_events_at_least_150", int(eval_row.get("event_count", 0)) >= MIN_EVAL_EVENTS, "CRITICAL", int(eval_row.get("event_count", 0))),
         quality_check("pooled_model_selected_eval_events_at_least_50", int(eval_row.get("selected_event_count", 0)) >= MIN_SELECTED_EVAL_EVENTS, "WARN", int(eval_row.get("selected_event_count", 0))),
         quality_check("pooled_model_min_selected_events_per_oof_fold_at_least_10", safe_float(eval_row.get("min_selected_events_per_fold", np.inf)) >= MIN_SELECTED_PER_EVAL_SPLIT, "WARN", eval_row.get("min_selected_events_per_fold", np.nan)),
@@ -5167,21 +6926,58 @@ def build_quality_checks(
         quality_check("pooled_model_brier_improvement_positive", safe_float(eval_row.get("brier_improvement_pct")) > 0, "WARN", eval_row.get("brier_improvement_pct", np.nan)),
         quality_check("tsm_calibration_layer_events_at_least_30", int(tsm_layer_row.get("event_count", 0)) >= MIN_TSM_CALIBRATION_EVENTS, "WARN", int(tsm_layer_row.get("event_count", 0))),
         quality_check("tsm_calibrated_eval_events_at_least_30", int(tsm_eval.get("event_count", 0)) >= MIN_TSM_EVAL_EVENTS, "WARN", int(tsm_eval.get("event_count", 0))),
-        quality_check("tsm_calibration_route_pass", to_bool(tsm_eval.get("tsm_calibration_route_pass", False)), "WARN", tsm_eval.get("tsm_calibration_route_failure_reasons", "")),
-        quality_check("tsm_calibrated_ece_at_most_0_15", safe_float(tsm_eval.get("decision_ece", tsm_eval.get("ece"))) <= MAX_TSM_ECE, "WARN", tsm_eval.get("decision_ece", tsm_eval.get("ece", np.nan))),
+        quality_check("tsm_calibration_route_pass", tsm_effective_route_pass, "WARN", tsm_route_check_value, tsm_route_check_details),
+        quality_check("tsm_calibrated_ece_at_most_0_15", tsm_effective_ece_pass, "WARN", tsm_eval.get("decision_ece", tsm_eval.get("ece", np.nan)), tsm_route_check_details),
         quality_check("tsm_like_effective_train_validation_n_at_least_500", safe_float(overlay.get("tsm_like_effective_train_validation_n"), 0.0) >= MIN_TSM_LIKE_EFFECTIVE_SELECTION_N, "WARN", overlay.get("tsm_like_effective_train_validation_n", np.nan)),
         quality_check("tsm_like_calibration_ece_at_most_0_15", safe_float(overlay.get("tsm_like_calibration_ece"), np.nan) <= MAX_TSM_ECE, "WARN", overlay.get("tsm_like_calibration_ece", np.nan)),
+        quality_check(
+            "stop_risk_calibration_report_generated",
+            not stop_risk_summary.empty,
+            "WARN",
+            int(len(stop_risk_summary)),
+            "Stop head raw/calibrated Brier, ECE, and drift diagnostics.",
+        ),
+        quality_check(
+            "stop_risk_calibrated_ece_not_worse_raw_oos",
+            bool(stop_summary_row.get("calibrated_ece_not_worse_than_raw", False)),
+            "WARN",
+            f"raw={stop_summary_row.get('raw_ece', np.nan)};calibrated={stop_summary_row.get('calibrated_ece', np.nan)}",
+            "Overall OOS entry-research stop calibration guardrail.",
+        ),
+        quality_check(
+            "stop_risk_latest_raw_calibrated_gap_warning_count",
+            latest_stop_gap_warning_count == 0,
+            "INFO",
+            latest_stop_gap_warning_count,
+            "Large raw/calibrated differences are advisory and do not loosen stop-risk gates.",
+        ),
+        quality_check(
+            "stop_risk_latest_calibration_warning_count",
+            latest_stop_calibration_warning_count == 0,
+            "INFO",
+            latest_stop_calibration_warning_count,
+            "Calibration guardrail warnings explain whether the active stop risk fell back to raw probabilities.",
+        ),
         quality_check("paper_only_gate_pass", to_bool(overlay.get("paper_decision_support_allowed", False)), "INFO", overlay.get("paper_gate_block_reasons", ""), "Paper gate does not enable strict prediction_ready or live trading."),
         quality_check("pooled_latest_decision_support_allowed", to_bool(overlay.get("decision_support_allowed", False)), "INFO", overlay.get("decision_support_allowed", False), "False is expected when latest TSM is not trade-ready or model gates fail."),
     ]
     return pd.DataFrame(rows)
 
 
-def write_report(outdir: Path, comparison: pd.DataFrame, tsm_metrics: pd.DataFrame, calibration: pd.DataFrame, quality: pd.DataFrame, overlay: Dict[str, object]) -> None:
+def write_report(
+    outdir: Path,
+    comparison: pd.DataFrame,
+    tsm_metrics: pd.DataFrame,
+    calibration: pd.DataFrame,
+    quality: pd.DataFrame,
+    overlay: Dict[str, object],
+    stop_risk_summary: pd.DataFrame | None = None,
+) -> None:
+    stop_risk_summary = stop_risk_summary if stop_risk_summary is not None else pd.DataFrame()
     lines = [
         "# Pooled Semiconductor Model Report",
         "",
-        "This report evaluates only 20D trade-ready events. It is research tooling and does not place orders.",
+        "This report evaluates pooled trade-ready events by horizon. It is research tooling and does not place orders.",
         "",
         "## Latest Overlay",
         "",
@@ -5197,7 +6993,7 @@ def write_report(outdir: Path, comparison: pd.DataFrame, tsm_metrics: pd.DataFra
             f"| {row['split']} | {row.get('evaluation_scope', 'NA')} | {int(row['event_count'])} | {int(row['selected_event_count'])} | "
             f"{row['brier_improvement_pct']:.2f}% | {row['ece']:.4f} | {row['selected_mean_return_pct']:.2f}% | {row['selected_expectancy_ci_lower_pct']:.2f}% |"
         )
-    lines.extend(["", "## TSMC Calibration Metrics", "", "| Split | Events | Selected | Brier Improvement | ECE | Selected Mean Return |"])
+    lines.extend(["", "## Top10 Calibration Metrics", "", "| Split | Events | Selected | Brier Improvement | ECE | Selected Mean Return |"])
     lines.append("|---|---:|---:|---:|---:|---:|")
     for _, row in tsm_metrics.iterrows():
         lines.append(
@@ -5211,19 +7007,50 @@ def write_report(outdir: Path, comparison: pd.DataFrame, tsm_metrics: pd.DataFra
             f"| {row.get('layer')} | {int(event_count if pd.notna(event_count) else 0)} | {row.get('status')} | "
             f"{safe_float(row.get('logit_shift')):.4f} | {safe_float(row.get('shrinkage')):.4f} | {row.get('fit_source')} |"
         )
+    if not stop_risk_summary.empty:
+        lines.extend(["", "## Stop Risk Calibration", "", "| Split | Scope | Events | Actual Stop | Raw Pred | Calibrated Pred | Raw ECE | Calibrated ECE | Raw Overpred | Cal Overpred |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"])
+        for _, row in stop_risk_summary.iterrows():
+            lines.append(
+                f"| {row.get('split')} | {row.get('evaluation_scope')} | {int(safe_float(row.get('event_count'), 0.0))} | "
+                f"{safe_float(row.get('actual_stop_rate')):.4f} | {safe_float(row.get('raw_predicted_stop_rate')):.4f} | "
+                f"{safe_float(row.get('calibrated_predicted_stop_rate')):.4f} | {safe_float(row.get('raw_ece')):.4f} | "
+                f"{safe_float(row.get('calibrated_ece')):.4f} | {safe_float(row.get('raw_overprediction')):.4f} | "
+                f"{safe_float(row.get('calibrated_overprediction')):.4f} |"
+            )
     lines.extend(["", "## Quality Checks", "", "| Check | Passed | Severity | Value | Details |", "|---|---:|---|---:|---|"])
     for _, row in quality.iterrows():
         lines.append(f"| {row.get('check')} | {row.get('passed')} | {row.get('severity')} | {row.get('value')} | {row.get('details', '')} |")
     (outdir / "tsm_pooled_model_report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_horizons(value: str) -> tuple[int, ...]:
+    horizons: list[int] = []
+    for raw in str(value or "").split(","):
+        raw = raw.strip().lower().replace("d", "")
+        if not raw:
+            continue
+        horizon = int(raw)
+        if horizon <= 0:
+            raise ValueError(f"horizon must be positive: {raw}")
+        horizons.append(horizon)
+    if not horizons:
+        return POOLED_MODEL_HORIZONS
+    return tuple(dict.fromkeys(horizons))
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build pooled 20D trade-ready model and TSMC calibration overlay.")
+    parser = argparse.ArgumentParser(description="Build pooled 5D/20D/60D trade-ready models and Top10 calibration overlay.")
     parser.add_argument("--pooled-feature-matrix", default="tsm_price_rule_output/tsm_prediction_pooled_feature_matrix.csv")
     parser.add_argument("--pooled-quality", default="tsm_price_rule_output/tsm_prediction_pooled_quality_checks.csv")
+    parser.add_argument("--pooled-comparison", default="tsm_price_rule_output/tsm_pooled_model_comparison.csv")
+    parser.add_argument("--tsm-like-metrics", default="tsm_price_rule_output/tsm_tsm_like_calibration_metrics.csv")
+    parser.add_argument("--pooled-latest", default="tsm_price_rule_output/tsm_pooled_latest_prediction_overlay.csv")
     parser.add_argument("--latest-prediction", default="tsm_price_rule_output/tsm_latest_prediction_snapshot.csv")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
+    parser.add_argument("--horizons", default="5,20,60", help="Comma-separated pooled horizons to train/evaluate/output, e.g. 5,20,60.")
     parser.add_argument("--no-update-latest", action="store_true")
+    parser.add_argument("--refresh-paper-gate-only", action="store_true")
+    parser.add_argument("--progress-log", action="store_true", help="Print pooled model stage timings to stderr.")
     return parser.parse_args()
 
 
@@ -5231,9 +7058,44 @@ def main() -> None:
     args = parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    if args.refresh_paper_gate_only:
+        comparison = read_csv(Path(args.pooled_comparison))
+        tsm_like_metrics = read_csv(Path(args.tsm_like_metrics))
+        pooled_quality = read_csv(Path(args.pooled_quality))
+        overlay = read_latest_snapshot(Path(args.pooled_latest))
+        refreshed_overlay, paper_gate_snapshot = refresh_paper_gate_overlay(
+            comparison,
+            tsm_like_metrics,
+            overlay,
+            pooled_quality,
+        )
+        paper_gate_snapshot.to_csv(outdir / "tsm_paper_gate_snapshot.csv", index=False)
+        build_overlay_rows(refreshed_overlay).to_csv(Path(args.pooled_latest), index=False)
+        for latest_table_name in ["tsm_universe_latest_predictions.csv", "tsm_top10_latest_predictions.csv"]:
+            latest_table_path = outdir / latest_table_name
+            if latest_table_path.exists():
+                refreshed_latest = apply_paper_gate_snapshot_to_latest_predictions(
+                    read_csv(latest_table_path),
+                    paper_gate_snapshot,
+                )
+                refreshed_latest.to_csv(latest_table_path, index=False)
+        quality_path = outdir / "tsm_pooled_model_quality_checks.csv"
+        if quality_path.exists():
+            refreshed_quality = apply_paper_gate_snapshot_to_quality_checks(
+                read_csv(quality_path),
+                paper_gate_snapshot,
+            )
+            refreshed_quality.to_csv(quality_path, index=False)
+        if not args.no_update_latest:
+            update_latest_snapshot(Path(args.latest_prediction), refreshed_overlay)
+        print("완료: refreshed pooled paper gate overlay =", Path(args.pooled_latest).resolve())
+        print(build_overlay_rows(refreshed_overlay).to_string(index=False))
+        return
     features = read_csv(Path(args.pooled_feature_matrix), parse_dates=["date"])
     pooled_quality = read_csv(Path(args.pooled_quality))
-    results = run_pooled_model(features, pooled_quality)
+    progress = ProgressLogger(args.progress_log)
+    horizons = parse_horizons(args.horizons)
+    results = run_pooled_model_horizons(features, pooled_quality, horizons=horizons, progress=progress if args.progress_log else None)
     comparison = results["comparison"]
     tsm_metrics = results["tsm_metrics"]
     threshold_policy = results["threshold_policy"]
@@ -5244,6 +7106,12 @@ def main() -> None:
     tsm_like_pool = results["tsm_like_pool"]
     tsm_like_metrics = results["tsm_like_metrics"]
     paper_gate_snapshot = results["paper_gate_snapshot"]
+    universe_latest_predictions = results.get("universe_latest_predictions", pd.DataFrame())
+    top10_latest_predictions = results.get("top10_latest_predictions", universe_latest_predictions)
+    stop_risk_summary = results.get("stop_risk_summary", pd.DataFrame())
+    stop_risk_calibration_bins = results.get("stop_risk_calibration_bins", pd.DataFrame())
+    stop_risk_slice_diagnostics = results.get("stop_risk_slice_diagnostics", pd.DataFrame())
+    stop_risk_latest_distribution = results.get("stop_risk_latest_distribution", pd.DataFrame())
     learning_curve = results["learning_curve"]
     calibration = results["calibration"]
     overlay = results["overlay"]
@@ -5258,11 +7126,17 @@ def main() -> None:
     tsm_like_pool.to_csv(outdir / "tsm_tsm_like_calibration_pool.csv", index=False)
     tsm_like_metrics.to_csv(outdir / "tsm_tsm_like_calibration_metrics.csv", index=False)
     paper_gate_snapshot.to_csv(outdir / "tsm_paper_gate_snapshot.csv", index=False)
+    universe_latest_predictions.to_csv(outdir / "tsm_universe_latest_predictions.csv", index=False)
+    top10_latest_predictions.to_csv(outdir / "tsm_top10_latest_predictions.csv", index=False)
+    stop_risk_summary.to_csv(outdir / "tsm_stop_risk_baseline_summary.csv", index=False)
+    stop_risk_calibration_bins.to_csv(outdir / "tsm_stop_risk_calibration_bins.csv", index=False)
+    stop_risk_slice_diagnostics.to_csv(outdir / "tsm_stop_risk_slice_diagnostics.csv", index=False)
+    stop_risk_latest_distribution.to_csv(outdir / "tsm_stop_risk_latest_distribution.csv", index=False)
     learning_curve.to_csv(outdir / "tsm_pooled_learning_curve_report.csv", index=False)
     calibration.to_csv(outdir / "tsm_pooled_tsm_calibration.csv", index=False)
     build_overlay_rows(overlay).to_csv(outdir / "tsm_pooled_latest_prediction_overlay.csv", index=False)
     quality.to_csv(outdir / "tsm_pooled_model_quality_checks.csv", index=False)
-    write_report(outdir, comparison, tsm_metrics, calibration, quality, overlay)
+    write_report(outdir, comparison, tsm_metrics, calibration, quality, overlay, stop_risk_summary)
     if not args.no_update_latest:
         update_latest_snapshot(Path(args.latest_prediction), overlay)
     print("완료: pooled model outputs =", outdir.resolve())

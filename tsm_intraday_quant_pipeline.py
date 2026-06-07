@@ -32,7 +32,20 @@ import numpy as np
 import pandas as pd
 import requests
 
+from tsm_core.currency import (
+    currency_profile,
+    ensure_fx_rate_file,
+    load_fx_rates,
+    normalize_ohlcv_to_engine_currency,
+    requires_fx_conversion,
+)
 from tsm_daily_quant_pipeline import DownloadResult, enrich_prices, pct
+from tsm_intraday_provider_adapter import (
+    DEFAULT_PROVIDER_ORDER,
+    SUPPORTED_PROVIDERS,
+    ProviderAttempt,
+    select_intraday_provider,
+)
 
 
 DEFAULT_SYMBOL = "TSM"
@@ -87,6 +100,7 @@ class IntradayDownloadResult:
     interval: str
     complete_requested_coverage: bool
     provider_limit_note: str
+    provider_attempts: list[ProviderAttempt] | None = None
 
 
 def ensure_outdirs(outdir: Path) -> Dict[str, Path]:
@@ -224,6 +238,26 @@ def download_yahoo_intraday(symbol: str, requested_start: str, requested_end: st
     )
 
 
+def download_intraday(
+    symbol: str,
+    requested_start: str,
+    requested_end: str,
+    interval: str,
+    provider: str = "auto",
+    provider_order: str = ",".join(DEFAULT_PROVIDER_ORDER),
+) -> IntradayDownloadResult:
+    selected_provider, attempts = select_intraday_provider(provider, interval, provider_order)
+    if selected_provider != "yahoo":
+        details = "; ".join(f"{attempt.provider}:{attempt.request_status}" for attempt in attempts)
+        raise RuntimeError(
+            f"intraday provider '{selected_provider}' is selected but this package currently only has the Yahoo runtime adapter. "
+            f"Use --provider auto or --provider yahoo until the paid-provider fetcher is implemented. attempts={details}"
+        )
+    result = download_yahoo_intraday(symbol, requested_start, requested_end, interval)
+    result.provider_attempts = attempts
+    return result
+
+
 def observed_bars_per_session(df: pd.DataFrame) -> float:
     sessions = pd.to_datetime(df["date"]).dt.date
     counts = sessions.value_counts()
@@ -269,6 +303,12 @@ def compute_summary(df: pd.DataFrame, result: IntradayDownloadResult, bars_per_y
 
     rows = [
         ("ticker", df["ticker"].iloc[0]),
+        ("listing_currency", df["listing_currency"].iloc[-1] if "listing_currency" in df.columns else "USD"),
+        ("display_currency", df["display_currency"].iloc[-1] if "display_currency" in df.columns else "USD"),
+        ("engine_currency", df["engine_currency"].iloc[-1] if "engine_currency" in df.columns else "USD"),
+        ("fx_pair", df["fx_pair"].iloc[-1] if "fx_pair" in df.columns else ""),
+        ("latest_fx_rate_to_usd", df["fx_rate_to_usd"].iloc[-1] if "fx_rate_to_usd" in df.columns else 1.0),
+        ("latest_usdkrw", df["usdkrw"].iloc[-1] if "usdkrw" in df.columns else np.nan),
         ("bar_interval", result.interval),
         ("bar_label", bar_name),
         ("data_source", result.source_info.source),
@@ -288,6 +328,10 @@ def compute_summary(df: pd.DataFrame, result: IntradayDownloadResult, bars_per_y
         ("annualization_bars_per_year", bars_per_year),
         ("start_adj_close", start_price),
         ("end_adj_close", end_price),
+        ("start_adj_close_native", df["adj_close_native"].iloc[0] if "adj_close_native" in df.columns else start_price),
+        ("end_adj_close_native", df["adj_close_native"].iloc[-1] if "adj_close_native" in df.columns else end_price),
+        ("start_close_native", df["close_native"].iloc[0] if "close_native" in df.columns else df["close"].iloc[0]),
+        ("end_close_native", df["close_native"].iloc[-1] if "close_native" in df.columns else df["close"].iloc[-1]),
         ("total_return_pct", pct(total_return)),
         ("cagr_pct", pct(cagr)),
         ("annualized_volatility_pct", pct(ann_vol)),
@@ -388,6 +432,8 @@ def write_source_audit(
             "source_url": "https://eodhd.com/financial-academy/how-to-get-stocks-data-examples/how-to-get-stocks-intraday-historical-data-on-python",
         },
     ]
+    if result.provider_attempts:
+        rows.extend(attempt.to_row() for attempt in result.provider_attempts)
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
 
 
@@ -400,8 +446,9 @@ def make_charts(df: pd.DataFrame, charts_dir: Path, prefix: str, interval: str) 
     ax1.plot(df["date"], df["close"], label=f"{interval} close", linewidth=0.8)
     for w in [20, 50, 200]:
         ax1.plot(df["date"], df[f"sma_{w}"], label=f"SMA {w} bars", linewidth=0.8)
-    ax1.set_title(f"TSMC {interval} close with moving averages")
-    ax1.set_ylabel("Price, USD")
+    ax1.set_title(f"Per-symbol {interval} close with moving averages")
+    engine_currency = df["engine_currency"].iloc[-1] if "engine_currency" in df.columns and not df.empty else "USD"
+    ax1.set_ylabel(f"Price, {engine_currency}")
     ax1.grid(True, alpha=0.25)
     ax1.legend(loc="upper left")
     ax2 = ax1.twinx()
@@ -414,7 +461,7 @@ def make_charts(df: pd.DataFrame, charts_dir: Path, prefix: str, interval: str) 
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.hist(df["close_change_pct"].dropna() * 100, bins=100)
     ax.axvline(0, linewidth=1.0)
-    ax.set_title(f"TSMC {interval} return distribution")
+    ax.set_title(f"Per-symbol {interval} return distribution")
     ax.set_xlabel("Bar return, %")
     ax.set_ylabel("Frequency")
     ax.grid(True, alpha=0.25)
@@ -434,7 +481,7 @@ def make_charts(df: pd.DataFrame, charts_dir: Path, prefix: str, interval: str) 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-    ax1.set_title(f"TSMC {interval} rolling volatility and ATR")
+    ax1.set_title(f"Per-symbol {interval} rolling volatility and ATR")
     fig.tight_layout()
     fig.savefig(charts_dir / f"{prefix}_rolling_vol_atr.png", dpi=160)
     plt.close(fig)
@@ -444,7 +491,7 @@ def write_report(path: Path, summary: pd.DataFrame, audit: pd.DataFrame, prefix:
     metrics = dict(zip(summary["metric"], summary["value"]))
     bar_label = metrics.get("bar_label")
     lines = [
-        f"# TSMC {metrics.get('bar_interval')} intraday 데이터 소스 점검 및 분석 요약",
+        f"# Top10 {metrics.get('bar_interval')} intraday 데이터 소스 점검 및 분석 요약",
         "",
         "## 결론",
         "",
@@ -493,12 +540,19 @@ def write_report(path: Path, summary: pd.DataFrame, audit: pd.DataFrame, prefix:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build TSMC intraday OHLCV files with daily-compatible schema.")
+    parser = argparse.ArgumentParser(description="Build intraday OHLCV files with daily-compatible schema for one requested symbol.")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Ticker symbol, default: TSM")
     parser.add_argument("--start", default=DEFAULT_START, help="Requested start date YYYY-MM-DD")
     parser.add_argument("--end", default=date.today().isoformat(), help="Requested end date YYYY-MM-DD")
     parser.add_argument("--interval", choices=sorted(YAHOO_PUBLIC_LIMIT_DAYS), default="1m", help="Yahoo interval")
+    parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="auto", help="Intraday data provider adapter; auto falls back to Yahoo when no implemented keyed provider is available.")
+    parser.add_argument("--provider-order", default=",".join(DEFAULT_PROVIDER_ORDER), help="Comma-separated provider preference order used when --provider auto.")
     parser.add_argument("--outdir", default=DEFAULT_OUTDIR, help="Output directory")
+    parser.add_argument("--listing-currency", default="", help="Listing/native price currency, inferred from ticker when empty.")
+    parser.add_argument("--display-currency", default="", help="Dashboard display currency, defaults to listing currency.")
+    parser.add_argument("--engine-currency", default="USD", help="Canonical engine/model currency.")
+    parser.add_argument("--fx-pair", default="", help="Yahoo FX pair used for native->engine conversion, e.g. KRW=X.")
+    parser.add_argument("--fx-rates", default="output/tsm_fx_rates_daily.csv", help="Daily FX rates CSV.")
     parser.add_argument("--skip-charts", action="store_true", help="Skip chart generation")
     return parser.parse_args()
 
@@ -512,9 +566,31 @@ def main() -> None:
 
     yahoo_evidence = check_yahoo_full_range_limit(args.symbol, args.start, args.end, args.interval)
     stooq_evidence = fetch_stooq_evidence(args.interval)
-    result = download_yahoo_intraday(args.symbol, args.start, args.end, args.interval)
+    result = download_intraday(args.symbol, args.start, args.end, args.interval, args.provider, args.provider_order)
 
-    raw = result.source_info.df
+    profile = currency_profile(
+        args.symbol,
+        args.symbol,
+        listing_currency=args.listing_currency,
+        display_currency=args.display_currency,
+        engine_currency=args.engine_currency,
+        fx_pair=args.fx_pair,
+    )
+    fx_rates = pd.DataFrame()
+    if requires_fx_conversion(profile.listing_currency, profile.engine_currency):
+        ensure_fx_rate_file(args.fx_rates, [profile.fx_pair], start=args.start, end=args.end)
+        fx_rates = load_fx_rates(args.fx_rates, profile.fx_pair)
+    raw = normalize_ohlcv_to_engine_currency(
+        result.source_info.df,
+        symbol=args.symbol,
+        symbol_yahoo=args.symbol,
+        listing_currency=profile.listing_currency,
+        display_currency=profile.display_currency,
+        engine_currency=profile.engine_currency,
+        fx_pair=profile.fx_pair,
+        fx_rates=fx_rates,
+    )
+    result.source_info.df = raw
     raw_path = outdir / f"{prefix}_available_raw.csv"
     raw.to_csv(raw_path, index=False, encoding="utf-8-sig")
     print(f"Raw intraday data saved: {raw_path}")

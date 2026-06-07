@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>투자 실행 대시보드</title>
-    <link rel="stylesheet" href="/styles.css?v=8" />
+    <link rel="stylesheet" href="/styles.css?v=13" />
   </head>
   <body>
     <div class="app-shell">
@@ -29,7 +29,7 @@
           <div class="fx-card">
             <span>환율</span>
             <strong id="fxRate">확인 중</strong>
-            <button id="fxRefreshBtn" class="mini-button" type="button">조회하기</button>
+            <span id="fxLiveTag" class="fx-live-tag">● 실시간</span>
           </div>
           <div>
             <span>데이터</span>
@@ -51,14 +51,12 @@
       </header>
 
       <main>
+        <div id="liveBar" class="live-bar hidden" aria-label="실시간 시세 상태"></div>
         <section id="actionRow" class="action-row" aria-label="우선 행동"></section>
 
         <nav class="tabs" aria-label="대시보드 보기">
           <button class="tab-button active" type="button" data-tab="all">전체 종목</button>
           <button class="tab-button" type="button" data-tab="portfolio">내 보유</button>
-          <button class="tab-button" type="button" data-tab="execute_candidate">실행 후보</button>
-          <button class="tab-button" type="button" data-tab="watch">관찰</button>
-          <button class="tab-button" type="button" data-tab="risk">금지/위험</button>
           <button class="tab-button" type="button" data-tab="system">시스템 상태</button>
           <button class="tab-button" type="button" data-tab="run">업데이트 실행</button>
         </nav>
@@ -72,6 +70,7 @@
               </div>
               <button id="refreshBtn" class="icon-button" type="button" title="새로고침" aria-label="새로고침">↻</button>
             </div>
+            <div id="signalFilter" class="signal-filter" role="group" aria-label="후보 분류"></div>
             <div id="symbolGrid" class="symbol-strip" role="tablist" aria-label="종목 목록"></div>
           </section>
 
@@ -192,6 +191,6 @@
         </form>
       </div>
     </div>
-    <script src="/app.js?v=6"></script>
+    <script src="/app.js?v=13"></script>
   </body>
 </html>

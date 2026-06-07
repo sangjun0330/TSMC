@@ -5,6 +5,8 @@ stop_multiple = 2.0
 
 [prediction]
 policy = "conservative"
+external_features = "tsm_price_rule_output/tsm_external_daily_features.csv"
+intraday_features = "tsm_price_rule_output/tsm_intraday_daily_features.csv"
 train_days = 756
 validation_days = 63
 test_days = 126
@@ -18,6 +20,83 @@ calibration_bins = 5
 [validation]
 schema_strict = false
 baseline_score_threshold = 75.0
+
+[rule_engine]
+score_entry_threshold = 75.0
+watchlist_threshold = 65.0
+observation_threshold = 60.0
+stop_atr_multiple = 2.0
+take_profit_r_multiple = 2.0
+max_weight_normal = 0.12
+max_weight_high_vol = 0.07
+max_weight_extreme_vol = 0.04
+max_weight_below_200d = 0.03
+signal_version = "tsm_rule_v1"
+rule_family = "price_momentum_risk"
+hypothesis_id = "top10_price_momentum_rule_v1"
+decision_policy_version = "decision_policy_v1"
+
+[paper_oms]
+enabled = true
+account_equity = 100000.0
+default_order_type = "MARKET"
+time_in_force = "DAY"
+max_slippage_bps = 25.0
+kill_switch_active = false
+
+[paper_execution]
+fill_mode = "next_open_with_spread"
+half_spread_bps = 2.0
+volatility_bps_multiplier = 10.0
+participation_bps_multiplier = 5.0
+gap_penalty_bps = 3.0
+event_day_penalty_bps = 5.0
+default_adv = 1000000000.0
+
+[portfolio_risk]
+max_single_name_weight = 0.10
+max_semiconductor_weight = 0.35
+max_beta_to_spy = 1.20
+max_beta_to_smh = 0.80
+smh_beta_limit_mode = "WARN"
+max_daily_loss = -0.02
+max_weekly_loss = -0.05
+max_order_adv_pct = 0.01
+
+[universe]
+enabled = true
+default_universe_config = "config/semiconductor_universe_top10.csv"
+decision_universe_config = "config/semiconductor_universe_top10.csv"
+research_universe_config = "config/semiconductor_universe_expanded.csv"
+required_decision_symbol_count = 12
+decision_scope = "top10"
+training_scope = "universal_research_pool"
+
+[portfolio_construction]
+max_open_positions = 5
+max_total_gross_weight = 0.35
+max_single_name_weight = 0.10
+max_group_weight = 0.35
+allocation_policy = "rank_cap"
+
+[paper_feedback]
+horizon_days = 20
+lambda_mae = 0.25
+lambda_slippage = 0.01
+lambda_unfilled = 0.50
+stop_multiple = 2.0
+target_r_multiple = 2.0
+min_matured_events_for_calibration = 30
+
+[automation]
+enabled = true
+timezone = "America/New_York"
+post_close_local_time = "17:30"
+premarket_local_time = "08:45"
+open_reconciliation_local_time = "09:45"
+eod_feedback_local_time = "18:15"
+weekly_review_day = "FRI"
+monthly_promotion_review_day = 1
 
 [news]
 enabled = true

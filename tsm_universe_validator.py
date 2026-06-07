@@ -20,6 +20,8 @@ from typing import Dict, Iterable
 import numpy as np
 import pandas as pd
 
+from tsm_core.universe import load_universe_members, members_to_frame
+
 
 MIN_DAILY_ROWS = 1260
 MAX_STRICT_START_DATE = pd.Timestamp("2019-01-01")
@@ -35,11 +37,7 @@ def strip_bom_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_universe(path: Path) -> pd.DataFrame:
-    config = strip_bom_columns(pd.read_csv(path))
-    required = ["symbol", "symbol_group", "symbol_stooq", "symbol_yahoo", "data_outdir", "rule_outdir", "enriched"]
-    missing = [col for col in required if col not in config.columns]
-    if missing:
-        raise ValueError(f"universe config missing columns: {missing}")
+    config = members_to_frame(load_universe_members(path, include_disabled=True))
     config["symbol"] = config["symbol"].astype(str).str.upper()
     config["symbol_group"] = config["symbol_group"].fillna("semiconductor").astype(str)
     return config
@@ -59,11 +57,13 @@ def _truthy(series: pd.Series) -> pd.Series:
 def validate_symbol_frame(row: pd.Series, enriched: pd.DataFrame | None) -> Dict[str, object]:
     symbol = str(row.get("symbol", "")).upper()
     symbol_group = str(row.get("symbol_group", "semiconductor"))
+    market_region = str(row.get("market_region", "OVERSEAS"))
     is_etf = symbol_group.lower() in ETF_GROUPS
     if enriched is None or enriched.empty:
         return {
             "symbol": symbol,
             "symbol_group": symbol_group,
+            "market_region": market_region,
             "loaded": False,
             "strict_eligible": False,
             "eligibility_status": "MISSING_ENRICHED",
@@ -120,6 +120,7 @@ def validate_symbol_frame(row: pd.Series, enriched: pd.DataFrame | None) -> Dict
     return {
         "symbol": symbol,
         "symbol_group": symbol_group,
+        "market_region": market_region,
         "loaded": True,
         "strict_eligible": not failures,
         "eligibility_status": status,
@@ -137,6 +138,9 @@ def validate_symbol_frame(row: pd.Series, enriched: pd.DataFrame | None) -> Dict
 
 def validate_universe(config: pd.DataFrame) -> pd.DataFrame:
     rows: list[Dict[str, object]] = []
+    duplicate_symbols = set(config.loc[config["symbol"].duplicated(keep=False), "symbol"].astype(str))
+    duplicate_data_paths = set(config.loc[config["data_outdir"].astype(str).duplicated(keep=False), "data_outdir"].astype(str))
+    duplicate_rule_paths = set(config.loc[config["rule_outdir"].astype(str).duplicated(keep=False), "rule_outdir"].astype(str))
     for _, row in config.iterrows():
         path = Path(str(row.get("enriched", "")))
         if path.exists():
@@ -146,7 +150,44 @@ def validate_universe(config: pd.DataFrame) -> pd.DataFrame:
                 enriched = None
         else:
             enriched = None
-        rows.append(validate_symbol_frame(row, enriched))
+        result = validate_symbol_frame(row, enriched)
+        end_date = pd.to_datetime(result.get("end_date"), errors="coerce")
+        freshness_days = int((pd.Timestamp.utcnow().tz_localize(None).normalize() - end_date).days) if pd.notna(end_date) else np.nan
+        symbol = str(row.get("symbol", "")).upper()
+        data_path = str(row.get("data_outdir", ""))
+        rule_path = str(row.get("rule_outdir", ""))
+        path_collision = data_path in duplicate_data_paths or rule_path in duplicate_rule_paths
+        duplicate_symbol = symbol in duplicate_symbols
+        enabled = _truthy(pd.Series([row.get("enabled", True)])).iloc[0]
+        paper_enabled = _truthy(pd.Series([row.get("paper_enabled", True)])).iloc[0]
+        freshness_ok = bool(pd.notna(freshness_days) and freshness_days <= 7)
+        extra_failures = []
+        if duplicate_symbol:
+            extra_failures.append("DUPLICATE_SYMBOL")
+        if path_collision:
+            extra_failures.append("PATH_COLLISION")
+        if not enabled:
+            extra_failures.append("SYMBOL_DISABLED")
+        if not freshness_ok:
+            extra_failures.append("DATA_NOT_FRESH")
+        result.update(
+            {
+                "enabled": bool(enabled),
+                "paper_enabled": bool(paper_enabled),
+                "duplicate_symbol": bool(duplicate_symbol),
+                "path_collision": bool(path_collision),
+                "freshness_days": freshness_days,
+                "freshness_ok": bool(freshness_ok),
+                "paper_eligible": bool(enabled and paper_enabled and not duplicate_symbol and not path_collision and freshness_ok and result.get("loaded", False)),
+            }
+        )
+        if extra_failures:
+            base = str(result.get("failure_reasons", "PASS"))
+            result["failure_reasons"] = "|".join([reason for reason in [base if base != "PASS" else "", *extra_failures] if reason])
+            if result.get("eligibility_status") == "STRICT_TRAINING_ELIGIBLE":
+                result["eligibility_status"] = "RESEARCH_ONLY_OPERATIONAL_CHECK_FAILED"
+            result["strict_eligible"] = False
+        rows.append(result)
     return pd.DataFrame(rows)
 
 

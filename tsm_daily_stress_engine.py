@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Daily-data stress and scenario engine for TSM.
+Daily and intraday-aware stress and scenario engine for TSM.
 
-This stays strictly at daily resolution. It does not model intraday order paths.
 It estimates how current risk sizing would behave under historical drawdowns,
-daily return shocks, and strategy equity drawdowns.
+daily return shocks, realized intraday volatility shocks, and strategy equity
+drawdowns.
 
 Outputs:
 - tsm_daily_stress_scenarios.csv
@@ -148,6 +148,69 @@ def build_atr_scenarios(signals: pd.DataFrame, latest_close: float, final_weight
     return rows
 
 
+def build_intraday_scenarios(intraday_features: pd.DataFrame, latest_close: float, final_weight: float) -> List[Dict]:
+    if intraday_features.empty:
+        return []
+    frame = intraday_features.copy()
+    if "symbol" in frame.columns:
+        frame = frame[frame["symbol"].astype(str).str.upper().eq("TSM")]
+    if "date" in frame.columns:
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.sort_values("date")
+    if frame.empty:
+        return []
+    latest = frame.iloc[-1]
+    rows: list[dict] = []
+    vol = as_float(latest.get("m5_realized_vol_20bar_ann"), as_float(latest.get("model_minute_realized_vol_20bar_ann"), np.nan))
+    realized_range = as_float(latest.get("m1_realized_range_pct"), as_float(latest.get("execution_minute_realized_range_pct"), np.nan))
+    coverage = as_float(latest.get("timeframe_coverage_score"), np.nan)
+    if pd.notna(vol):
+        for multiple in [1.0, 2.0]:
+            shock = -abs(vol) / math.sqrt(252.0) * multiple
+            rows.append(
+                {
+                    "scenario_type": "intraday_realized_vol_shock",
+                    "scenario_name": f"minus_{multiple:g}x_intraday_realized_daily_vol",
+                    "source": "tsm_intraday_daily_features",
+                    "shock_return_pct": pct(shock),
+                    "latest_close": latest_close,
+                    "implied_price": latest_close * (1.0 + shock),
+                    "final_recommended_max_weight_pct": pct(final_weight),
+                    "estimated_portfolio_impact_pct": pct(final_weight * shock),
+                    "notes": f"coverage_score={coverage}",
+                }
+            )
+    if pd.notna(realized_range):
+        shock = -abs(realized_range)
+        rows.append(
+            {
+                "scenario_type": "gap_plus_intraday_range",
+                "scenario_name": "gap_down_plus_latest_1m_range",
+                "source": "tsm_intraday_daily_features",
+                "shock_return_pct": pct(shock),
+                "latest_close": latest_close,
+                "implied_price": latest_close * (1.0 + shock),
+                "final_recommended_max_weight_pct": pct(final_weight),
+                "estimated_portfolio_impact_pct": pct(final_weight * shock),
+                "notes": "Execution path stress uses 1m realized range when available.",
+            }
+        )
+    rows.append(
+        {
+            "scenario_type": "first_touch_ambiguity_stress",
+            "scenario_name": "same_day_stop_target_order_uncertain",
+            "source": "paper_oms_path_policy",
+            "shock_return_pct": np.nan,
+            "latest_close": latest_close,
+            "implied_price": np.nan,
+            "final_recommended_max_weight_pct": pct(final_weight),
+            "estimated_portfolio_impact_pct": np.nan,
+            "notes": "When 1m replay is missing, paper OMS records AMBIGUOUS_DAILY_PATH and applies conservative daily fallback.",
+        }
+    )
+    return rows
+
+
 def build_strategy_stress_summary(curves: pd.DataFrame) -> pd.DataFrame:
     require_columns(
         curves,
@@ -216,13 +279,13 @@ def write_report(outdir: Path, scenarios: pd.DataFrame, strategy_stress: pd.Data
     strategy = strategy_stress.sort_values("max_drawdown_pct")
 
     lines = [
-        "# TSMC Daily Stress Report",
+        "# Top10 Daily Stress Report",
         "",
         "## Latest Stress Snapshot",
         f"- Stress status: {snapshot_map.get('stress_status', 'NA')}",
         f"- Worst current-weight scenario: {snapshot_map.get('worst_current_weight_scenario', 'NA')}",
         f"- Estimated portfolio impact: {fmt_pct(as_float(snapshot_map.get('worst_current_weight_portfolio_impact_pct')))}",
-        f"- Implied TSMC price: ${as_float(snapshot_map.get('worst_current_weight_implied_price')):,.2f}",
+        f"- Implied reference price: ${as_float(snapshot_map.get('worst_current_weight_implied_price')):,.2f}",
         "",
         "## Worst Current-Weight Scenarios",
         "",
@@ -262,6 +325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-policy", default="tsm_price_rule_output/tsm_risk_policy_daily.csv")
     parser.add_argument("--drawdowns", default="tsm_price_rule_output/tsm_drawdown_episodes.csv")
     parser.add_argument("--equity-curves", default="tsm_price_rule_output/tsm_backtest_equity_curves.csv")
+    parser.add_argument("--intraday-features", default="tsm_price_rule_output/tsm_intraday_daily_features.csv")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
     return parser.parse_args()
 
@@ -279,6 +343,7 @@ def main() -> None:
     risk_policy = load_csv(Path(args.risk_policy), required_cols=["date", "final_recommended_max_weight"], parse_dates=["date"])
     drawdowns = load_csv(Path(args.drawdowns)) if Path(args.drawdowns).exists() else pd.DataFrame()
     curves = load_csv(Path(args.equity_curves), parse_dates=["date"])
+    intraday_features = load_csv(Path(args.intraday_features), parse_dates=["date"]) if Path(args.intraday_features).exists() else pd.DataFrame()
 
     latest = signals.iloc[-1]
     latest_close = as_float(latest["close"])
@@ -288,6 +353,7 @@ def main() -> None:
     rows.extend(build_daily_shock_scenarios(signals, latest_close, final_weight))
     rows.extend(build_drawdown_scenarios(drawdowns, latest_close, final_weight))
     rows.extend(build_atr_scenarios(signals, latest_close, final_weight))
+    rows.extend(build_intraday_scenarios(intraday_features, latest_close, final_weight))
     scenarios = pd.DataFrame(rows)
     strategy_stress = build_strategy_stress_summary(curves)
     snapshot = build_latest_stress_snapshot(scenarios, strategy_stress)

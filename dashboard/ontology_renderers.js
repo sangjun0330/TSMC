@@ -13,7 +13,7 @@
     container.innerHTML = `
       <section class="ontology-command-hero ${escapeAttr(tone)}">
         <div class="ontology-hero-copy">
-          <span>TSM Ontology Command Center · ${escapeHtml(ontology.asOf || "없음")}</span>
+          <span>${escapeHtml(ontology.symbol ? `${ontology.symbol} Object${ontology.groupLabel ? ` · ${ontology.groupLabel}` : ""}` : "Top10 Ontology Command Center")} · ${escapeHtml(ontology.asOf || "없음")}</span>
           <strong>${escapeHtml(permission.title || "상태 확인")}</strong>
           <p>${escapeHtml(heroSentence(ontology))}</p>
         </div>
@@ -194,7 +194,7 @@
       ["현재 결론", permission.title || "상태 확인"],
       ["20D 돌파 기준", action.targetPrice20d || "없음"],
       ["60D 돌파 기준", action.targetPrice60d || "없음"],
-      ["2ATR 손절가", fmtCurrency(action.stopPrice)],
+      ["2ATR 손절가", action.stopPriceDisplay || fmtCurrency(action.stopPrice)],
       ["최대 비중", fmtPct(action.maxWeight, 2)],
       ["Paper Action", permission.paper || "NOT_READY"],
       ["Live Action", permission.live || "LIVE_DISABLED_BY_DESIGN"],

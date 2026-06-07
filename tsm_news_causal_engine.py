@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Direct-web news and cause matching engine for the TSM research pipeline.
+Direct-web news and cause matching engine for the semiconductor research pipeline.
 
 This module intentionally avoids paid/free news APIs and LLM APIs. It collects
 metadata from public web/RSS pages, keeps only short snippets, maps articles to
@@ -15,7 +15,6 @@ import argparse
 import hashlib
 import html
 import re
-import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -40,29 +39,33 @@ except Exception:  # pragma: no cover - optional fallback
 
 TSMC_PRESS_ARCHIVE_URL = "https://pr.tsmc.com/english/news-archives"
 TSMC_PRESS_LATEST_URL = "https://pr.tsmc.com/english"
-YAHOO_FINANCE_TSM_URL = "https://finance.yahoo.com/quote/TSM/"
+YAHOO_FINANCE_QUOTE_URLS = {
+    "yahoo_finance_tsm": "https://finance.yahoo.com/quote/TSM/",
+    "yahoo_finance_samsung": "https://finance.yahoo.com/quote/005930.KS/",
+    "yahoo_finance_sk_hynix": "https://finance.yahoo.com/quote/000660.KS/",
+}
 GOOGLE_NEWS_RSS_URL = (
     "https://news.google.com/rss/search?q="
-    + quote_plus('TSMC OR "Taiwan Semiconductor" OR "TSM stock" semiconductor')
+    + quote_plus('TSMC OR "Taiwan Semiconductor" OR "TSM stock" OR "Samsung Electronics" OR "005930.KS" OR "SK hynix" OR "SK Hynix" OR "000660.KS" semiconductor')
     + "&hl=en-US&gl=US&ceid=US:en"
 )
-DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; TSM-News-Causal-Research/1.0)"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; Semiconductor-News-Causal-Research/1.0)"
 MARKET_CLOSE = dt_time(16, 0)
 
 
 CAUSE_KEYWORDS: dict[str, list[str]] = {
-    "earnings_results": ["earnings", "eps", "profit", "net income", "quarter results", "quarterly results", "margin"],
-    "guidance": ["guidance", "outlook", "forecast", "revenue view", "retains", "raises forecast", "cuts forecast"],
+    "earnings_results": ["earnings", "eps", "profit", "net income", "operating profit", "quarter results", "quarterly results", "preliminary earnings", "margin"],
+    "guidance": ["guidance", "outlook", "forecast", "revenue view", "retains", "raises forecast", "cuts forecast", "memory outlook"],
     "monthly_revenue": ["monthly revenue", "revenue report", "november revenue", "december revenue", "january revenue", "february revenue", "march revenue", "april revenue", "may revenue", "june revenue", "july revenue", "august revenue", "september revenue", "october revenue"],
     "capex_fab_expansion": ["fab", "plant", "factory", "capacity", "capex", "expansion", "arizona", "japan", "germany", "new facility"],
-    "ai_hpc_demand": ["ai demand", "ai chip", "ai chips", "artificial intelligence demand", "hpc", "nvidia", "advanced packaging", "chip demand", "accelerator"],
-    "customer_supply_chain": ["apple", "amd", "nvidia", "qualcomm", "broadcom", "sony", "customer", "supply chain", "outsourcing", "intel delay", "foundry", "partnership"],
+    "ai_hpc_demand": ["ai demand", "ai chip", "ai chips", "artificial intelligence demand", "hpc", "hbm", "high bandwidth memory", "dram", "nvidia", "advanced packaging", "chip demand", "accelerator"],
+    "customer_supply_chain": ["apple", "amd", "nvidia", "qualcomm", "broadcom", "sony", "samsung", "samsung electronics", "sk hynix", "hynix", "customer", "supply chain", "outsourcing", "intel delay", "foundry", "partnership"],
     "regulation_export_controls": ["export control", "bis", "commerce department", "sanction", "regulation", "chip curbs", "advanced computing"],
     "geopolitics_taiwan": ["china", "geopolitical", "geopolitics", "strait", "military", "tariff", "invasion", "war", "tension", "national security"],
     "operational_disruption": ["earthquake", "disruption", "virus", "incident", "shutdown", "power outage", "evacuation", "production halt"],
     "analyst_rating_target": ["analyst", "rating", "price target", "upgrade", "downgrade", "initiates", "maintains"],
     "dividend_capital_return": ["dividend", "buyback", "cash distribution", "capital return", "board of directors"],
-    "peer_sector_move": ["semiconductor stocks", "chip stocks", "soxx", "smh", "sector", "samsung", "micron", "asml"],
+    "peer_sector_move": ["semiconductor stocks", "chip stocks", "soxx", "smh", "sector", "samsung", "samsung electronics", "sk hynix", "hynix", "micron", "asml"],
     "macro_rates_fx": ["rate", "inflation", "fed", "dollar", "fx", "yen", "treasury", "macro"],
     "technical_market_move": [
         "why is",
@@ -202,7 +205,15 @@ CONCRETE_EVENT_HINTS = [
     "demand",
     "orders",
     "hpc",
+    "hbm",
+    "high bandwidth memory",
+    "dram",
+    "memory chip",
     "nvidia",
+    "samsung",
+    "samsung electronics",
+    "sk hynix",
+    "hynix",
     "advanced packaging",
     "accelerator",
     "partnership",
@@ -472,12 +483,17 @@ def parse_yahoo_finance_html(html_text: str, page_url: str, discovered_at: str) 
     parser.feed(html_text)
     rows = []
     seen: set[str] = set()
-    keywords = re.compile(r"\b(tsmc|taiwan semiconductor|tsm|semiconductor|chip|ai)\b", re.I)
+    keywords = re.compile(
+        r"\b(tsmc|taiwan semiconductor|tsm|samsung electronics|samsung|sk hynix|hynix|005930|000660|semiconductor|chip|ai|hbm|dram|memory)\b",
+        re.I,
+    )
     article_url = re.compile(r"(/news/|/m/|fool\.com|investors\.com|benzinga\.com|zacks\.com|reuters\.com|bloomberg\.com|cnbc\.com)", re.I)
     generic_titles = {
         "more about taiwan semiconductor manufacturing company limited",
         "tsm taiwan semiconductor manufacturing company limited",
         "taiwan semiconductor manufacturing company limited",
+        "005930.ks samsung electronics co., ltd.",
+        "000660.ks sk hynix inc.",
     }
     discovered_ts = safe_to_datetime(discovered_at) or pd.Timestamp.now(tz="UTC")
     for anchor in parser.anchors:
@@ -553,7 +569,9 @@ def collect_articles(
         "tsmc_press": ("tsmc_archive.html", TSMC_PRESS_ARCHIVE_URL, parse_tsmc_archive_html),
         "tsmc_latest": ("tsmc_latest.html", TSMC_PRESS_LATEST_URL, parse_tsmc_latest_html),
         "google_news_rss": ("google_news_rss.xml", GOOGLE_NEWS_RSS_URL, parse_google_news_rss),
-        "yahoo_finance": ("yahoo_finance.html", YAHOO_FINANCE_TSM_URL, parse_yahoo_finance_html),
+        "yahoo_finance_tsm": ("yahoo_finance.html", YAHOO_FINANCE_QUOTE_URLS["yahoo_finance_tsm"], parse_yahoo_finance_html),
+        "yahoo_finance_samsung": ("yahoo_finance_samsung.html", YAHOO_FINANCE_QUOTE_URLS["yahoo_finance_samsung"], parse_yahoo_finance_html),
+        "yahoo_finance_sk_hynix": ("yahoo_finance_sk_hynix.html", YAHOO_FINANCE_QUOTE_URLS["yahoo_finance_sk_hynix"], parse_yahoo_finance_html),
     }
 
     for source in sources:
@@ -564,6 +582,8 @@ def collect_articles(
             continue
         if source == "tsmc_press":
             jobs = ["tsmc_press", "tsmc_latest"]
+        elif source == "yahoo_finance":
+            jobs = ["yahoo_finance_tsm", "yahoo_finance_samsung", "yahoo_finance_sk_hynix"]
         else:
             jobs = [source]
         for job in jobs:
@@ -690,6 +710,10 @@ def relevance_score(title: str, snippet: str = "") -> int:
         return 25
     if re.search(r"\btsm\b", text):
         return 22
+    if "samsung electronics" in text or "005930" in text:
+        return 24
+    if "sk hynix" in text or "hynix" in text or "000660" in text:
+        return 24
     if "semiconductor" in text or "chip" in text:
         return 14
     return 6
@@ -1018,7 +1042,7 @@ def default_daily_news(prices: pd.DataFrame, coverage: str) -> pd.DataFrame:
 
 def write_report(path: Path, matches: pd.DataFrame, articles: pd.DataFrame, events: pd.DataFrame, clusters: pd.DataFrame, warnings: list[str], coverage: str) -> None:
     lines = [
-        "# TSM News Causal Event Report",
+        "# Semiconductor News Causal Event Report",
         "",
         f"- Coverage status: {coverage}",
         f"- Articles collected: {len(articles)}",
@@ -1063,7 +1087,7 @@ def parse_sources(value: str) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect direct-web news metadata and match likely causes to TSM price moves.")
+    parser = argparse.ArgumentParser(description="Collect direct-web news metadata and match likely causes to semiconductor price moves.")
     parser.add_argument("--enriched", default="output/tsm_daily_10y_enriched.csv")
     parser.add_argument("--events", default="tsm_events_seed.csv")
     parser.add_argument("--start", default="2016-05-12")

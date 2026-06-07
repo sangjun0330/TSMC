@@ -17,6 +17,7 @@ from tsm_news_causal_engine import (
     parse_google_news_rss,
     parse_tsmc_archive_html,
     preserve_existing_coverage_for_unchanged_dates,
+    relevance_score,
     short_snippet,
 )
 
@@ -53,6 +54,12 @@ class NewsCausalEngineTests(unittest.TestCase):
         self.assertEqual(classify_cause("Taiwan Semiconductor CEO hints at the next move in AI stocks"), "technical_market_move")
         self.assertEqual(classify_cause("Billionaire is loading up on Taiwan Semiconductor despite geopolitical risks"), "technical_market_move")
         self.assertEqual(classify_cause("China Taiwan Strait military tension hits chip stocks"), "geopolitics_taiwan")
+        self.assertEqual(classify_cause("SK hynix raises HBM memory outlook on AI demand"), "guidance")
+        self.assertEqual(classify_cause("Samsung Electronics preliminary earnings beat on memory chip demand"), "earnings_results")
+
+    def test_korean_memory_names_are_high_relevance(self):
+        self.assertGreaterEqual(relevance_score("Samsung Electronics 005930.KS shares rise on HBM demand"), 24)
+        self.assertGreaterEqual(relevance_score("SK hynix 000660.KS profit jumps on DRAM demand"), 24)
 
     def test_after_close_news_maps_to_next_trading_day(self):
         events = pd.DataFrame(

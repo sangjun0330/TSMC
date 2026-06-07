@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Desktop launcher for the TSMC dashboard.
+Desktop launcher for the Top10+2 dashboard.
 
 This keeps the existing HTTP dashboard as the source of truth, starts it on a
 loopback-only port, and displays it inside a native macOS WebKit window via
@@ -21,12 +21,12 @@ from pathlib import Path
 import tsm_dashboard
 
 
-APP_TITLE = "TSMC 대시보드"
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "TSMC Dashboard"
+APP_TITLE = "Top10+2 대시보드"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "Top10+2 Dashboard"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the TSMC dashboard in a desktop window.")
+    parser = argparse.ArgumentParser(description="Run the Top10+2 dashboard in a desktop window.")
     parser.add_argument("--host", default="127.0.0.1", help="Loopback host for the embedded dashboard server.")
     parser.add_argument("--port", type=int, default=8765, help="Preferred embedded dashboard server port.")
     parser.add_argument("--strict-port", action="store_true", help="Fail instead of trying the next port when busy.")
@@ -80,7 +80,7 @@ def main() -> int:
         url = f"http://{args.host}:{port}"
         thread = threading.Thread(target=server.serve_forever, name="tsm-dashboard-http", daemon=True)
         thread.start()
-        print(f"TSMC dashboard fallback server running at {url}")
+        print(f"Top10+2 dashboard fallback server running at {url}")
         try:
             webbrowser.open(url)
             block_until_interrupted()
@@ -93,7 +93,7 @@ def main() -> int:
     url = f"http://{args.host}:{port}"
     thread = threading.Thread(target=server.serve_forever, name="tsm-dashboard-http", daemon=True)
     thread.start()
-    print(f"TSMC dashboard desktop app running with internal server at {url}")
+    print(f"Top10+2 dashboard desktop app running with internal server at {url}")
 
     APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
     try:

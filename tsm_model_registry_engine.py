@@ -34,7 +34,7 @@ def strip_bom_columns(df: pd.DataFrame) -> pd.DataFrame:
 def read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
-    return strip_bom_columns(pd.read_csv(path))
+    return strip_bom_columns(pd.read_csv(path, low_memory=False))
 
 
 def file_sha256(path: Path) -> str:
@@ -75,8 +75,26 @@ def require_columns(df: pd.DataFrame, required: Iterable[str], label: str) -> No
 
 
 def registry_id(row: pd.Series) -> str:
-    basis = f"{row.get('candidate_scope')}|{row.get('horizon_days')}|{row.get('model_name')}|{row.get('generated_at_utc')}"
+    basis = (
+        f"{row.get('candidate_scope')}|{row.get('horizon_days')}|{row.get('model_name')}|"
+        f"{row.get('split', '')}|{row.get('evaluation_scope', '')}|{row.get('validation_design', '')}|"
+        f"{row.get('champion_scope', '')}|{row.get('generated_at_utc')}"
+    )
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def to_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def key_value_frame_to_dict(frame: pd.DataFrame) -> dict[str, object]:
+    if frame.empty or not {"field", "value"}.issubset(frame.columns):
+        return {}
+    return dict(zip(frame["field"].astype(str), frame["value"]))
 
 
 def selected_feature_counts(feature_selection: pd.DataFrame) -> pd.DataFrame:
@@ -228,12 +246,16 @@ def build_pooled_registry(
     pooled_latest: pd.DataFrame,
     pooled_schema: pd.DataFrame,
     pooled_features: pd.DataFrame,
+    model_gate_snapshot: pd.DataFrame,
     source_hashes: Dict[str, str],
 ) -> pd.DataFrame:
     if pooled_comparison.empty:
         return pd.DataFrame()
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    latest = dict(zip(pooled_latest["field"], pooled_latest["value"])) if not pooled_latest.empty and {"field", "value"}.issubset(pooled_latest.columns) else {}
+    latest = key_value_frame_to_dict(pooled_latest)
+    gate = key_value_frame_to_dict(model_gate_snapshot)
+    pooled_system_quality_pass = to_bool(gate.get("pooled_system_quality_pass", False))
+    pooled_prediction_decision_support = to_bool(gate.get("pooled_prediction_decision_support", False))
     dependency_version_text = dependency_versions()
     feature_count = pooled_feature_count(pooled_schema, pooled_features)
     frame = pooled_comparison[pooled_comparison["split"].astype(str).eq("combined_test_holdout")].copy()
@@ -241,9 +263,19 @@ def build_pooled_registry(
         frame = pooled_comparison.copy()
     rows = []
     for _, row in frame.iterrows():
-        is_champion = str(row.get("is_champion", "False")).lower() in {"true", "1", "yes"}
-        model_quality_pass = str(latest.get("model_quality_pass", "False")).lower() in {"true", "1", "yes"} if is_champion else False
-        latest_signal_pass = str(latest.get("latest_signal_pass", "False")).lower() in {"true", "1", "yes"} if is_champion else False
+        is_champion = to_bool(row.get("is_champion", False))
+        model_quality_pass = to_bool(latest.get("model_quality_pass", False)) if is_champion else False
+        latest_signal_pass = to_bool(latest.get("latest_signal_pass", False)) if is_champion else False
+        diagnostic_champion = bool(is_champion)
+        promotable_model = bool(is_champion and pooled_system_quality_pass)
+        decision_support_allowed = bool(is_champion and pooled_prediction_decision_support)
+        model_policy = (
+            "POOLED_PROMOTABLE_CHAMPION"
+            if promotable_model
+            else "POOLED_DIAGNOSTIC_CHAMPION_BLOCKED"
+            if diagnostic_champion
+            else "POOLED_CANDIDATE"
+        )
         out = row.to_dict()
         out.update(
             {
@@ -251,22 +283,27 @@ def build_pooled_registry(
                 "candidate_scope": "pooled_trade_ready_entry",
                 "champion_scope": "pooled_trade_ready_20d",
                 "horizon_days": 20,
-                "model_policy": "POOLED_CHAMPION" if is_champion else "POOLED_CANDIDATE",
-                "prediction_quality_pass": bool(model_quality_pass),
+                "model_policy": model_policy,
+                "diagnostic_champion": diagnostic_champion,
+                "promotable_model": promotable_model,
+                "decision_support_allowed": decision_support_allowed,
+                "prediction_quality_pass": promotable_model,
                 "model_quality_pass": bool(model_quality_pass),
+                "pooled_system_quality_pass": bool(is_champion and pooled_system_quality_pass),
                 "oos_event_count": row.get("event_count", np.nan),
                 "selected_oos_event_count": row.get("selected_event_count", np.nan),
                 "expectancy_improvement_pct": row.get("selected_minus_all_pct", np.nan),
                 "pr_auc": row.get("average_precision", np.nan),
-                "promotion_status": "MODEL_QUALITY_PASS" if model_quality_pass else "BLOCKED",
+                "promotion_status": "PROMOTABLE" if promotable_model else "BLOCKED",
                 "latest_signal_pass": bool(latest_signal_pass),
-                "pooled_decision_support_allowed": str(latest.get("decision_support_allowed", "False")).lower() in {"true", "1", "yes"} if is_champion else False,
+                "pooled_decision_support_allowed": decision_support_allowed,
                 "quality_block_reasons": latest.get("model_quality_block_reasons", "") if is_champion else "NOT_CHAMPION",
                 "source_hash_pooled_comparison": source_hashes.get("pooled_comparison", ""),
                 "source_hash_pooled_oos": source_hashes.get("pooled_oos_predictions", ""),
                 "source_hash_pooled_threshold_policy": source_hashes.get("pooled_threshold_policy", ""),
                 "source_hash_pooled_quality": source_hashes.get("pooled_quality", ""),
                 "source_hash_pooled_latest": source_hashes.get("pooled_latest", ""),
+                "source_hash_model_gate_snapshot": source_hashes.get("model_gate_snapshot", ""),
                 "source_hash_pooled_schema": source_hashes.get("pooled_schema", ""),
                 "source_hash_pooled_feature_matrix": source_hashes.get("pooled_feature_matrix", ""),
                 "dependency_versions": dependency_version_text,
@@ -289,27 +326,36 @@ def build_pooled_registry(
 
 
 def write_report(outdir: Path, registry: pd.DataFrame, experiment_log: pd.DataFrame) -> None:
+    def display_value(row: pd.Series, column: str, default: object = False) -> object:
+        value = row.get(column, default)
+        if pd.isna(value):
+            return default
+        return value
+
     lines = [
-        "# TSMC Prediction Model Registry Report",
+        "# Top10 Prediction Model Registry Report",
         "",
         f"- Registered model rows: {len(registry)}",
         f"- Experiment log rows: {len(experiment_log)}",
         "",
         "## Current Registry",
         "",
-        "| Scope | Horizon | Model | Policy | Pass | OOS | Brier Improvement | ECE | Overlay Mean Return Delta | Block Reasons |",
-        "|---|---:|---|---|---:|---:|---:|---:|---:|---|",
+        "| Scope | Horizon | Model | Policy | Promotion | Promotable | Diagnostic | Model Pass | Latest Pass | Decision Support | OOS | Brier Improvement | ECE | Block Reasons |",
+        "|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     if registry.empty:
-        lines.append("| NA | NA | NA | NA | False | 0 | NA | NA | NA | missing |")
+        lines.append("| NA | NA | NA | NA | BLOCKED | False | False | False | False | False | 0 | NA | NA | missing |")
     else:
         for _, row in registry.sort_values(["candidate_scope", "horizon_days", "rank_score"], ascending=[True, True, False]).iterrows():
             oos_event_count = pd.to_numeric(pd.Series([row.get("oos_event_count", 0)]), errors="coerce").fillna(0).iloc[0]
             lines.append(
                 f"| {row.get('candidate_scope')} | {int(row.get('horizon_days'))} | {row.get('model_name')} | {row.get('model_policy')} | "
-                f"{row.get('prediction_quality_pass')} | {int(oos_event_count)} | "
+                f"{display_value(row, 'promotion_status', 'BLOCKED')} | {display_value(row, 'promotable_model', display_value(row, 'prediction_quality_pass', False))} | "
+                f"{display_value(row, 'diagnostic_champion', False)} | {display_value(row, 'model_quality_pass', display_value(row, 'prediction_quality_pass', False))} | "
+                f"{display_value(row, 'latest_signal_pass', False)} | {display_value(row, 'pooled_decision_support_allowed', display_value(row, 'decision_support_allowed', False))} | "
+                f"{int(oos_event_count)} | "
                 f"{row.get('brier_improvement_pct', np.nan):.2f}% | {row.get('ece', np.nan):.4f} | "
-                f"{row.get('overlay_mean_return_improvement_pct', np.nan):.2f}% | {row.get('quality_block_reasons', '')} |"
+                f"{row.get('quality_block_reasons', '')} |"
             )
     lines.extend(["", "This report is research tooling, not investment advice."])
     (outdir / "tsm_prediction_model_registry_report.md").write_text("\n".join(lines), encoding="utf-8")
@@ -336,6 +382,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooled-threshold-policy", default="tsm_price_rule_output/tsm_pooled_model_threshold_policy.csv")
     parser.add_argument("--pooled-quality", default="tsm_price_rule_output/tsm_pooled_model_quality_checks.csv")
     parser.add_argument("--pooled-latest", default="tsm_price_rule_output/tsm_pooled_latest_prediction_overlay.csv")
+    parser.add_argument("--model-gate-snapshot", default="tsm_price_rule_output/tsm_model_gate_snapshot.csv")
     parser.add_argument("--pooled-schema", default="tsm_price_rule_output/tsm_prediction_pooled_schema.csv")
     parser.add_argument("--pooled-feature-matrix", default="tsm_price_rule_output/tsm_prediction_pooled_feature_matrix.csv")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
@@ -361,6 +408,7 @@ def main() -> None:
     pooled_threshold_path = Path(args.pooled_threshold_policy)
     pooled_quality_path = Path(args.pooled_quality)
     pooled_latest_path = Path(args.pooled_latest)
+    model_gate_snapshot_path = Path(args.model_gate_snapshot)
     pooled_schema_path = Path(args.pooled_schema)
     pooled_feature_matrix_path = Path(args.pooled_feature_matrix)
     registry = build_registry(
@@ -387,12 +435,14 @@ def main() -> None:
         read_csv(pooled_latest_path),
         read_csv(pooled_schema_path),
         read_csv(pooled_feature_matrix_path),
+        read_csv(model_gate_snapshot_path),
         {
             "pooled_comparison": file_sha256(pooled_comparison_path),
             "pooled_oos_predictions": file_sha256(pooled_oos_path),
             "pooled_threshold_policy": file_sha256(pooled_threshold_path),
             "pooled_quality": file_sha256(pooled_quality_path),
             "pooled_latest": file_sha256(pooled_latest_path),
+            "model_gate_snapshot": file_sha256(model_gate_snapshot_path),
             "pooled_schema": file_sha256(pooled_schema_path),
             "pooled_feature_matrix": file_sha256(pooled_feature_matrix_path),
         },

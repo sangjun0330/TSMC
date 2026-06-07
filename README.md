@@ -1,6 +1,6 @@
-# TSMC / TSM 일봉 룰 후보 Meta-Labeling + Risk Sizing 패키지
+# Top10+2 반도체 멀티 타임프레임 Meta-Labeling + Risk Sizing 패키지
 
-이 패키지는 TSMC ADR인 **TSM**의 일봉 데이터를 내려받아 가격/변동성/추세/유동성/상대강도 지표를 만들고, causal rule engine이 만든 진입 후보를 triple-barrier meta-labeling, 확률 보정, expected-R, risk sizing으로 검증합니다. 목표는 주가 자체를 직접 예측하는 것이 아니라 “룰상 후보가 실거래 기대값을 갖는가”를 보수적으로 판단하는 것입니다.
+이 패키지는 `config/semiconductor_universe_top10.csv`의 Top10+2 운영 종목을 기준으로 두고, 일봉/시간봉/5분봉/1분봉 데이터에서 가격/변동성/추세/유동성/상대강도 지표를 만듭니다. 현재 운영 대상은 기존 Top10에 삼성전자(`005930.KS`)와 SK hynix(`000660.KS`)를 추가한 12종목입니다. Universal research pool은 학습·보정·cross-sectional 진단에만 사용하고, risk/intent/paper execution/dashboard 판단 후보는 운영 유니버스로 필터링합니다. 목표는 주가 자체를 직접 예측하는 것이 아니라 “룰상 후보가 실거래 기대값을 갖는가”를 보수적으로 판단하는 것입니다.
 
 ## 1. 설치
 
@@ -24,7 +24,7 @@ macOS `.app` 번들을 다시 만들고 실행하려면 다음 명령을 사용�
 ./script/build_and_run.sh
 ```
 
-이 명령은 `dist/TSMC Dashboard.app`을 만들고 실행합니다. 이후에는 Finder에서 해당 앱을 더블클릭하면 됩니다.
+이 명령은 `dist/Top10 Dashboard.app`을 만들고 실행합니다. 이후에는 Finder에서 해당 앱을 더블클릭하면 됩니다.
 
 로컬 웹 서버를 직접 열어 디버깅해야 할 때만 다음 명령을 사용합니다.
 
@@ -68,28 +68,39 @@ python3 run_daily_update.py \
   --rule-outdir tsm_price_rule_output
 ```
 
-시간봉 소스 점검과 공개로 확보 가능한 시간봉 CSV를 만들려면 다음처럼 실행합니다.
+Top10+2 전체의 시간봉 소스 점검과 공개로 확보 가능한 시간봉 CSV를 만들려면 다음처럼 실행합니다.
 
 ```bash
-.venv/bin/python tsm_hourly_quant_pipeline.py \
+.venv/bin/python run_universe_market_data_update.py \
+  --universe-config config/semiconductor_universe_top10.csv \
+  --bar-scope hourly \
   --start 2016-05-12 \
   --end 2026-05-12 \
-  --outdir output
+  --outdir output \
+  --provider auto \
+  --skip-charts \
+  --continue-on-error
 ```
 
-주의: Yahoo 공개 chart API는 1시간봉 요청이 최근 730일 안에 있어야 하므로, 인증 없이 2016년부터의 완전한 10년 시간봉은 내려받을 수 없습니다. 스크립트는 `output/tsm_hourly_10y_source_audit.csv`에 이 제한과 대체 공급처를 기록하고, 공개로 확보 가능한 최대 범위를 `output/tsm_hourly_available_raw.csv`와 `output/tsm_hourly_available_enriched.csv`로 저장합니다. `POLYGON_API_KEY`가 환경변수에 있으면 `--provider auto`가 Polygon 1시간봉을 먼저 시도합니다.
+주의: Yahoo 공개 chart API는 1시간봉 요청이 최근 730일 안에 있어야 하므로, 인증 없이 2016년부터의 완전한 10년 시간봉은 내려받을 수 없습니다. 스크립트는 `output/tsm_universe_intraday_update_manifest.csv`와 `output/tsm_universe_market_data_latest.csv`에 이 제한과 종목별 커버리지를 기록하고, 공개로 확보 가능한 최대 범위를 `output/universe/<SYMBOL>/tsm_hourly_available_raw.csv`와 `output/universe/<SYMBOL>/tsm_hourly_available_enriched.csv`로 저장합니다. `POLYGON_API_KEY`가 환경변수에 있으면 `--provider auto`가 Polygon 1시간봉을 먼저 시도합니다.
 
-분봉 소스 점검과 공개로 확보 가능한 1분봉 CSV를 만들려면 다음처럼 실행합니다.
+Top10+2 전체의 5분봉 모델 피처와 1분봉 실행/슬리피지 확인 CSV를 만들려면 다음처럼 실행합니다.
 
 ```bash
-.venv/bin/python tsm_intraday_quant_pipeline.py \
-  --interval 1m \
+.venv/bin/python run_universe_market_data_update.py \
+  --universe-config config/semiconductor_universe_top10.csv \
+  --bar-scope minute \
+  --model-minute-interval 5m \
+  --execution-minute-interval 1m \
   --start 2016-05-12 \
   --end 2026-05-12 \
-  --outdir output
+  --outdir output \
+  --provider auto \
+  --skip-charts \
+  --continue-on-error
 ```
 
-주의: Yahoo 공개 chart API는 `1m`은 약 8일, `2m/5m/15m/30m`은 최근 60일, `60m/1h`는 최근 730일 제한을 반환합니다. 이 스크립트는 `output/tsm_minute_10y_source_audit.csv`에 실제 10년 요청 제한과 대체 공급처를 기록하고, 공개로 확보 가능한 최대 1분봉 범위를 일봉 raw와 같은 컬럼 순서로 저장합니다.
+주의: Yahoo 공개 chart API는 `1m`은 약 8일, `2m/5m/15m/30m`은 최근 60일, `60m/1h`는 최근 730일 제한을 반환합니다. 이 스크립트는 Top10 각 종목의 `output/universe/<SYMBOL>/tsm_5min_available_*.csv`와 `output/universe/<SYMBOL>/tsm_minute_available_*.csv`를 만들고, coverage 부족은 품질/게이트 진단에 반영합니다.
 
 각 단계를 수동으로 실행하려면 다음 순서를 사용합니다.
 
@@ -138,11 +149,26 @@ python3 tsm_prediction_engine.py \
   --enriched output/tsm_daily_10y_enriched.csv \
   --outdir tsm_price_rule_output
 
+python3 tsm_next_day_up_model_engine.py \
+  --signals tsm_price_rule_output/tsm_daily_algorithmic_signals.csv \
+  --trade-log tsm_price_rule_output/tsm_backtest_trade_log.csv \
+  --risk-policy tsm_price_rule_output/tsm_risk_policy_daily.csv \
+  --enriched output/tsm_daily_10y_enriched.csv \
+  --external-features tsm_price_rule_output/tsm_external_daily_features.csv \
+  --intraday-features tsm_price_rule_output/tsm_intraday_daily_features.csv \
+  --outdir tsm_price_rule_output
+
 python3 tsm_ml_overlay_backtest.py \
   --oos-predictions tsm_price_rule_output/tsm_prediction_oos_predictions.csv \
   --outdir tsm_price_rule_output
 
 python3 tsm_pooled_dataset_builder.py \
+  --outdir tsm_price_rule_output
+
+python3 tsm_next_close_forecast_engine.py \
+  --pooled-feature-matrix tsm_price_rule_output/tsm_prediction_pooled_feature_matrix.csv \
+  --decision-universe-config config/semiconductor_universe_top10.csv \
+  --latest-prediction tsm_price_rule_output/tsm_latest_prediction_snapshot.csv \
   --outdir tsm_price_rule_output
 
 python3 tsm_model_registry_engine.py \
@@ -189,31 +215,26 @@ python3 tsm_daily_trading_report.py \
 | `output/charts/tsm_daily_move_heatmap.png` | 연/월별 평균 절대 일간 변동폭 히트맵 |
 | `output/charts/tsm_event_impact.png` | 이벤트 당일 및 이벤트 후 수익률 그래프 |
 
-시간봉 추가 생성 파일:
+Top10+2 시간봉 추가 생성 파일:
 
 | 파일 | 설명 |
 |---|---|
-| `output/tsm_hourly_available_raw.csv` | 일봉 raw와 같은 컬럼 순서의 시간봉 OHLCV 데이터 |
-| `output/tsm_hourly_available_enriched.csv` | 일봉 enriched와 같은 지표 스키마의 시간봉 분석 CSV |
-| `output/tsm_hourly_available_summary.csv` | 시간봉 확보 범위, 수익률, CAGR, 변동성, MDD 등 요약 |
-| `output/tsm_hourly_10y_source_audit.csv` | Yahoo/Stooq/Polygon/Alpha Vantage/EODHD 기준 10년 시간봉 확보 가능성 점검 |
-| `output/tsm_hourly_data_report.md` | 시간봉 소스 제한과 분석 결과 요약 리포트 |
-| `output/charts/tsm_hourly_price_ma_drawdown.png` | 시간봉 종가 + 20/50/200봉 이동평균 + 고점 대비 낙폭 |
-| `output/charts/tsm_hourly_return_distribution.png` | 시간봉 수익률 분포 |
-| `output/charts/tsm_hourly_rolling_vol_atr.png` | 시간봉 롤링 변동성 + ATR14 |
+| `output/universe/<SYMBOL>/tsm_hourly_available_raw.csv` | Top10+2 종목별 일봉 raw와 같은 컬럼 순서의 시간봉 OHLCV 데이터 |
+| `output/universe/<SYMBOL>/tsm_hourly_available_enriched.csv` | Top10+2 종목별 일봉 enriched와 같은 지표 스키마의 시간봉 분석 CSV |
+| `output/universe/<SYMBOL>/tsm_hourly_available_summary.csv` | Top10+2 종목별 시간봉 확보 범위, 수익률, CAGR, 변동성, MDD 등 요약 |
+| `output/universe/<SYMBOL>/tsm_hourly_10y_source_audit.csv` | Top10+2 종목별 Yahoo/Stooq/Polygon/Alpha Vantage/EODHD 기준 10년 시간봉 확보 가능성 점검 |
+| `output/tsm_universe_intraday_update_manifest.csv` | Top10+2 종목별 시간/분봉 갱신 실행 기록 |
+| `output/tsm_universe_market_data_latest.csv` | Top10+2 종목별 일/시간/분봉 최신성·커버리지 요약 |
 
-분봉 추가 생성 파일:
+Top10+2 분봉 추가 생성 파일:
 
 | 파일 | 설명 |
 |---|---|
-| `output/tsm_minute_available_raw.csv` | 일봉 raw와 같은 컬럼 순서의 공개 확보 가능 1분봉 OHLCV 데이터 |
-| `output/tsm_minute_available_enriched.csv` | 일봉 enriched와 같은 지표 스키마의 1분봉 분석 CSV |
-| `output/tsm_minute_available_summary.csv` | 1분봉 확보 범위, 수익률, 변동성, MDD 등 요약 |
-| `output/tsm_minute_10y_source_audit.csv` | Yahoo/Stooq/Polygon/Alpha Vantage/EODHD 기준 10년 분봉 확보 가능성 점검 |
-| `output/tsm_minute_data_report.md` | 분봉 소스 제한과 분석 결과 요약 리포트 |
-| `output/charts/tsm_minute_price_ma_drawdown.png` | 1분봉 종가 + 20/50/200봉 이동평균 + 고점 대비 낙폭 |
-| `output/charts/tsm_minute_return_distribution.png` | 1분봉 수익률 분포 |
-| `output/charts/tsm_minute_rolling_vol_atr.png` | 1분봉 롤링 변동성 + ATR14 |
+| `output/universe/<SYMBOL>/tsm_5min_available_raw.csv` | Top10+2 종목별 5분봉 모델 입력 OHLCV 데이터 |
+| `output/universe/<SYMBOL>/tsm_5min_available_enriched.csv` | Top10+2 종목별 5분봉 모델 피처용 지표 CSV |
+| `output/universe/<SYMBOL>/tsm_minute_available_raw.csv` | Top10+2 종목별 1분봉 paper execution/slippage 확인용 OHLCV 데이터 |
+| `output/universe/<SYMBOL>/tsm_minute_available_enriched.csv` | Top10+2 종목별 1분봉 실행 확인용 지표 CSV |
+| `output/universe/<SYMBOL>/tsm_minute_10y_source_audit.csv` | Top10+2 종목별 Yahoo/Stooq/Polygon/Alpha Vantage/EODHD 기준 10년 분봉 확보 가능성 점검 |
 
 룰 엔진/백테스트 추가 생성 파일:
 
@@ -249,11 +270,13 @@ python3 tsm_daily_trading_report.py \
 | `tsm_price_rule_output/tsm_prediction_feature_matrix.csv` | 예측 모델용 allowlist 피처와 라벨 결합 데이터 |
 | `tsm_price_rule_output/tsm_prediction_candidate_scope_stats.csv` | 예측 후보 범위/진입 게이트/트리거/행동별 성공률, 순수익률, 손절률 기준 통계 |
 | `tsm_price_rule_output/tsm_prediction_label_diagnostics.csv` | 20/60일 triple-barrier 라벨별 손절 회피, 1R/2R 도달, 양수 수익 진단 |
-| `tsm_price_rule_output/tsm_prediction_feature_selection_report.csv` | fold별 결측/분산/상관 필터로 선택·제외된 피처 감사 로그 |
+| `tsm_price_rule_output/tsm_prediction_feature_selection_report.csv` | fold별 결측/분산/상관 필터와 train-only target association으로 선택·제외된 피처 감사 로그 |
+| `tsm_price_rule_output/tsm_prediction_feature_association_summary.csv` | 선택·제외된 피처의 train-only association 요약. 제외된 고연관 피처는 다음 검증 실험 후보로만 사용 |
 | `tsm_price_rule_output/tsm_prediction_walk_forward_metrics.csv` | 예측 모델별 walk-forward OOS Brier, log loss, PR AUC, 기대값 |
 | `tsm_price_rule_output/tsm_prediction_oos_predictions.csv` | fold별 OOS 예측 원장. 날짜, 확률, threshold 선택 여부, 실제 라벨을 보존 |
 | `tsm_price_rule_output/tsm_prediction_model_comparison.csv` | `trade_ready_entry`, `trigger_all`, `context_all`을 분리한 예측 모델별 OOS 품질/경제성 비교 |
 | `tsm_price_rule_output/tsm_prediction_model_audit.csv` | 모델별 Brier decomposition, threshold 안정성, 품질 차단 사유 |
+| `tsm_price_rule_output/tsm_prediction_brier_decomposition_summary.csv` | 모델별 Brier reliability/resolution/uncertainty 분해와 다음 calibration/action 진단 |
 | `tsm_price_rule_output/tsm_prediction_calibration_bins.csv` | 확률 구간별 예측확률과 실제 성공률 calibration 표 |
 | `tsm_price_rule_output/tsm_prediction_calibration_summary.csv` | fixed-width/equal-frequency calibration별 ECE와 bin 커버리지 요약 |
 | `tsm_price_rule_output/tsm_prediction_threshold_policy.csv` | fold별 validation 구간에서 선택된 확률 임계값 |
@@ -261,13 +284,41 @@ python3 tsm_daily_trading_report.py \
 | `tsm_price_rule_output/tsm_prediction_quality_checks.csv` | 예측 라벨/피처/룩어헤드/threshold/품질 체크 |
 | `tsm_price_rule_output/tsm_prediction_report.md` | 예측 정확도와 메타-라벨 품질 요약 리포트 |
 | `tsm_price_rule_output/tsm_prediction_reliability_report.md` | 최신 2단계 확률, 80% 확률 구간, reliability bin 리포트 |
+| `tsm_price_rule_output/tsm_next_day_up_label_dataset.csv` | 오늘 종가 대비 다음 거래일 종가 상승 여부(`label_success_1d`) close-to-close 라벨 |
+| `tsm_price_rule_output/tsm_next_day_up_feature_matrix.csv` | 1일 상승 예측용 기존 allowlist 피처와 close-to-close 라벨 결합 데이터 |
+| `tsm_price_rule_output/tsm_next_day_up_model_comparison.csv` | 1일 상승 모델별 walk-forward OOS Brier, PR AUC, calibration, threshold 성과 |
+| `tsm_price_rule_output/tsm_next_day_up_oos_predictions.csv` | 1일 상승 모델 fold별 OOS 확률 원장 |
+| `tsm_price_rule_output/tsm_next_day_up_latest_snapshot.csv` | 최신 거래일 기준 `next_day_p_up_1d`, threshold, 상태 요약. 기존 최신 예측 스냅샷에도 `next_day_*` 필드로 병합 |
+| `tsm_price_rule_output/tsm_next_day_up_quality_checks.csv` | 1일 상승 라벨/피처/워크포워드/threshold 품질 체크 |
+| `tsm_price_rule_output/tsm_next_day_up_report.md` | 1일 상승 모델 설계와 최신 확률 요약 리포트 |
+| `tsm_price_rule_output/tsm_next_close_label_dataset.csv` | Top12 전체의 1D/5D/20D 종가 direct forecast 라벨. 목표값은 `log(close_engine[t+h] / close_engine[t])` |
+| `tsm_price_rule_output/tsm_next_close_feature_matrix.csv` | pooled feature matrix에 종가 forecast 라벨을 붙인 학습 입력. 일봉, 외부, hourly, m5/m1 daily-aligned intraday 피처를 포함 |
+| `tsm_price_rule_output/tsm_next_close_feature_selection_report.csv` | fold별 train-only 피처 선택 로그. 결측이 과도한 intraday 피처는 제외하고 충분한 coverage 피처는 유지 |
+| `tsm_price_rule_output/tsm_next_close_model_comparison.csv` | horizon별 baseline/ElasticNet/HGBR/LightGBM/XGBoost/validation blend의 OOS MAE, RMSE, 방향 적중, 구간 coverage, 성공 gate |
+| `tsm_price_rule_output/tsm_next_close_oos_predictions.csv` | fold별 OOS 예상 log return, 예상 종가(engine/USD/native), 80% 구간, 실제 종가 비교 원장 |
+| `tsm_price_rule_output/tsm_next_close_interval_calibration.csv` | 모델별 80% 구간 coverage와 평균 구간 폭 요약 |
+| `tsm_price_rule_output/tsm_next_close_universe_latest_predictions.csv` | Top12 최신 1D/5D/20D 예상 종가, 예상 수익률, 80% 구간, horizon별 품질 상태 |
+| `tsm_price_rule_output/tsm_next_close_latest_snapshot.csv` | TSM 최신 forecast snapshot. 기존 최신 예측 스냅샷에도 `next_close_*` 필드로 병합 |
+| `tsm_price_rule_output/tsm_next_close_quality_checks.csv` | forecast 라벨, 누수 방지, OOS 순서, Top12 최신 row, success gate 품질 체크 |
+| `tsm_price_rule_output/tsm_next_close_report.md` | 1D/5D/20D 예상 종가 모델 품질과 최신 TSM forecast 요약 |
 | `tsm_price_rule_output/tsm_ml_overlay_summary.csv` | 룰 전체 OOS 이벤트와 ML threshold 필터링 이벤트의 수익률/성공률 비교 |
 | `tsm_price_rule_output/tsm_ml_overlay_equity_curves.csv` | ML overlay별 이벤트 가중 equity curve와 drawdown |
 | `tsm_price_rule_output/tsm_ml_overlay_quality_checks.csv` | overlay 백테스트 산출물 계약 검증 |
-| `tsm_price_rule_output/tsm_prediction_pooled_label_dataset.csv` | 멀티 심볼 확장을 위한 symbol 포함 라벨 데이터셋. 기본값은 TSM 단일 심볼 |
+| `tsm_price_rule_output/tsm_prediction_pooled_label_dataset.csv` | Universal research pool 기반 symbol 포함 라벨 데이터셋. 최종 판단 후보는 Top10으로 제한 |
 | `tsm_price_rule_output/tsm_prediction_pooled_feature_matrix.csv` | 멀티 심볼 확장을 위한 symbol 포함 피처 행렬 |
 | `tsm_price_rule_output/tsm_prediction_pooled_schema.csv` | pooled dataset 컬럼 role, dtype, 결측률 스키마 |
 | `tsm_price_rule_output/tsm_prediction_model_registry.csv` | 모델/스코프/호라이즌별 품질, calibration, overlay, source hash를 묶은 registry |
+
+예측 실험 variant를 baseline 산출물과 비교해 OOS 악화 여부를 자동 판정하려면 다음처럼 실행합니다.
+
+```bash
+.venv/bin/python tsm_prediction_experiment_guardrail.py \
+  --baseline-dir tsm_price_rule_output \
+  --variant-dir /tmp/tsm_variant_candidate \
+  --target-scope entry_research \
+  --target-model elastic_net_logistic \
+  --out-csv /tmp/tsm_prediction_experiment_guardrail.csv
+```
 | `tsm_price_rule_output/tsm_prediction_experiment_log.csv` | registry 기반 실험 상태와 차단 사유 로그 |
 | `tsm_price_rule_output/tsm_shadow_paper_predictions.csv` | 최신 예측을 날짜/호라이즌별로 기록하고 미래 창이 생기면 realized label을 채우는 섀도우 원장 |
 | `tsm_price_rule_output/tsm_shadow_paper_quality_checks.csv` | 섀도우 원장 중복/상태/날짜 계약 검증 |
@@ -289,6 +340,8 @@ python3 tsm_daily_trading_report.py \
 최신 스냅샷의 `prediction_signal_status`와 `prediction_use_status`는 이 구분을 반영합니다. 예측값은 기존 `trade_action`을 뒤집지 않으며, `DECISION_SUPPORT_ALLOWED`가 아니면 표시 전용입니다.
 
 예측 v2는 `p_stop_survival * p_positive_given_survival = p_success`의 2단계 확률을 유지하면서 `p_stop_hit`, `p_hit_1r`, `p_hit_2r`, `expected_r`, `expected_net_return`을 함께 표시합니다. `effective_oos_event_count`가 100 미만이거나 Brier/ECE/PR AUC/기대값 기준을 통과하지 못하면 최신 예측은 자동으로 표시 전용입니다.
+
+별도 1일 방향성 모델인 `tsm_next_day_up_model_engine.py`는 오늘 종가 대비 다음 거래일 종가가 상승할 확률(`next_day_p_up_1d`)을 계산합니다. 이 모델은 close-to-close 방향성 진단용이며 기존 20D trade-ready 의사결정 게이트나 live trading 상태를 켜지 않습니다.
 
 현재 ML 개선 단계는 다음 흐름으로 고정되어 있습니다.
 
@@ -345,6 +398,7 @@ python3 tsm_daily_trading_report.py \
 - 장 마감 후 실행을 전제로 설계되어 있으며, 최신 거래일이 실행일보다 7일 이상 오래되면 품질 체크에서 경고합니다.
 - 모든 실행 단계는 `tsm_daily_update_manifest.csv`에 기록됩니다.
 - 품질 체크가 실패하면 `tsm_daily_update_operational_report.md`에서 어떤 검사가 실패했는지 먼저 확인하세요.
+- LaunchAgent/Codex 일일 자동화의 최종 전체 점검은 `tsm_full_daily_update_audit.csv`와 `tsm_full_daily_update_audit.md`에 기록됩니다. 이 파일은 일봉, 시간봉, 분봉, 뉴스, pooled universe, 시스템 상태, paper OMS 산출물을 한 번에 확인합니다.
 - 네트워크 또는 데이터 제공처 장애가 있을 때는 `--skip-data-refresh`로 기존 CSV 기준 후속 리포트만 재생성할 수 있습니다.
 - 라이브 주문은 명시적으로 비활성화되어 있습니다. 시스템 상태 파일의 `live_trading_status`도 `DISABLED_BY_DESIGN`으로 고정됩니다.
 
@@ -359,7 +413,7 @@ event_date,event_name,event_type,source_url,notes
 
 ## 9. 뉴스 원인 자동 수집
 
-API 키 없이 공개 웹/RSS와 TSMC 공식 보도자료를 직접 수집해 가격 변동일과 매칭하려면 다음을 실행합니다.
+API 키 없이 공개 웹/RSS와 반도체 관련 공개 보도자료를 직접 수집해 가격 변동일과 매칭하려면 다음을 실행합니다.
 
 ```bash
 python3 tsm_news_causal_engine.py \
@@ -374,6 +428,17 @@ python3 tsm_news_causal_engine.py \
 
 ```bash
 ./script/install_daily_launch_agent.sh
+```
+
+LaunchAgent 실행 스크립트는 `config/semiconductor_universe_top10.csv`의 enabled 종목 전체에 대해 일봉 연구 산출물과 `output/universe/<SYMBOL>/tsm_hourly_available_*.csv`, `output/universe/<SYMBOL>/tsm_minute_available_*.csv`를 함께 갱신합니다. 확장 후보 전체는 `config/semiconductor_universe_expanded.csv`에 보존되어 있습니다. 유니버스 시간/분봉만 수동 갱신하려면 다음을 실행합니다.
+
+```bash
+.venv/bin/python run_universe_market_data_update.py \
+  --universe-config config/semiconductor_universe_top10.csv \
+  --start 2016-05-12 \
+  --end "$(date '+%Y-%m-%d')" \
+  --bar-scope both \
+  --skip-charts
 ```
 
 ## 10. 주의

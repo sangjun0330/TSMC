@@ -149,6 +149,14 @@ def build_data_quality_report(output_dir: Path, rule_outdir: Path, run_date: str
         rule_outdir / "tsm_prediction_fold_manifest.csv",
         rule_outdir / "tsm_prediction_policy_audit.csv",
         rule_outdir / "tsm_latest_prediction_snapshot.csv",
+        rule_outdir / "tsm_next_day_up_model_comparison.csv",
+        rule_outdir / "tsm_next_day_up_oos_predictions.csv",
+        rule_outdir / "tsm_next_day_up_latest_snapshot.csv",
+        rule_outdir / "tsm_next_day_up_quality_checks.csv",
+        rule_outdir / "tsm_next_day_up_report.md",
+        rule_outdir / "tsm_intraday_daily_features.csv",
+        rule_outdir / "tsm_top10_timeframe_coverage.csv",
+        rule_outdir / "tsm_intraday_feature_quality_checks.csv",
         rule_outdir / "tsm_ml_overlay_summary.csv",
         rule_outdir / "tsm_ml_overlay_equity_curves.csv",
         rule_outdir / "tsm_ml_overlay_quality_checks.csv",
@@ -157,12 +165,27 @@ def build_data_quality_report(output_dir: Path, rule_outdir: Path, run_date: str
         rule_outdir / "tsm_prediction_pooled_schema.csv",
         rule_outdir / "tsm_prediction_pooled_quality_checks.csv",
         rule_outdir / "tsm_prediction_pooled_dataset_report.md",
+        rule_outdir / "tsm_decision_universe_config.csv",
+        rule_outdir / "tsm_research_pool_audit.csv",
+        rule_outdir / "tsm_next_close_label_dataset.csv",
+        rule_outdir / "tsm_next_close_feature_matrix.csv",
+        rule_outdir / "tsm_next_close_feature_selection_report.csv",
+        rule_outdir / "tsm_next_close_walk_forward_metrics.csv",
+        rule_outdir / "tsm_next_close_oos_predictions.csv",
+        rule_outdir / "tsm_next_close_model_comparison.csv",
+        rule_outdir / "tsm_next_close_interval_calibration.csv",
+        rule_outdir / "tsm_next_close_latest_snapshot.csv",
+        rule_outdir / "tsm_next_close_universe_latest_predictions.csv",
+        rule_outdir / "tsm_next_close_quality_checks.csv",
+        rule_outdir / "tsm_next_close_report.md",
         rule_outdir / "tsm_pooled_model_comparison.csv",
         rule_outdir / "tsm_pooled_model_oos_predictions.csv",
         rule_outdir / "tsm_pooled_model_oof_predictions.csv",
         rule_outdir / "tsm_pooled_model_slice_diagnostics.csv",
         rule_outdir / "tsm_pooled_tsm_calibration.csv",
         rule_outdir / "tsm_pooled_latest_prediction_overlay.csv",
+        rule_outdir / "tsm_universe_latest_predictions.csv",
+        rule_outdir / "tsm_top10_latest_predictions.csv",
         rule_outdir / "tsm_pooled_model_quality_checks.csv",
         rule_outdir / "tsm_pooled_model_report.md",
         rule_outdir / "tsm_model_gate_audit.csv",
@@ -174,6 +197,39 @@ def build_data_quality_report(output_dir: Path, rule_outdir: Path, run_date: str
         rule_outdir / "tsm_shadow_paper_predictions.csv",
         rule_outdir / "tsm_shadow_paper_quality_checks.csv",
         rule_outdir / "tsm_shadow_paper_report.md",
+        rule_outdir / "tsm_order_intents.csv",
+        rule_outdir / "tsm_order_intent_quality_checks.csv",
+        rule_outdir / "tsm_order_intent_report.md",
+        rule_outdir / "tsm_portfolio_risk_order_decisions.csv",
+        rule_outdir / "tsm_portfolio_risk_snapshot.csv",
+        rule_outdir / "tsm_portfolio_targets.csv",
+        rule_outdir / "tsm_portfolio_snapshot.csv",
+        rule_outdir / "tsm_portfolio_risk_checks.csv",
+        rule_outdir / "tsm_portfolio_risk_report.md",
+        rule_outdir / "tsm_paper_orders.csv",
+        rule_outdir / "tsm_paper_fills.csv",
+        rule_outdir / "tsm_paper_positions.csv",
+        rule_outdir / "tsm_paper_slippage_report.csv",
+        rule_outdir / "tsm_paper_oms_quality_checks.csv",
+        rule_outdir / "tsm_paper_oms_report.md",
+        rule_outdir / "tsm_paper_reconciliation_report.csv",
+        rule_outdir / "tsm_paper_reconciliation_quality_checks.csv",
+        rule_outdir / "tsm_paper_reconciliation_report.md",
+        rule_outdir / "tsm_order_state_events.csv",
+        rule_outdir / "tsm_order_lifecycle_snapshot.csv",
+        rule_outdir / "tsm_order_state_quality_checks.csv",
+        rule_outdir / "tsm_order_state_report.md",
+        rule_outdir / "tsm_execution_feedback_events.csv",
+        rule_outdir / "tsm_execution_feedback_features.csv",
+        rule_outdir / "tsm_execution_feedback_labels.csv",
+        rule_outdir / "tsm_execution_feedback_quality_checks.csv",
+        rule_outdir / "tsm_execution_feedback_report.md",
+        rule_outdir / "tsm_fill_model_calibration.csv",
+        rule_outdir / "tsm_fill_model_calibration_quality_checks.csv",
+        rule_outdir / "tsm_fill_model_calibration_report.md",
+        rule_outdir / "tsm_automation_plan.csv",
+        rule_outdir / "tsm_automation_quality_checks.csv",
+        rule_outdir / "tsm_automation_report.md",
         rule_outdir / "tsm_daily_stress_scenarios.csv",
         rule_outdir / "tsm_latest_stress_snapshot.csv",
         output_dir / "tsm_news_raw_articles.csv",
@@ -260,12 +316,20 @@ def build_data_quality_report(output_dir: Path, rule_outdir: Path, run_date: str
     if model_gate_snapshot is not None and not model_gate_snapshot.empty and {"field", "value"}.issubset(model_gate_snapshot.columns):
         model_gate = dict(zip(model_gate_snapshot["field"], model_gate_snapshot["value"]))
         status = str(model_gate.get("model_gate_status", "UNKNOWN"))
+        known_model_gate_statuses = {
+            "PASS",
+            "WARN",
+            "BLOCKED",
+            "PAPER_DECISION_SUPPORT_ALLOWED",
+            "MODEL_QUALITY_PASS_LATEST_BLOCKED",
+            "PASS_MODEL_QUALITY_SIGNAL_STANDBY",
+        }
         checks.append(
             {
                 "check": "model_gate_audit_ran",
-                "passed": status in {"PASS", "WARN", "BLOCKED"},
+                "passed": status in known_model_gate_statuses,
                 "value": status,
-                "details": str(model_gate.get("failed_gate_groups", "")),
+                "details": str(model_gate.get("blocking_failed_gate_groups", model_gate.get("failed_gate_groups", ""))),
             }
         )
     if news_daily is not None and not news_daily.empty:
@@ -290,7 +354,7 @@ def build_data_quality_report(output_dir: Path, rule_outdir: Path, run_date: str
 
 
 def write_operational_report(rule_outdir: Path, manifest: List[StepResult], quality: pd.DataFrame) -> None:
-    passed_steps = all(r.status == "PASS" for r in manifest)
+    passed_steps = all(r.status in {"PASS", "PARTIAL_INTRADAY"} for r in manifest)
     passed_quality = bool(quality["passed"].all()) if not quality.empty else False
     latest_plan = rule_outdir / "tsm_daily_trading_plan.md"
     latest_risk = rule_outdir / "tsm_latest_risk_snapshot.csv"
@@ -301,7 +365,7 @@ def write_operational_report(rule_outdir: Path, manifest: List[StepResult], qual
     latest_news = rule_outdir / "tsm_news_integrated_daily.csv"
 
     lines = [
-        "# TSMC Daily Update Operational Report",
+        "# Top10 Daily Update Operational Report",
         "",
         f"- Pipeline status: {'PASS' if passed_steps else 'FAIL'}",
         f"- Quality status: {'PASS' if passed_quality else 'FAIL'}",
@@ -357,6 +421,8 @@ def write_operational_report(rule_outdir: Path, manifest: List[StepResult], qual
                 f"- Use status: {prediction_map.get('prediction_use_status', 'NA')}",
                 f"- 20D probability: {prediction_map.get('p_success_20d', 'NA')}",
                 f"- 20D threshold: {prediction_map.get('threshold_20d', 'NA')}",
+                f"- Next-day up probability: {prediction_map.get('next_day_p_up_1d', 'NA')}",
+                f"- Next-day up status: {prediction_map.get('next_day_prediction_signal_status', 'NA')}",
             ]
         )
 
@@ -414,14 +480,16 @@ def write_operational_report(rule_outdir: Path, manifest: List[StepResult], qual
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run full TSMC daily research update without placing orders.")
+    parser = argparse.ArgumentParser(description="Run full Top10 daily research update without placing orders.")
     parser.add_argument("--config", default="config/tsm_research.toml")
     parser.add_argument("--start", default="2016-05-12")
     parser.add_argument("--end", default=date.today().isoformat())
     parser.add_argument("--preferred-source", choices=["stooq", "yahoo"], default="stooq")
+    parser.add_argument("--kr-preferred-source", choices=["stooq", "yahoo"], default="yahoo")
     parser.add_argument("--events", default="tsm_events_seed.csv")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--rule-outdir", default="tsm_price_rule_output")
+    parser.add_argument("--fx-rates", default="output/tsm_fx_rates_daily.csv", help="Daily FX rates used for non-USD listings.")
     parser.add_argument("--skip-data-refresh", action="store_true", help="Use existing output/*.csv files and rerun downstream engines only.")
     parser.add_argument("--skip-news-refresh", action="store_true", help="Use existing news cause files and skip direct-web news collection.")
     parser.add_argument("--news-backfill", action="store_true", help="Collect direct-web news using the configured historical backfill start.")
@@ -440,7 +508,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-threshold", type=float, default=75.0)
     parser.add_argument("--schema-strict", action="store_true")
     parser.add_argument("--prediction-policy", choices=["conservative", "research"], default="conservative")
-    parser.add_argument("--universe-config", default="config/semiconductor_universe_expanded.csv")
+    parser.add_argument("--universe-mode", choices=["universe", "hybrid"], default="hybrid")
+    parser.add_argument("--universe-config", default="config/semiconductor_universe_top10.csv")
+    parser.add_argument("--decision-universe-config", default="config/semiconductor_universe_top10.csv")
+    parser.add_argument("--research-universe-config", default="config/semiconductor_universe_expanded.csv")
+    parser.add_argument("--skip-universe-symbol-build", action="store_true", help="Rebuild pooled aggregates from existing per-symbol universe outputs.")
+    parser.add_argument("--skip-universe-symbol-diagnostics", action="store_true", help="Skip per-symbol diagnostics during universe symbol builds.")
     parser.add_argument("--skip-external-web", action="store_true", help="Build external features from local files only.")
     parser.add_argument("--enable-feedback-features", action="store_true", help="Build prefix-only backtest feedback feature outputs.")
     parser.add_argument("--enable-auto-research", action="store_true", help="Run automatic research trial ledger after pooled model outputs.")
@@ -456,11 +529,30 @@ def main() -> None:
     rule_outdir = Path(args.rule_outdir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rule_outdir.mkdir(parents=True, exist_ok=True)
+    decision_universe_config = str(args.decision_universe_config or args.universe_config)
+    research_universe_config = str(args.research_universe_config)
 
     py = sys.executable
     steps: List[tuple[str, List[str]]] = []
 
     if not args.skip_data_refresh:
+        steps.append(
+            (
+                "fx_rate_engine",
+                [
+                    py,
+                    "tsm_fx_rate_engine.py",
+                    "--start",
+                    args.start,
+                    "--end",
+                    args.end,
+                    "--outdir",
+                    str(Path(args.fx_rates).parent),
+                    "--pairs",
+                    "KRW=X",
+                ],
+            )
+        )
         cmd = [
             py,
             "tsm_daily_quant_pipeline.py",
@@ -474,6 +566,8 @@ def main() -> None:
             args.events,
             "--outdir",
             str(output_dir),
+            "--fx-rates",
+            str(args.fx_rates),
         ]
         if args.skip_charts:
             cmd.append("--skip-charts")
@@ -535,6 +629,12 @@ def main() -> None:
                     str(rule_outdir / "tsm_news_integrated_daily.csv"),
                     "--outdir",
                     str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                    "--symbol",
+                    "TSM",
+                    "--symbol-group",
+                    "semiconductor",
                 ],
             ),
             (
@@ -584,6 +684,10 @@ def main() -> None:
                     str(rule_outdir / "tsm_daily_algorithmic_signals.csv"),
                     "--outdir",
                     str(rule_outdir),
+                    "--root-symbol",
+                    "TSM",
+                    "--root-signals",
+                    str(rule_outdir / "tsm_daily_algorithmic_signals.csv"),
                 ],
             ),
             (
@@ -643,6 +747,8 @@ def main() -> None:
                     str(rule_outdir / "tsm_drawdown_episodes.csv"),
                     "--equity-curves",
                     str(rule_outdir / "tsm_backtest_equity_curves.csv"),
+                    "--intraday-features",
+                    str(rule_outdir / "tsm_intraday_daily_features.csv"),
                     "--outdir",
                     str(rule_outdir),
                 ],
@@ -676,7 +782,7 @@ def main() -> None:
                     "--outdir",
                     str(rule_outdir),
                     "--universe-config",
-                    str(args.universe_config),
+                    research_universe_config,
                     "--news-events",
                     str(output_dir / "tsm_news_events_normalized.csv"),
                     "--start",
@@ -684,6 +790,87 @@ def main() -> None:
                     "--end",
                     str(args.end),
                     *(["--skip-web"] if args.skip_external_web else []),
+                ],
+            ),
+            *(
+                [
+                    (
+                        "universe_daily_refresh",
+                        [
+                            py,
+                            "run_pooled_universe_update.py",
+                            "--symbol-build-only",
+                            *(["--skip-symbol-diagnostics"] if args.skip_universe_symbol_diagnostics else []),
+                            "--universe-config",
+                            decision_universe_config,
+                            "--decision-universe-config",
+                            decision_universe_config,
+                            "--research-universe-config",
+                            research_universe_config,
+                            "--outdir",
+                            str(rule_outdir),
+                            "--start",
+                            str(args.start),
+                            "--end",
+                            str(args.end),
+                            "--preferred-source",
+                            str(args.preferred_source),
+                            "--kr-preferred-source",
+                            str(args.kr_preferred_source),
+                            "--fx-rates",
+                            str(args.fx_rates),
+                            "--commission-bps",
+                            str(args.commission_bps),
+                            "--slippage-bps",
+                            str(args.slippage_bps),
+                            "--stop-multiple",
+                            str(args.stop_multiple),
+                        ],
+                    )
+                ]
+                if not args.skip_universe_symbol_build and not args.skip_data_refresh
+                else []
+            ),
+            (
+                "top10_intraday_market_data",
+                [
+                    py,
+                    "run_universe_market_data_update.py",
+                    "--universe-config",
+                    decision_universe_config,
+                    "--outdir",
+                    str(output_dir),
+                    "--start",
+                    str(args.start),
+                    "--end",
+                    str(args.end),
+                    "--bar-scope",
+                    "both",
+                    "--model-minute-interval",
+                    "5m",
+                    "--execution-minute-interval",
+                    "1m",
+                    "--provider",
+                    "auto",
+                    "--provider-order",
+                    "alpha_vantage,polygon,eodhd,alpaca,yahoo",
+                    "--fx-rates",
+                    str(args.fx_rates),
+                    "--skip-charts",
+                    "--continue-on-error",
+                ],
+            ),
+            (
+                "intraday_feature_engine",
+                [
+                    py,
+                    "tsm_intraday_feature_engine.py",
+                    "--decision-universe-config",
+                    decision_universe_config,
+                    "--research-universe-config",
+                    research_universe_config,
+                    "--outdir",
+                    str(rule_outdir),
                 ],
             ),
             (
@@ -701,6 +888,8 @@ def main() -> None:
                     str(output_dir / "tsm_daily_10y_enriched.csv"),
                     "--external-features",
                     str(rule_outdir / "tsm_external_daily_features.csv"),
+                    "--intraday-features",
+                    str(rule_outdir / "tsm_intraday_daily_features.csv"),
                     "--outdir",
                     str(rule_outdir),
                     "--commission-bps",
@@ -713,7 +902,33 @@ def main() -> None:
                     str(args.config),
                     "--prediction-policy",
                     str(args.prediction_policy),
+                    "--symbol",
+                    "TSM",
                     *(["--schema-strict"] if args.schema_strict else []),
+                ],
+            ),
+            (
+                "next_day_up_model_engine",
+                [
+                    py,
+                    "tsm_next_day_up_model_engine.py",
+                    "--aggregate-universe",
+                    "--universe-config",
+                    decision_universe_config,
+                    "--universe-rule-root",
+                    str(rule_outdir / "universe"),
+                    "--universe-data-root",
+                    str(output_dir / "universe"),
+                    "--external-features",
+                    str(rule_outdir / "tsm_external_daily_features.csv"),
+                    "--intraday-features",
+                    str(rule_outdir / "tsm_intraday_daily_features.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--latest-prediction",
+                    str(rule_outdir / "tsm_latest_prediction_snapshot.csv"),
+                    "--symbol",
+                    "TSM",
                 ],
             ),
             (
@@ -739,10 +954,25 @@ def main() -> None:
                     py,
                     "run_pooled_universe_update.py",
                     "--skip-symbol-build",
+                    *(["--skip-symbol-diagnostics"] if args.skip_universe_symbol_diagnostics else []),
                     "--universe-config",
-                    str(args.universe_config),
+                    decision_universe_config,
+                    "--decision-universe-config",
+                    decision_universe_config,
+                    "--research-universe-config",
+                    research_universe_config,
                     "--outdir",
                     str(rule_outdir),
+                    "--start",
+                    str(args.start),
+                    "--end",
+                    str(args.end),
+                    "--preferred-source",
+                    str(args.preferred_source),
+                    "--kr-preferred-source",
+                    str(args.kr_preferred_source),
+                    "--fx-rates",
+                    str(args.fx_rates),
                     "--commission-bps",
                     str(args.commission_bps),
                     "--slippage-bps",
@@ -751,6 +981,25 @@ def main() -> None:
                     str(args.stop_multiple),
                     "--external-features",
                     str(rule_outdir / "tsm_external_daily_features.csv"),
+                    "--intraday-features",
+                    str(rule_outdir / "tsm_intraday_daily_features.csv"),
+                ],
+            ),
+            (
+                "next_close_forecast_engine",
+                [
+                    py,
+                    "tsm_next_close_forecast_engine.py",
+                    "--pooled-feature-matrix",
+                    str(rule_outdir / "tsm_prediction_pooled_feature_matrix.csv"),
+                    "--decision-universe-config",
+                    decision_universe_config,
+                    "--latest-prediction",
+                    str(rule_outdir / "tsm_latest_prediction_snapshot.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--symbol",
+                    "TSM",
                 ],
             ),
             (
@@ -795,6 +1044,12 @@ def main() -> None:
                     str(rule_outdir / "tsm_deflated_sharpe_report.csv"),
                     "--paper-gate",
                     str(rule_outdir / "tsm_paper_gate_snapshot.csv"),
+                    "--next-close-comparison",
+                    str(rule_outdir / "tsm_next_close_model_comparison.csv"),
+                    "--next-close-quality",
+                    str(rule_outdir / "tsm_next_close_quality_checks.csv"),
+                    "--next-close-latest",
+                    str(rule_outdir / "tsm_next_close_latest_snapshot.csv"),
                     "--outdir",
                     str(rule_outdir),
                 ],
@@ -844,6 +1099,185 @@ def main() -> None:
                 ],
             ),
             (
+                "pre_paper_system_state_engine",
+                [
+                    py,
+                    "tsm_system_state_engine.py",
+                    "--operational-quality",
+                    str(rule_outdir / "tsm_operational_quality_checks.csv"),
+                    "--integrity-quality",
+                    str(rule_outdir / "tsm_daily_integrity_checks.csv"),
+                    "--validation-quality",
+                    str(rule_outdir / "tsm_validation_quality_checks.csv"),
+                    "--prediction-quality",
+                    str(rule_outdir / "tsm_prediction_quality_checks.csv"),
+                    "--prediction-snapshot",
+                    str(rule_outdir / "tsm_latest_prediction_snapshot.csv"),
+                    "--risk-snapshot",
+                    str(rule_outdir / "tsm_latest_risk_snapshot.csv"),
+                    "--stress-snapshot",
+                    str(rule_outdir / "tsm_latest_stress_snapshot.csv"),
+                    "--backtest-summary",
+                    str(rule_outdir / "tsm_backtest_strategy_summary.csv"),
+                    "--walk-forward",
+                    str(rule_outdir / "tsm_validation_walk_forward_summary.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                ],
+            ),
+            (
+                "order_intent_engine",
+                [
+                    py,
+                    "tsm_order_intent_engine.py",
+                    "--signals",
+                    str(rule_outdir / "tsm_daily_algorithmic_signals.csv"),
+                    "--risk",
+                    str(rule_outdir / "tsm_latest_risk_snapshot.csv"),
+                    "--prediction",
+                    str(rule_outdir / "tsm_latest_prediction_snapshot.csv"),
+                    "--system-state",
+                    str(rule_outdir / "tsm_latest_system_state.csv"),
+                    "--ledger",
+                    str(rule_outdir / "tsm_order_intents.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--universe-config",
+                    decision_universe_config,
+                    "--latest-predictions",
+                    str(rule_outdir / "tsm_universe_latest_predictions.csv"),
+                    "--signals-root",
+                    str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                ],
+            ),
+            (
+                "portfolio_risk_engine",
+                [
+                    py,
+                    "tsm_portfolio_risk_engine.py",
+                    "--intents",
+                    str(rule_outdir / "tsm_order_intents.csv"),
+                    "--signals",
+                    str(rule_outdir / "tsm_daily_algorithmic_signals.csv"),
+                    "--latest-signals",
+                    str(rule_outdir / "tsm_universe_latest_signals.csv"),
+                    "--intraday-features",
+                    str(rule_outdir / "tsm_intraday_daily_features.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                    "--decision-universe-config",
+                    decision_universe_config,
+                ],
+            ),
+            (
+                "paper_execution_engine",
+                [
+                    py,
+                    "tsm_paper_execution_engine.py",
+                    "--intents",
+                    str(rule_outdir / "tsm_order_intents.csv"),
+                    "--portfolio-decisions",
+                    str(rule_outdir / "tsm_portfolio_risk_order_decisions.csv"),
+                    "--signals",
+                    str(rule_outdir / "tsm_daily_algorithmic_signals.csv"),
+                    "--signals-root",
+                    str(rule_outdir),
+                    "--universe-config",
+                    decision_universe_config,
+                    "--intraday-features",
+                    str(rule_outdir / "tsm_intraday_daily_features.csv"),
+                    "--orders",
+                    str(rule_outdir / "tsm_paper_orders.csv"),
+                    "--fills",
+                    str(rule_outdir / "tsm_paper_fills.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                    "--commission-bps",
+                    str(args.commission_bps),
+                ],
+            ),
+            (
+                "position_reconciler",
+                [
+                    py,
+                    "tsm_position_reconciler.py",
+                    "--positions",
+                    str(rule_outdir / "tsm_paper_positions.csv"),
+                    "--fills",
+                    str(rule_outdir / "tsm_paper_fills.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                ],
+            ),
+            (
+                "order_state_machine",
+                [
+                    py,
+                    "tsm_order_state_machine.py",
+                    "--intents",
+                    str(rule_outdir / "tsm_order_intents.csv"),
+                    "--portfolio-decisions",
+                    str(rule_outdir / "tsm_portfolio_risk_order_decisions.csv"),
+                    "--orders",
+                    str(rule_outdir / "tsm_paper_orders.csv"),
+                    "--fills",
+                    str(rule_outdir / "tsm_paper_fills.csv"),
+                    "--reconciliation",
+                    str(rule_outdir / "tsm_paper_reconciliation_report.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                ],
+            ),
+            (
+                "execution_feedback_engine",
+                [
+                    py,
+                    "tsm_execution_feedback_engine.py",
+                    "--orders",
+                    str(rule_outdir / "tsm_paper_orders.csv"),
+                    "--fills",
+                    str(rule_outdir / "tsm_paper_fills.csv"),
+                    "--signals",
+                    str(rule_outdir / "tsm_daily_algorithmic_signals.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                ],
+            ),
+            (
+                "fill_model_calibration_engine",
+                [
+                    py,
+                    "tsm_fill_model_calibration_engine.py",
+                    "--feedback-events",
+                    str(rule_outdir / "tsm_execution_feedback_events.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                ],
+            ),
+            (
+                "automation_scheduler",
+                [
+                    py,
+                    "tsm_automation_scheduler.py",
+                    "--lifecycle-snapshot",
+                    str(rule_outdir / "tsm_order_lifecycle_snapshot.csv"),
+                    "--outdir",
+                    str(rule_outdir),
+                    "--config",
+                    str(args.config),
+                ],
+            ),
+            (
                 "system_state_engine",
                 [
                     py,
@@ -866,6 +1300,18 @@ def main() -> None:
                     str(rule_outdir / "tsm_backtest_strategy_summary.csv"),
                     "--walk-forward",
                     str(rule_outdir / "tsm_validation_walk_forward_summary.csv"),
+                    "--paper-oms-quality",
+                    str(rule_outdir / "tsm_paper_oms_quality_checks.csv"),
+                    "--paper-reconciliation-quality",
+                    str(rule_outdir / "tsm_paper_reconciliation_quality_checks.csv"),
+                    "--order-state-quality",
+                    str(rule_outdir / "tsm_order_state_quality_checks.csv"),
+                    "--execution-feedback-quality",
+                    str(rule_outdir / "tsm_execution_feedback_quality_checks.csv"),
+                    "--fill-calibration-quality",
+                    str(rule_outdir / "tsm_fill_model_calibration_quality_checks.csv"),
+                    "--automation-quality",
+                    str(rule_outdir / "tsm_automation_quality_checks.csv"),
                     "--outdir",
                     str(rule_outdir),
                 ],
@@ -893,6 +1339,24 @@ def main() -> None:
                     str(rule_outdir / "tsm_latest_system_state.csv"),
                     "--prediction",
                     str(rule_outdir / "tsm_latest_prediction_snapshot.csv"),
+                    "--order-intents",
+                    str(rule_outdir / "tsm_order_intents.csv"),
+                    "--universe-latest-predictions",
+                    str(rule_outdir / "tsm_universe_latest_predictions.csv"),
+                    "--portfolio-targets",
+                    str(rule_outdir / "tsm_portfolio_targets.csv"),
+                    "--paper-positions",
+                    str(rule_outdir / "tsm_paper_positions.csv"),
+                    "--paper-reconciliation",
+                    str(rule_outdir / "tsm_paper_reconciliation_report.csv"),
+                    "--order-lifecycle",
+                    str(rule_outdir / "tsm_order_lifecycle_snapshot.csv"),
+                    "--execution-feedback",
+                    str(rule_outdir / "tsm_execution_feedback_events.csv"),
+                    "--fill-calibration",
+                    str(rule_outdir / "tsm_fill_model_calibration.csv"),
+                    "--automation-plan",
+                    str(rule_outdir / "tsm_automation_plan.csv"),
                     "--outdir",
                     str(rule_outdir),
                 ],
@@ -916,6 +1380,18 @@ def main() -> None:
                     str(rule_outdir / "tsm_shadow_paper_quality_checks.csv"),
                     "--operational-quality",
                     str(rule_outdir / "tsm_operational_quality_checks.csv"),
+                    "--paper-oms-quality",
+                    str(rule_outdir / "tsm_paper_oms_quality_checks.csv"),
+                    "--paper-reconciliation-quality",
+                    str(rule_outdir / "tsm_paper_reconciliation_quality_checks.csv"),
+                    "--order-state-quality",
+                    str(rule_outdir / "tsm_order_state_quality_checks.csv"),
+                    "--execution-feedback-quality",
+                    str(rule_outdir / "tsm_execution_feedback_quality_checks.csv"),
+                    "--fill-calibration-quality",
+                    str(rule_outdir / "tsm_fill_model_calibration_quality_checks.csv"),
+                    "--automation-quality",
+                    str(rule_outdir / "tsm_automation_quality_checks.csv"),
                     "--outdir",
                     str(rule_outdir),
                 ],
@@ -977,19 +1453,29 @@ def main() -> None:
         )
 
     results: List[StepResult] = []
+    research_warning_steps = {"external_feature_engine", "universe_daily_refresh", "pooled_dataset_builder", "next_close_forecast_engine", "pooled_model_engine"}
+    partial_intraday_steps = {"top10_intraday_market_data", "intraday_feature_engine"}
     for step, command in steps:
         result = run_step(step, command, cwd)
+        if step in partial_intraday_steps and result.returncode != 0:
+            result.status = "PARTIAL_INTRADAY"
         results.append(result)
         write_manifest(rule_outdir, results)
         print(f"{step}: {result.status} ({result.duration_sec:.2f}s)")
         if step == "news_causal_engine" and result.returncode != 0:
             print("WARNING: news causal engine failed; continuing with existing or empty news outputs.")
             continue
+        if step in partial_intraday_steps and result.returncode != 0:
+            print(f"WARNING: {step} failed; continuing with PARTIAL_INTRADAY status and latest existing intraday features.")
+            continue
+        if step in research_warning_steps and result.returncode != 0:
+            print(f"WARNING: {step} failed; continuing because this is a model research/support stage.")
+            continue
         if result.returncode != 0 and not args.continue_on_error:
             quality = build_data_quality_report(output_dir, rule_outdir, args.end)
             write_operational_report(rule_outdir, results, quality)
             raise SystemExit(result.returncode)
-        if step == "shadow_paper_engine" and result.returncode == 0:
+        if step == "automation_scheduler" and result.returncode == 0:
             build_data_quality_report(output_dir, rule_outdir, args.end, include_system_outputs=False)
 
     quality = build_data_quality_report(output_dir, rule_outdir, args.end, include_system_outputs=True)

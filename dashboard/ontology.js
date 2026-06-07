@@ -55,6 +55,8 @@
 
     return {
       asOf: shortDate(ctx.asOfDate),
+      symbol: (data.meta && (data.meta.symbol_display_name || data.meta.symbol_name || data.meta.symbol)) || "",
+      groupLabel: (data.meta && data.meta.group_label) || "",
       generatedAt: data.generated_at || "",
       objects,
       edges,
@@ -84,6 +86,14 @@
     const dailyHealth = snapshots.daily_health || {};
     const modelGate = snapshots.model_gate || {};
     const paperGate = snapshots.paper_gate || {};
+    const orderIntent = snapshots.order_intent || {};
+    const portfolioRisk = snapshots.portfolio_risk || {};
+    const paperPosition = snapshots.paper_position || {};
+    const paperReconciliation = snapshots.paper_reconciliation || {};
+    const orderLifecycle = snapshots.order_lifecycle || {};
+    const executionFeedback = snapshots.execution_feedback || {};
+    const fillModelCalibration = snapshots.fill_model_calibration || {};
+    const automation = snapshots.automation || {};
     const latestNews = snapshots.latest_news || {};
     const stress = snapshots.stress || {};
     const integrated = snapshots.integrated_price || snapshots.summary || {};
@@ -93,7 +103,7 @@
     const research = snapshots.research_expansion || {};
     const planRows = tables.trading_plan || [];
     const pSuccess = probabilityPercent(firstValue(pooled, ["p_success_20d", "p_success_tsm_like_20d", "decision_score_20d"], prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d", "p_success_20d"]));
-    const pStop = probabilityPercent(firstValue(pooled, ["p_stop_hit_20d"], prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d", "p_stop_hit_20d"]));
+    const pStop = probabilityPercent(firstValue(pooled, ["p_stop_hit_calibrated_20d", "p_stop_hit_20d"], prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d", "p_stop_hit_20d"]));
     const threshold = probabilityPercent(firstValue(pooled, ["threshold_20d", "threshold"], prediction, ["trade_ready_threshold_20d", "trigger_threshold_20d", "context_threshold_20d", "threshold_20d"]));
     const expectedR = number(firstValue(pooled, ["expected_r_net_20d"], prediction, ["trade_ready_expected_r_20d", "trigger_expected_r_20d", "context_expected_r_20d", "expected_r_20d"]));
     const expectedNet = number(firstValue(pooled, ["expected_net_return_pct_20d"], prediction, ["trade_ready_expected_net_return_20d", "trigger_expected_net_return_20d", "context_expected_net_return_20d", "expected_net_return_20d"]));
@@ -103,6 +113,8 @@
     const hasTrigger = Boolean(entryTrigger && !["NONE", "NO_ENTRY_TRIGGER", "NO_SIGNAL", "FALSE"].includes(entryTrigger));
     const score = number(decision.score_price_algo_total ?? risk.score_price_algo_total);
     const asOfDate = decision.date || prediction.prediction_asof_date || pooled.asof_date || dataQuality.latest_signal_date || latestPrice.date || integrated.end_date;
+    const displayCurrency = inferDisplayCurrency(data, latestPrice, decision, risk);
+    const fxRateToUsd = inferFxRateToUsd(latestPrice, decision, risk, integrated);
 
     return {
       data,
@@ -119,6 +131,14 @@
       dailyHealth,
       modelGate,
       paperGate,
+      orderIntent,
+      portfolioRisk,
+      paperPosition,
+      paperReconciliation,
+      orderLifecycle,
+      executionFeedback,
+      fillModelCalibration,
+      automation,
       latestNews,
       stress,
       integrated,
@@ -145,6 +165,8 @@
         || text(paperGate.paper_gate_status).toUpperCase().includes("PAPER_READY_ENTRY"),
       strictAllowed: bool(paperGate.strict_decision_support_allowed),
       liveStatus: system.live_trading_status || "LIVE_DISABLED_BY_DESIGN",
+      displayCurrency,
+      fxRateToUsd,
     };
   }
 
@@ -166,6 +188,14 @@
     const paperToLiveGap = computePaperToLiveGap(ctx);
     const shadowRealizationScore = computeShadowRealization(ctx);
     const pipelineFreshnessScore = computePipelineFreshness(ctx);
+    const paperOmsScore = average([
+      statusScoreValue(ctx.orderIntent.status || "MISSING"),
+      statusScoreValue(ctx.portfolioRisk.portfolio_risk_status || "MISSING"),
+      statusScoreValue(ctx.paperReconciliation.status || "MISSING"),
+      statusScoreValue(ctx.paperPosition.position_state || "CASH"),
+      statusScoreValue(ctx.orderLifecycle.lifecycle_state || "MISSING"),
+      statusScoreValue(ctx.fillModelCalibration.calibration_status || "MISSING"),
+    ]) || 50;
     const predictionEdge = ctx.pSuccess === null || ctx.threshold === null ? null : ctx.pSuccess - ctx.threshold;
     const stopAdjustedEdge = predictionEdge === null ? null : predictionEdge - (ctx.pStop || 0) * 0.18;
     const expectedTradeQuality = computeExpectedTradeQuality(ctx, predictionPermissionEdge);
@@ -220,6 +250,7 @@
       paperToLiveGap: Math.round(paperToLiveGap),
       shadowRealizationScore: Math.round(shadowRealizationScore),
       pipelineFreshnessScore: Math.round(pipelineFreshnessScore),
+      paperOmsScore: Math.round(paperOmsScore),
       ontologyConflictCount: 0,
     };
   }
@@ -513,7 +544,7 @@
 
     return [
       object("price_rule_today", "PriceRule", "가격·룰 객체", permission.state.includes("WATCH") ? "관찰" : label(ctx.decision.trade_action || "NO_TRADE"), scoreTone(ctx.score, ctx.hasTrigger), [
-        ["Close", fmtCurrency(ctx.decision.close || ctx.latestPrice.close)],
+        ["Close", fmtDisplayCurrency(ctx, ctx.decision.close || ctx.latestPrice.close)],
         ["Score", `${fmtNumber(ctx.score, 1)} / 100`],
         ["Trigger", label(ctx.decision.entry_trigger || "NO_ENTRY_TRIGGER")],
         ["Strict", label(ctx.decision.strict_signal_stage || "STRICT_NO_ENTRY")],
@@ -533,9 +564,24 @@
         ["Drawdown Limit", fmtWeight(ctx.risk.drawdown_limit_weight)],
         ["Score Limit", fmtWeight(ctx.risk.score_limit_weight)],
         ["Account Risk", fmtWeight(ctx.risk.account_risk_limit_weight)],
-        ["2ATR Stop", fmtCurrency(ctx.risk.stop_price_2atr)],
+        ["2ATR Stop", fmtDisplayCurrency(ctx, ctx.risk.stop_price_2atr)],
         ["Stop Distance", fmtMaybePct(ctx.risk.risk_pct_2atr, 2)],
       ], "신호의 alpha가 아니라 오늘 감당 가능한 위험량과 병목을 설명합니다.", { actionability: Math.round((metrics.riskCapacityScore - 50) * 0.24), blockPressure: Math.round(100 - metrics.riskCapacityScore) }, "tsm_latest_risk_snapshot.csv"),
+
+      object("paper_oms_today", "PaperOMS", "Paper OMS 객체", label(ctx.orderIntent.status || ctx.portfolioRisk.portfolio_risk_status || "MISSING"), metrics.paperOmsScore >= 70 ? "good" : metrics.paperOmsScore < 45 ? "bad" : "warn", [
+        ["Intent", label(ctx.orderIntent.status || "MISSING")],
+        ["Risk Gate", label(ctx.portfolioRisk.portfolio_risk_status || "MISSING")],
+        ["Approved Weight", fmtWeight(ctx.portfolioRisk.portfolio_approved_weight)],
+        ["Paper Position", label(ctx.paperPosition.position_state || "CASH")],
+        ["Position Weight", fmtWeight(ctx.paperPosition.weight)],
+        ["Reconciliation", label(ctx.paperReconciliation.status || "MISSING")],
+        ["Mismatch Count", fmtNumber(ctx.paperReconciliation.mismatch_count, 0)],
+        ["Lifecycle", label(ctx.orderLifecycle.lifecycle_state || "MISSING")],
+        ["Feedback Matured", label(ctx.executionFeedback.label_matured || "TRACKING")],
+        ["Fill Calibration", label(ctx.fillModelCalibration.calibration_status || "MISSING")],
+        ["Automation", label(ctx.automation.automation_status || "MISSING")],
+        ["Live", label(ctx.orderIntent.live_trading_status || ctx.paperReconciliation.live_trading_status || "DISABLED_BY_DESIGN")],
+      ], "실제 브로커 없이 주문 의도, Paper 체결, 포지션 원장, 정합성, 실행 피드백, 체결모델 보정까지 닫힌 루프로 기록합니다.", { actionability: Math.round((metrics.paperOmsScore - 50) * 0.18), blockPressure: Math.round(100 - metrics.paperOmsScore) }, "tsm_order_intents.csv"),
 
       object("prediction_model_today", "PredictionSnapshot", "예측·모델 객체", label(permission.prediction), ctx.predictionAllowed ? "good" : "warn", [
         ["20D Success", fmtPct(ctx.pSuccess, 1)],
@@ -582,9 +628,9 @@
         ["Strict Eligible", fmtNumber(ctx.universe.strict_eligible_symbols, 0)],
         ["Decision Events", fmtNumber(ctx.pooled.decision_event_count || ctx.pooled.oos_event_count, 0)],
         ["Selected OOS", fmtNumber(ctx.pooled.selected_oos_event_count, 0)],
-        ["TSM-like Strength", `${fmtNumber(metrics.tsmLikeSampleStrength, 0)} / 100`],
+        ["Similarity Strength", `${fmtNumber(metrics.tsmLikeSampleStrength, 0)} / 100`],
         ["Cross Support", `${fmtNumber(metrics.crossSectionalSupport, 0)} / 100`],
-      ], "TSM 단일 표본 부족을 반도체 유니버스와 TSM-like calibration으로 보완합니다.", { actionability: Math.round((metrics.crossSectionalSupport - 50) * 0.12), blockPressure: ctx.predictionAllowed ? -8 : 12 }, "tsm_pooled_latest_prediction_overlay.csv"),
+      ], "Top10 판단 표본을 Universal research pool과 similarity calibration으로 보완합니다.", { actionability: Math.round((metrics.crossSectionalSupport - 50) * 0.12), blockPressure: ctx.predictionAllowed ? -8 : 12 }, "tsm_pooled_latest_prediction_overlay.csv"),
 
       object("operations_quality_today", "DataQualityState", "운영·품질 객체", label(ctx.dataQuality.data_quality_status || "MISSING"), metrics.dataTrust >= 75 ? "good" : metrics.dataTrust < 45 ? "bad" : "warn", [
         ["Pipeline", ctx.lineageStatus || label(lineageStatus(ctx.tables.manifest))],
@@ -603,10 +649,12 @@
       edge("operations_quality_today", "price_rule_today", "controls", "데이터 품질이 가격·룰 입력을 통제", metrics.dataTrust >= 70 ? "good" : "warn"),
       edge("news_cause_today", "price_rule_today", "penalizes", "뉴스 원인이 룰 점수 감점으로 연결", metrics.newsDragScore >= 35 ? "warn" : "neutral"),
       edge("price_rule_today", "risk_policy_today", "sized_by", "신호 후보가 리스크 정책으로 비중 제한", metrics.riskCapacityScore >= 60 ? "good" : "warn"),
+      edge("risk_policy_today", "paper_oms_today", "approves", "리스크 승인 후에만 Paper 주문 의도가 체결 시뮬레이션으로 이동", metrics.paperOmsScore >= 70 ? "good" : "warn"),
+      edge("price_rule_today", "paper_oms_today", "creates_intent", "가격 신호가 주문 의도의 원천 signal_id가 됨", ctx.orderIntent.intent_id ? "good" : "warn"),
       edge("price_rule_today", "prediction_model_today", "evaluated_by", "룰 후보만 예측 품질 평가 대상", ctx.predictionAllowed ? "good" : "warn"),
       edge("validation_evidence_today", "prediction_model_today", "gated_by", "검증 근거가 모델 사용 권한을 결정", ctx.predictionAllowed ? "good" : "warn"),
       edge("backtest_strategy_today", "validation_evidence_today", "evidences", "백테스트 성과를 시간순 검증으로 재평가", metrics.validationTrustScore >= 70 ? "good" : "warn"),
-      edge("pooled_universe_today", "prediction_model_today", "supports", "반도체 유니버스가 TSM 예측을 보조", metrics.crossSectionalSupport >= 70 ? "good" : "warn"),
+      edge("pooled_universe_today", "prediction_model_today", "supports", "Universal research pool이 Top10 예측을 보조", metrics.crossSectionalSupport >= 70 ? "good" : "warn"),
       edge("prediction_model_today", "risk_policy_today", "informs", "게이트 통과 시 신호 품질을 리스크 해석에 반영", ctx.predictionAllowed ? "good" : "warn"),
     ];
   }
@@ -702,7 +750,7 @@
       contradictions.push(conflict("HIGH_PROBABILITY_MODEL_BLOCKED", "모델 확률 높음 + model gate blocked", "예측값은 좋아도 판단 근거로 쓸 수 없습니다.", "model gate root cause를 확인합니다.", "warn"));
     }
     if (bool(ctx.pooled.decision_support_allowed) && !ctx.predictionAllowed) {
-      contradictions.push(conflict("POOLED_SUPPORT_LOCAL_WEAK", "pooled model 좋음 + TSM direct 약함", "유니버스는 지지하지만 단일 종목 판단 권한이 약합니다.", "Paper만 허용하고 live 판단은 금지합니다.", "warn"));
+      contradictions.push(conflict("POOLED_SUPPORT_LOCAL_WEAK", "pooled model 좋음 + Top10 direct 약함", "Research pool은 지지하지만 Top10 직접 판단 권한이 약합니다.", "Paper만 허용하고 live 판단은 금지합니다.", "warn"));
     }
     if (backtest && (number(backtest.cagr_pct) || 0) > 5 && causal !== null && causal < 45) {
       contradictions.push(conflict("BACKTEST_GOOD_CAUSAL_WEAK", "backtest summary 좋음 + causal WF 약함", "전체 성과보다 시간순 검증이 취약합니다.", "causal WF와 CPCV 결과를 우선 확인합니다.", "warn"));
@@ -748,6 +796,7 @@
       targetPrice20d: breakout20,
       targetPrice60d: breakout60,
       stopPrice: ctx.risk.stop_price_2atr,
+      stopPriceDisplay: fmtDisplayCurrency(ctx, ctx.risk.stop_price_2atr),
       maxWeight: ctx.maxWeightPct,
       contradictionCount: contradictions.length,
     };
@@ -814,6 +863,7 @@
       ladder("Model Gate", label(ctx.modelGate.model_gate_status || permission.prediction), modelGateBlocked(ctx) ? "BLOCKED" : "PASS", "model gate snapshot/audit/root causes"),
       ladder("Stress Check", `${fmtNumber(metrics.stressTolerance, 0)} / 100`, metrics.stressTolerance >= 65 ? "PASS" : "WARN", "latest stress snapshot"),
       ladder("Paper Gate", label(permission.paper), ctx.paperAllowed ? "READY" : "NOT_READY", "paper gate / shadow paper"),
+      ladder("Paper OMS", label(ctx.orderLifecycle.lifecycle_state || ctx.orderIntent.status || "MISSING"), metrics.paperOmsScore >= 70 ? "READY" : "WARN", "order intent / execution / feedback / calibration"),
       ladder("Trading Plan", permission.title, permission.state.includes("STRICT") ? "READY" : permission.state.includes("DATA") ? "BLOCKED" : "WAIT", "daily trading plan"),
     ];
   }
@@ -827,6 +877,7 @@
       { id: "validation_evidence_today", x: 51, y: 72 },
       { id: "pooled_universe_today", x: 70, y: 72 },
       { id: "prediction_model_today", x: 70, y: 38 },
+      { id: "paper_oms_today", x: 84, y: 58 },
       { id: "trading_plan_today", x: 90, y: 38, virtual: true },
     ];
     const objectById = new Map(objects.map((objectItem) => [objectItem.id, objectItem]));
@@ -841,7 +892,7 @@
         fields: [
           ["20D", actionPlan.targetPrice20d || "없음"],
           ["60D", actionPlan.targetPrice60d || "없음"],
-          ["Stop", fmtCurrency(actionPlan.stopPrice)],
+          ["Stop", actionPlan.stopPriceDisplay || fmtCurrency(actionPlan.stopPrice)],
           ["Max Weight", fmtPct(actionPlan.maxWeight, 2)],
         ],
         meaning: actionPlan.reason,
@@ -882,6 +933,7 @@
       { objectId: "price_rule_today", label: "가격·룰", score: metrics.ruleSignalStrength },
       { objectId: "risk_policy_today", label: "리스크", score: metrics.riskCapacityScore },
       { objectId: "prediction_model_today", label: "예측", score: metrics.predictionPermissionEdge },
+      { objectId: "paper_oms_today", label: "Paper OMS", score: metrics.paperOmsScore },
       { objectId: "validation_evidence_today", label: "검증", score: metrics.validationTrustScore },
       { objectId: "news_cause_today", label: "뉴스 명확성", score: metrics.causeClarityScore },
       { objectId: "operations_quality_today", label: "운영·품질", score: metrics.dataTrust },
@@ -995,17 +1047,17 @@
 
   function statusScoreValue(value) {
     const raw = text(value).toUpperCase();
-    if (raw.includes("PASS") || raw.includes("READY") || raw.includes("ALLOWED")) return 92;
-    if (raw.includes("WARN") || raw.includes("DISPLAY_ONLY") || raw.includes("BLOCKED")) return 58;
-    if (raw.includes("FAIL") || raw.includes("MISSING")) return 25;
+    if (raw.includes("PASS") || raw.includes("READY") || raw.includes("ALLOWED") || raw.includes("APPROVED") || raw.includes("FILLED")) return 92;
+    if (raw.includes("WARN") || raw.includes("DISPLAY_ONLY") || raw.includes("PAPER_SUBMITTED") || raw.includes("EXPIRED")) return 58;
+    if (raw.includes("FAIL") || raw.includes("MISSING") || raw.includes("REJECTED") || raw.includes("BLOCKED") || raw.includes("MISMATCH")) return 25;
     return 50;
   }
 
   function statusTone(value) {
     const raw = text(value).toUpperCase();
-    if (raw.includes("PASS") || raw.includes("READY") || raw.includes("ALLOWED")) return "good";
-    if (raw.includes("FAIL") || raw.includes("MISSING")) return "bad";
-    if (raw.includes("WARN") || raw.includes("BLOCKED") || raw.includes("DISPLAY_ONLY")) return "warn";
+    if (raw.includes("PASS") || raw.includes("READY") || raw.includes("ALLOWED") || raw.includes("APPROVED") || raw.includes("FILLED")) return "good";
+    if (raw.includes("FAIL") || raw.includes("MISSING") || raw.includes("REJECTED") || raw.includes("BLOCKED") || raw.includes("MISMATCH")) return "bad";
+    if (raw.includes("WARN") || raw.includes("DISPLAY_ONLY") || raw.includes("PAPER_SUBMITTED") || raw.includes("EXPIRED")) return "warn";
     return "neutral";
   }
 
@@ -1112,6 +1164,38 @@
     if (parsed === null) return "없음";
     const prefix = parsed > 0 ? "+" : "";
     return `${prefix}${fmtNumber(parsed, digits)}`;
+  }
+
+  function inferDisplayCurrency(data, ...rows) {
+    const sources = [data && data.meta, ...rows].filter(Boolean);
+    for (const source of sources) {
+      const raw = source.display_currency || source.listing_currency;
+      if (hasValue(raw)) return text(raw).toUpperCase();
+    }
+    const symbol = text(data && data.meta && data.meta.symbol).toUpperCase();
+    return symbol.endsWith(".KS") || symbol.endsWith(".KQ") ? "KRW" : "USD";
+  }
+
+  function inferFxRateToUsd(...rows) {
+    for (const row of rows.filter(Boolean)) {
+      const fx = number(row.fx_rate_to_usd);
+      if (fx !== null && fx > 0) return fx;
+      const usdkrw = number(row.usdkrw);
+      if (usdkrw !== null && usdkrw > 0) return 1 / usdkrw;
+    }
+    return null;
+  }
+
+  function fmtDisplayCurrency(ctx, value) {
+    const parsed = number(value);
+    if (parsed === null) return "없음";
+    const currency = text(ctx && ctx.displayCurrency).toUpperCase();
+    if (currency === "KRW") {
+      const fx = number(ctx && ctx.fxRateToUsd);
+      const native = fx !== null && fx > 0 ? parsed / fx : parsed;
+      return `₩${native.toLocaleString("ko-KR", { maximumFractionDigits: 0 })}`;
+    }
+    return fmtCurrency(parsed);
   }
 
   function fmtCurrency(value) {

@@ -91,6 +91,23 @@ def load_signals(path: Path) -> pd.DataFrame:
     ]
     for col in bool_cols:
         df[col] = df[col].map(to_bool)
+    v2_defaults = {
+        "decision_tier": "LEGACY_ONLY",
+        "suggested_action": "LEGACY_ONLY",
+        "sizing_tier": "LEGACY_ONLY",
+        "raw_entry_event": "NONE",
+        "semi_momentum_regime": "UNKNOWN",
+        "suggested_weight": 0.0,
+        "memory_ai_regime_score": np.nan,
+        "semi_group_momentum_score": np.nan,
+        "stop_price_1_8atr": np.nan,
+        "invalidation_5d_low": np.nan,
+        "invalidation_ema10": np.nan,
+        "next_check_condition": "",
+    }
+    for col, default in v2_defaults.items():
+        if col not in df.columns:
+            df[col] = default
     return df
 
 
@@ -130,6 +147,10 @@ def drawdown_limit(row: pd.Series) -> tuple[float, str]:
 def score_limit(row: pd.Series) -> tuple[float, str]:
     score = as_float(row["score_price_algo_total"])
     trigger = str(row["entry_trigger"])
+    decision_tier = str(row.get("decision_tier", "LEGACY_ONLY"))
+    suggested_weight = as_float(row.get("suggested_weight"), 0.0)
+    if decision_tier in {"STRICT_ENTRY_ALLOWED", "AGGRESSIVE_TREND_ENTRY", "BREAKOUT_EXTENSION_TINY", "PULLBACK_REENTRY"} and suggested_weight > 0:
+        return min(suggested_weight, 0.07), f"V2_{decision_tier}"
     if trigger == "DEEP_DD_RECOVERY" or str(row.get("trade_action")) == "RESEARCH_ONLY_DEEP_DD":
         return 0.00, "DEEP_DD_RESEARCH_ONLY"
     if score >= 75 and trigger != "NONE":
@@ -153,6 +174,11 @@ def account_risk_limit(row: pd.Series, account_risk_pct: float) -> tuple[float, 
 def risk_state(row: pd.Series, final_weight: float) -> str:
     if final_weight <= 0:
         return "NO_NEW_RISK"
+    decision_tier = str(row.get("decision_tier", ""))
+    if decision_tier == "BREAKOUT_EXTENSION_TINY":
+        return "V2_TINY_TREND_RISK_ALLOWED"
+    if decision_tier in {"AGGRESSIVE_TREND_ENTRY", "PULLBACK_REENTRY", "STRICT_ENTRY_ALLOWED"}:
+        return "V2_TREND_RISK_ALLOWED"
     if str(row.get("trade_action")) == "RESEARCH_ONLY_DEEP_DD":
         return "RESEARCH_ONLY_NO_NEW_RISK"
     if to_bool(row["algo_vol_extreme"]):
@@ -190,9 +216,13 @@ def build_risk_policy(
         final_weight = max(0.0, min(value for value, _ in limits.values()))
         risk_per_share = 2.0 * as_float(row["atr_14"])
         stop_price = as_float(row["close"]) - risk_per_share
+        memory_ai_score = as_float(row.get("memory_ai_regime_score"), 0.0)
+        paper_semiconductor_max_weight = 0.45 if memory_ai_score >= 70.0 else 0.35
         rows.append(
             {
                 "date": row["date"],
+                "symbol": row.get("symbol", ""),
+                "symbol_group": row.get("symbol_group", ""),
                 "close": row["close"],
                 "trade_action": row["trade_action"],
                 "entry_trigger": row["entry_trigger"],
@@ -205,6 +235,9 @@ def build_risk_policy(
                 "risk_pct_2atr": row["risk_pct_2atr"],
                 "risk_per_share_2atr": risk_per_share,
                 "stop_price_2atr": stop_price,
+                "stop_price_1_8atr": as_float(row.get("stop_price_1_8atr"), as_float(row["close"]) - 1.8 * as_float(row["atr_14"])),
+                "invalidation_5d_low": as_float(row.get("invalidation_5d_low")),
+                "invalidation_ema10": as_float(row.get("invalidation_ema10")),
                 "vol_limit_weight": limits["vol"][0],
                 "trend_limit_weight": limits["trend"][0],
                 "drawdown_limit_weight": limits["drawdown"][0],
@@ -214,6 +247,16 @@ def build_risk_policy(
                 "final_recommended_max_weight": final_weight,
                 "limiting_reason": limiting_reason(limits),
                 "risk_state": risk_state(row, final_weight),
+                "raw_entry_event": row.get("raw_entry_event", "NONE"),
+                "semi_momentum_regime": row.get("semi_momentum_regime", "UNKNOWN"),
+                "semi_group_momentum_score": row.get("semi_group_momentum_score", np.nan),
+                "memory_ai_regime_score": row.get("memory_ai_regime_score", np.nan),
+                "decision_tier": row.get("decision_tier", "LEGACY_ONLY"),
+                "sizing_tier": row.get("sizing_tier", "LEGACY_ONLY"),
+                "suggested_action": row.get("suggested_action", "LEGACY_ONLY"),
+                "suggested_weight": as_float(row.get("suggested_weight"), 0.0),
+                "next_check_condition": row.get("next_check_condition", ""),
+                "paper_semiconductor_max_weight": paper_semiconductor_max_weight,
                 "algo_vol_high": row["algo_vol_high"],
                 "algo_vol_extreme": row["algo_vol_extreme"],
                 "algo_overextended_highvol": row["algo_overextended_highvol"],
@@ -239,6 +282,8 @@ def write_latest_snapshot(outdir: Path, policy: pd.DataFrame) -> None:
         "account_risk_limit_weight",
         "secondary_account_risk_limit_weight",
         "final_recommended_max_weight",
+        "suggested_weight",
+        "paper_semiconductor_max_weight",
     }
     rows = []
     for col in policy.columns:
@@ -306,6 +351,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", default="tsm_price_rule_output")
     parser.add_argument("--account-risk-pct", type=float, default=0.005)
     parser.add_argument("--secondary-account-risk-pct", type=float, default=0.010)
+    parser.add_argument("--root-symbol", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--root-signals", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 

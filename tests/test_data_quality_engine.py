@@ -79,7 +79,7 @@ def test_data_quality_fails_stale_latest_signal():
     assert stale["severity"] == "CRITICAL"
 
 
-def test_data_quality_blocks_when_adjusted_close_equals_close():
+def test_data_quality_warns_when_adjusted_close_equals_close():
     raw, enriched, signals = _base_frames(adj_close_values=[101.0, 102.0, 103.0])
     existing = Path(__file__)
 
@@ -94,7 +94,39 @@ def test_data_quality_blocks_when_adjusted_close_equals_close():
         7,
     )
 
-    assert determine_status(checks) == "FAIL"
+    assert determine_status(checks) == "WARN"
     failure = checks.loc[checks["check"].eq("corporate_action_adjustment_independent")].iloc[0]
     assert bool(failure["passed"]) is False
-    assert failure["severity"] == "CRITICAL"
+    assert failure["severity"] == "WARN"
+
+
+def test_data_quality_allows_intentionally_disabled_benchmarks():
+    raw, enriched, signals = _base_frames()
+    enriched = enriched.drop(
+        columns=[
+            "spy_adj_close",
+            "smh_adj_close",
+            "qqq_adj_close",
+            "relative_return_vs_spy_60d",
+            "relative_return_vs_smh_60d",
+            "relative_return_vs_qqq_60d",
+        ]
+    )
+    existing = Path(__file__)
+
+    checks = build_checks(
+        raw,
+        enriched,
+        signals,
+        existing,
+        existing,
+        existing,
+        "2024-01-05",
+        7,
+        benchmark_mode="disabled",
+    )
+
+    assert determine_status(checks) == "PASS"
+    disabled = checks.loc[checks["check"].eq("benchmark_join_columns_disabled")].iloc[0]
+    assert bool(disabled["passed"]) is True
+    assert disabled["severity"] == "CRITICAL"

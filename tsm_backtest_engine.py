@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSM single-name backtest engine.
+Per-symbol backtest engine used by the Top10 decision universe.
 
 The rule engine creates close-based signals. This script tests those signals
 with next-session open fills, ATR stops, cash/share accounting, and explicit
@@ -846,7 +846,7 @@ def write_report(
     best = ranked.iloc[0] if not ranked.empty else None
 
     lines = [
-        "# TSMC Backtest Report",
+        "# Top10 Per-Symbol Backtest Report",
         "",
         "## Execution assumptions",
         "- Signals are generated from same-day close data.",

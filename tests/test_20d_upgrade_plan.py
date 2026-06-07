@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from tsm_core.schemas import validate_no_future_features
+from tsm_backtest_feedback_feature_engine import build_feedback_features
 from tsm_external_feature_engine import add_revenue_features
 from tsm_ml_overlay_backtest import build_non_overlap_event_portfolio
 from tsm_prediction_engine import OPTIONAL_NEWS_SIGNAL_DEFAULTS, normalize_optional_signal_columns
@@ -51,6 +52,64 @@ def test_schema_blocks_new_future_leakage_patterns():
     assert "next_earnings_return" in leaks
     assert "future_alpha" in leaks
     assert "score_price_algo_total" not in leaks
+
+
+def test_backtest_feedback_waits_for_label_availability_date():
+    ledger = pd.DataFrame(
+        {
+            "symbol": ["TSM", "TSM"],
+            "symbol_group": ["foundry", "foundry"],
+            "date": pd.to_datetime(["2024-01-02", "2024-01-10"]),
+            "exit_date": pd.to_datetime(["2024-01-30", "2024-01-31"]),
+            "strategy_id": ["S", "S"],
+            "strategy_group": ["SG", "SG"],
+            "variant_id": ["V1", "V2"],
+            "entry_trigger": ["A", "A"],
+            "candidate_tier": ["decision_trade_ready", "decision_trade_ready"],
+            "net_return_pct": [10.0, -10.0],
+            "realized_r_multiple": [1.0, -1.0],
+            "stop_hit": [False, True],
+        }
+    )
+
+    features = build_feedback_features(ledger, pd.DataFrame())
+
+    assert pd.isna(features.loc[0, "fb_trigger_success_rate_ewm_60"])
+    assert pd.isna(features.loc[1, "fb_trigger_success_rate_ewm_60"])
+
+
+def test_oof_feedback_waits_for_20d_label_availability():
+    ledger = pd.DataFrame(
+        {
+            "symbol": ["TSM", "TSM"],
+            "symbol_group": ["foundry", "foundry"],
+            "date": pd.to_datetime(["2024-01-29", "2024-02-01"]),
+            "exit_date": pd.to_datetime(["2024-01-29", "2024-02-01"]),
+            "strategy_id": ["S", "S"],
+            "strategy_group": ["SG", "SG"],
+            "variant_id": ["V1", "V2"],
+            "entry_trigger": ["A", "A"],
+            "candidate_tier": ["decision_trade_ready", "decision_trade_ready"],
+            "net_return_pct": [0.0, 0.0],
+            "realized_r_multiple": [0.0, 0.0],
+            "stop_hit": [False, False],
+        }
+    )
+    oof = pd.DataFrame(
+        {
+            "symbol": ["TSM"],
+            "date": [pd.Timestamp("2024-01-02")],
+            "p_success": [0.25],
+            "label_success_20d": [1],
+            "label_net_return_pct_20d": [5.0],
+            "selected_by_threshold": [True],
+        }
+    )
+
+    features = build_feedback_features(ledger, oof)
+
+    assert pd.isna(features.loc[0, "fb_model_calibration_residual_ewm_120"])
+    assert features.loc[1, "fb_model_calibration_residual_ewm_120"] == 0.75
 
 
 def test_deflated_sharpe_uses_period_sharpe_and_bootstrap_gate():

@@ -104,9 +104,9 @@ def normalize_candidate_frame(pooled: pd.DataFrame, local: pd.DataFrame) -> pd.D
         p["source_scope"] = "pooled"
         frames.append(p)
     if not local.empty:
-        l = local.copy()
-        l["source_scope"] = "local"
-        frames.append(l)
+        local_frame = local.copy()
+        local_frame["source_scope"] = "local"
+        frames.append(local_frame)
     if not frames:
         return pd.DataFrame()
     candidates = pd.concat(frames, ignore_index=True, sort=False)

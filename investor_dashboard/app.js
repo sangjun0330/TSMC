@@ -7,17 +7,71 @@ const state = {
   portfolioCurrency: "KRW",
   portfolioLoaded: false,
   pfShowNewBuys: false,
+  signalFilter: "all",
+  live: null,
+  liveTimer: null,
+  liveHistory: {},
 };
 
 const $ = (id) => document.getElementById(id);
 
-const actionLabels = {
-  execute_candidate: "실행 후보",
-  watch: "관찰",
-  reduce: "추격 금지",
-  avoid: "매수 금지",
-  blocked: "차단",
+const LIVE_POLL_MS = 30000;
+// Max live-price points kept per symbol while the dashboard stays open
+// (240 × 30s ≈ 2 hours of intraday session history).
+const LIVE_HISTORY_MAX = 240;
+
+const marketStateLabel = {
+  REGULAR: "장중",
+  PRE: "장전",
+  POST: "장후",
+  CLOSED: "장마감",
+  UNKNOWN: "확인 중",
 };
+
+function liveQuote(symbol) {
+  return state.live?.quotes?.[symbol] || null;
+}
+
+function isLiveMarket(quote) {
+  return Boolean(quote) && ["REGULAR", "PRE", "POST"].includes(String(quote.market_state || ""));
+}
+
+function fmtSignedPct(value, digits = 2) {
+  const num = toNumber(value);
+  if (num === null) return "";
+  return `${num >= 0 ? "+" : ""}${num.toFixed(digits)}%`;
+}
+
+function moveTone(value) {
+  const num = toNumber(value);
+  if (num === null || num === 0) return "flat";
+  return num > 0 ? "up" : "down";
+}
+
+// Distance from the live price to a fixed level (stop/target/forecast), in %.
+function pctTo(level, from) {
+  const a = toNumber(level);
+  const b = toNumber(from);
+  if (a === null || b === null || b === 0) return null;
+  return (a / b - 1) * 100;
+}
+
+const actionLabels = {
+  execute_candidate: "실행후보",
+  watch: "관찰",
+  reduce: "매수금지",
+  avoid: "매수금지",
+  blocked: "매수금지",
+};
+
+const signalFilterLabels = {
+  all: "전체",
+  positive: "실행후보",
+  neutral: "관찰",
+  defensive: "매수금지",
+};
+
+const signalFilterOrder = ["all", "positive", "neutral", "defensive"];
 
 const statusTone = {
   정상: "good",
@@ -104,6 +158,19 @@ function fmtPrice(value, currency) {
   return `$${num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function fmtChipPrice(value, currency) {
+  const num = toNumber(value);
+  if (num === null) return "현재가 대기";
+  if (currency === "KRW") return `₩${Math.round(num).toLocaleString("ko-KR")}`;
+  return `$${num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function fmtChipChange(value) {
+  const num = toNumber(value);
+  if (num === null) return "전일대비 대기";
+  return `${num >= 0 ? "+" : ""}${num.toFixed(2)}%`;
+}
+
 function fmtUsdKrw(value) {
   const num = toNumber(value);
   if (num === null) return "환율 없음";
@@ -131,6 +198,36 @@ function statusPill(label) {
 
 function actionPill(level) {
   return `<span class="action-pill ${escapeHtml(level || "neutral")}">${escapeHtml(actionLabels[level] || "확인")}</span>`;
+}
+
+function signalProfile(item) {
+  return item?.signal_profile || {};
+}
+
+function signalLabel(item) {
+  const profile = signalProfile(item);
+  return profile.tier_label || actionLabels[item?.action_level] || "관찰";
+}
+
+function signalToneClass(item) {
+  const tier = signalProfile(item).tier;
+  if (tier === "positive") return "execute_candidate";
+  if (tier === "neutral") return "watch";
+  return item?.action_level || "avoid";
+}
+
+function signalMetricText(item) {
+  const metrics = signalProfile(item).metrics || {};
+  const parts = [];
+  if (toNumber(metrics.p_success_20d) !== null) parts.push(`성공 ${fmtPct(metrics.p_success_20d)}`);
+  if (toNumber(metrics.p_stop_hit_20d) !== null) parts.push(`손절 ${fmtPct(metrics.p_stop_hit_20d)}`);
+  if (toNumber(metrics.expected_r_20d) !== null) parts.push(`기대 ${fmtNumber(metrics.expected_r_20d, 2)}R`);
+  if (toNumber(metrics.forecast_return_20d) !== null) parts.push(`종가 ${fmtSignedPct(metrics.forecast_return_20d)}`);
+  return parts.join(" · ") || "20일 예측 지표 없음";
+}
+
+function primaryBlockReason(item) {
+  return (item?.new_buy_block_reasons || [])[0] || null;
 }
 
 function coverageText(coverage) {
@@ -183,8 +280,9 @@ function renderActionRow() {
   const data = state.data;
   const queue = data?.action_queue || [];
   const symbols = data?.symbols || [];
-  const topCandidate = queue.find((item) => item.action_level === "execute_candidate") || queue[0];
-  const hardAvoid = symbols.find((item) => ["avoid", "reduce", "blocked"].includes(item.action_level));
+  const topCandidate = queue.find((item) => item.signal_profile?.new_buy_allowed || item.signal_profile?.tier === "positive" || item.action_level === "execute_candidate");
+  const fallbackFocus = topCandidate || queue.find((item) => item.signal_profile?.tier === "neutral") || queue[0];
+  const hardAvoid = symbols.find((item) => (item.new_buy_block_reasons || []).length);
   const system = data?.system || {};
   const daily = system.daily_update || {};
   const top12Coverage = coverageText(daily.coverage?.latest_prediction_top12);
@@ -192,24 +290,28 @@ function renderActionRow() {
   const fallbackRows = daily.latest_predictions?.fallback_rows ?? "확인 필요";
   const cards = [
     {
-      label: "1순위",
-      title: topCandidate ? topCandidate.action : "실행 후보 없음",
-      meta: topCandidate ? `${topCandidate.name} · ${topCandidate.symbol}` : "새 매수는 대기",
-      body: topCandidate ? `${topCandidate.main_reason} · 최대 ${fmtWeight(topCandidate.max_weight)}` : "조건이 맞는 종목이 나올 때까지 관찰",
-      tone: topCandidate?.action_level || "neutral",
+      label: "실행후보",
+      title: topCandidate ? (topCandidate.signal_profile?.headline || topCandidate.action) : "우위 신호 없음",
+      meta: fallbackFocus ? `${fallbackFocus.name} · ${fallbackFocus.symbol}` : "새 매수는 대기",
+      body: topCandidate
+        ? `${topCandidate.main_reason} · ${signalMetricText(topCandidate)} · 최대 ${fmtWeight(topCandidate.max_weight)}`
+        : fallbackFocus
+          ? `${signalLabel(fallbackFocus)} · ${signalMetricText(fallbackFocus)}`
+          : "20일 예측 우위가 생길 때까지 대기",
+      tone: topCandidate?.action_level || fallbackFocus?.action_level || "neutral",
     },
     {
-      label: "금지 행동",
-      title: hardAvoid ? hardAvoid.action_text : "추격매수 금지",
+      label: "매수금지",
+      title: hardAvoid ? (primaryBlockReason(hardAvoid)?.label || hardAvoid.action_text) : "공통 리스크 원칙",
       meta: hardAvoid ? `${hardAvoid.name} · ${hardAvoid.symbol}` : "공통 원칙",
-      body: hardAvoid ? hardAvoid.warning : "손절 기준 없는 진입은 하지 않음",
+      body: hardAvoid ? (primaryBlockReason(hardAvoid)?.detail || hardAvoid.warning) : "손절 기준 없는 진입은 하지 않음",
       tone: hardAvoid?.action_level || "avoid",
     },
     {
       label: "신뢰 상태",
       title: `${system.data_status || "확인 필요"} · ${daily.full_audit_status || system.model_status || "확인 필요"}`,
       meta: `Top12 ${top12Coverage} · 해외 ${foreignCoverage}`,
-      body: system.live_trading_status === "DISABLED_BY_DESIGN" ? `${system.main_model || "내일 상승 예측"} 메인 · fallback ${fallbackRows} · 실거래 주문 비활성` : "실거래 상태 확인 필요",
+      body: system.live_trading_status === "DISABLED_BY_DESIGN" ? `${system.main_model || "20일 예측"} 메인 · fallback ${fallbackRows} · 실거래 주문 비활성` : "실거래 상태 확인 필요",
       tone: system.data_status === "정상" && system.model_status === "판단 가능" ? "execute_candidate" : "watch",
     },
   ];
@@ -229,28 +331,68 @@ function renderActionRow() {
 
 function filteredSymbols() {
   const symbols = state.data?.symbols || [];
-  if (state.activeTab === "all") return symbols;
-  if (state.activeTab === "risk") return symbols.filter((item) => ["avoid", "reduce", "blocked"].includes(item.action_level));
-  return symbols.filter((item) => item.action_level === state.activeTab);
+  if (state.signalFilter === "all") return symbols;
+  return symbols.filter((item) => (signalProfile(item).tier || "unknown") === state.signalFilter);
+}
+
+function renderSignalFilter(counts) {
+  const target = $("signalFilter");
+  if (!target) return;
+  const total = Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  target.innerHTML = signalFilterOrder
+    .map((key) => {
+      const count = key === "all" ? total : counts?.[key] || 0;
+      const active = state.signalFilter === key ? "active" : "";
+      return `
+        <button class="signal-filter-button ${active}" type="button" data-filter="${escapeHtml(key)}" aria-pressed="${active ? "true" : "false"}">
+          <span>${escapeHtml(signalFilterLabels[key])}</span>
+          <b>${count}</b>
+        </button>
+      `;
+    })
+    .join("");
+  target.querySelectorAll(".signal-filter-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.signalFilter = button.dataset.filter || "all";
+      state.selectedSymbol = null;
+      render();
+    });
+  });
 }
 
 function renderSymbolGrid() {
-  const symbols = filteredSymbols();
   const all = state.data?.symbols || [];
   const counts = all.reduce((acc, item) => {
-    acc[item.action_level] = (acc[item.action_level] || 0) + 1;
+    const tier = signalProfile(item).tier || "unknown";
+    acc[tier] = (acc[tier] || 0) + 1;
     return acc;
   }, {});
-  $("boardSummary").textContent = `실행 ${counts.execute_candidate || 0} · 관찰 ${counts.watch || 0} · 금지/위험 ${(counts.avoid || 0) + (counts.reduce || 0) + (counts.blocked || 0)}`;
+  renderSignalFilter(counts);
+  const symbols = filteredSymbols();
+  $("boardSummary").textContent = `실행후보 ${counts.positive || 0} · 관찰 ${counts.neutral || 0} · 매수금지 ${counts.defensive || 0} · 칩 = 실시간 현재가 / 전일 종가 대비`;
+  if (!symbols.length) {
+    $("symbolGrid").innerHTML = `<div class="empty-state compact">${escapeHtml(signalFilterLabels[state.signalFilter] || "선택한 분류")} 종목이 없습니다.</div>`;
+    return;
+  }
   $("symbolGrid").innerHTML = symbols
     .map((item) => {
       const selected = item.symbol === state.selectedSymbol ? "selected" : "";
-      const prob = fmtPct(item.prediction?.up_probability);
+      const q = liveQuote(item.symbol);
+      const livePrice = q?.price ?? item.price;
+      const liveCurrency = q?.currency || item.currency;
+      const changePct = q ? q.change_pct : null;
+      const priceText = fmtChipPrice(livePrice, liveCurrency);
+      const changeText = fmtChipChange(changePct);
+      const changeTone = moveTone(changePct);
+      const liveTitle = q
+        ? ` · 실시간 현재가 ${fmtPrice(q.price, liveCurrency)} · 전일 종가 ${fmtPrice(q.prev_close, liveCurrency)} 대비 ${fmtSignedPct(q.change_pct)}`
+        : ` · 실시간 현재가 대기 · 기준일 종가 ${fmtPrice(item.price, item.currency)}`;
       return `
-        <button class="symbol-chip ${escapeHtml(item.action_level)} ${selected}" type="button" role="tab" aria-selected="${selected ? "true" : "false"}" data-symbol="${escapeHtml(item.symbol)}" title="${escapeHtml(item.name)} · ${escapeHtml(actionLabels[item.action_level] || "")} · ${fmtPrice(item.price, item.currency)}">
+        <button class="symbol-chip ${escapeHtml(signalToneClass(item))} ${selected}" type="button" role="tab" aria-selected="${selected ? "true" : "false"}" data-symbol="${escapeHtml(item.symbol)}" title="${escapeHtml(item.name)}${liveTitle}">
           <span class="chip-dot" aria-hidden="true"></span>
           <b class="chip-ticker">${escapeHtml(item.symbol)}</b>
-          <span class="chip-prob">${prob}</span>
+          <span class="chip-signal">${escapeHtml(priceText)}</span>
+          <span class="chip-prob ${escapeHtml(changeTone)}">${escapeHtml(changeText)}</span>
         </button>
       `;
     })
@@ -263,42 +405,152 @@ function renderSymbolGrid() {
   });
 }
 
-function chartSvg(item) {
-  const series = (item?.price_series || []).filter((row) => toNumber(row.price) !== null).slice(-90);
-  if (series.length < 2) {
-    return `<div class="empty-chart">가격 데이터 없음</div>`;
+// Append one live price point per symbol from the latest quote poll.
+function recordLiveHistory(quotes) {
+  const now = Date.now();
+  const store = state.liveHistory || (state.liveHistory = {});
+  for (const [symbol, quote] of Object.entries(quotes || {})) {
+    const price = toNumber(quote?.price);
+    if (price === null) continue;
+    const arr = store[symbol] || (store[symbol] = []);
+    arr.push({ ts: now, price, currency: quote.currency || "USD" });
+    if (arr.length > LIVE_HISTORY_MAX) arr.splice(0, arr.length - LIVE_HISTORY_MAX);
+  }
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// Generic responsive line chart with hover crosshair support. `points` is a list
+// of { value, label }. Reference lines (target/stop) render as dashed lines with
+// HTML labels. Returns chart-wrap markup, or an empty-state when too few points.
+function lineChartMarkup(points, opts = {}) {
+  const { currency = "USD", lines = [], ariaLabel = "가격 차트", emptyText = "데이터 없음" } = opts;
+  const clean = (points || []).filter((p) => toNumber(p.value) !== null);
+  if (clean.length < 2) {
+    return `<div class="empty-chart">${escapeHtml(emptyText)}</div>`;
   }
   const width = 680;
   const height = 220;
-  const values = series.map((row) => Number(row.price));
-  const stop = toNumber(item.risk?.stop_price);
-  const target = toNumber(item.risk?.target_price);
-  const extra = [stop, target].filter((value) => value !== null);
-  const min = Math.min(...values, ...extra);
-  const max = Math.max(...values, ...extra);
-  const pad = Math.max((max - min) * 0.08, max * 0.01);
+  const values = clean.map((p) => Number(p.value));
+  const refs = lines.map((l) => toNumber(l.value)).filter((v) => v !== null);
+  const min = Math.min(...values, ...refs);
+  const max = Math.max(...values, ...refs);
+  const pad = Math.max((max - min) * 0.08, Math.abs(max) * 0.01) || 1;
   const yMin = min - pad;
   const yMax = max + pad;
-  const xFor = (idx) => (idx / Math.max(series.length - 1, 1)) * width;
-  const yFor = (value) => height - ((value - yMin) / Math.max(yMax - yMin, 1)) * height;
-  const path = series.map((row, idx) => `${idx === 0 ? "M" : "L"} ${xFor(idx).toFixed(2)} ${yFor(Number(row.price)).toFixed(2)}`).join(" ");
-  const line = (value, cssClass, label) => {
-    if (value === null) return "";
-    const y = yFor(value).toFixed(2);
-    return `<g class="${cssClass}"><line x1="0" y1="${y}" x2="${width}" y2="${y}"></line><text x="${width - 96}" y="${Number(y) - 6}">${escapeHtml(label)}</text></g>`;
-  };
+  const xFor = (idx) => (idx / Math.max(clean.length - 1, 1)) * width;
+  const yFor = (value) => height - ((value - yMin) / Math.max(yMax - yMin, 1e-9)) * height;
+  const path = clean.map((p, idx) => `${idx === 0 ? "M" : "L"} ${xFor(idx).toFixed(2)} ${yFor(Number(p.value)).toFixed(2)}`).join(" ");
+  const pts = clean.map((p, idx) => ({ x: Number(xFor(idx).toFixed(2)), y: Number(yFor(Number(p.value)).toFixed(2)), v: Number(p.value), label: p.label || "" }));
+  const refLines = lines
+    .filter((l) => toNumber(l.value) !== null)
+    .map((l) => `<line class="ref-line ${l.cssClass}" x1="0" y1="${yFor(Number(l.value)).toFixed(2)}" x2="${width}" y2="${yFor(Number(l.value)).toFixed(2)}"></line>`)
+    .join("");
+  const refLabels = lines
+    .filter((l) => toNumber(l.value) !== null)
+    .map((l) => `<span class="ref-label ${l.cssClass}" style="top:${(yFor(Number(l.value)) / height * 100).toFixed(2)}%">${escapeHtml(l.label)}</span>`)
+    .join("");
+  const dataAttr = escapeHtml(JSON.stringify({ pts, currency, w: width, h: height }));
   return `
-    <svg class="price-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(item.symbol)} 가격 차트">
-      <g class="grid-lines">
-        <line x1="0" y1="${height * 0.25}" x2="${width}" y2="${height * 0.25}"></line>
-        <line x1="0" y1="${height * 0.5}" x2="${width}" y2="${height * 0.5}"></line>
-        <line x1="0" y1="${height * 0.75}" x2="${width}" y2="${height * 0.75}"></line>
-      </g>
-      ${line(target, "target-line", "목표")}
-      ${line(stop, "stop-line", "손절")}
-      <path class="price-path" d="${path}"></path>
-    </svg>
+    <div class="chart-wrap">
+      <svg class="price-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(ariaLabel)}" data-chart="${dataAttr}">
+        <g class="grid-lines">
+          <line x1="0" y1="${height * 0.25}" x2="${width}" y2="${height * 0.25}"></line>
+          <line x1="0" y1="${height * 0.5}" x2="${width}" y2="${height * 0.5}"></line>
+          <line x1="0" y1="${height * 0.75}" x2="${width}" y2="${height * 0.75}"></line>
+        </g>
+        ${refLines}
+        <path class="price-path" d="${path}"></path>
+        <g class="chart-cursor" opacity="0">
+          <line class="cursor-line" x1="0" y1="0" x2="0" y2="${height}"></line>
+          <circle class="cursor-dot" r="4" cx="0" cy="0"></circle>
+        </g>
+      </svg>
+      ${refLabels}
+      <div class="chart-tooltip" hidden></div>
+    </div>
   `;
+}
+
+// Daily close history (engine price_series) with target/stop reference lines.
+function chartSvg(item) {
+  const series = (item?.price_series || []).filter((row) => toNumber(row.price) !== null).slice(-90);
+  const points = series.map((row) => ({ value: Number(row.price), label: compactDate(row.date) }));
+  return lineChartMarkup(points, {
+    currency: item.currency,
+    lines: [
+      { value: toNumber(item.risk?.target_price), cssClass: "target-line", label: "목표" },
+      { value: toNumber(item.risk?.stop_price), cssClass: "stop-line", label: "손절" },
+    ],
+    ariaLabel: `${item.symbol} 일일 가격 차트`,
+    emptyText: "가격 데이터 없음",
+  });
+}
+
+// Intraday session history accumulated from the 30s live-quote polling.
+function liveChartSvg(item) {
+  const history = state.liveHistory?.[item.symbol] || [];
+  const points = history.map((h) => ({ value: Number(h.price), label: fmtClock(h.ts) }));
+  const currency = history.length ? history[history.length - 1].currency : (liveQuote(item.symbol)?.currency || item.currency);
+  return lineChartMarkup(points, {
+    currency,
+    ariaLabel: `${item.symbol} 실시간 세션 차트`,
+    emptyText: "실시간 데이터 수집 중 · 30초마다 갱신 (점 2개부터 표시)",
+  });
+}
+
+// Wire hover crosshair + price tooltip onto every chart inside `root`.
+function attachChartInteractions(root) {
+  if (!root) return;
+  root.querySelectorAll(".chart-wrap").forEach((wrap) => {
+    const svg = wrap.querySelector(".price-chart[data-chart]");
+    const tip = wrap.querySelector(".chart-tooltip");
+    if (!svg || !tip) return;
+    let cfg;
+    try {
+      cfg = JSON.parse(svg.dataset.chart);
+    } catch (err) {
+      return;
+    }
+    const pts = cfg.pts || [];
+    if (pts.length < 2) return;
+    const cursor = svg.querySelector(".chart-cursor");
+    const line = svg.querySelector(".cursor-line");
+    const dot = svg.querySelector(".cursor-dot");
+    const onMove = (event) => {
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width) return;
+      const vbX = ((event.clientX - rect.left) / rect.width) * cfg.w;
+      let best = pts[0];
+      let bestDist = Infinity;
+      for (const p of pts) {
+        const dist = Math.abs(p.x - vbX);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = p;
+        }
+      }
+      cursor.setAttribute("opacity", "1");
+      line.setAttribute("x1", best.x);
+      line.setAttribute("x2", best.x);
+      dot.setAttribute("cx", best.x);
+      dot.setAttribute("cy", best.y);
+      tip.hidden = false;
+      tip.innerHTML = `<b>${fmtPrice(best.v, cfg.currency)}</b>${best.label ? `<span>${escapeHtml(best.label)}</span>` : ""}`;
+      tip.style.left = `${(best.x / cfg.w) * rect.width}px`;
+      tip.style.top = `${(best.y / cfg.h) * rect.height}px`;
+    };
+    const onLeave = () => {
+      cursor.setAttribute("opacity", "0");
+      tip.hidden = true;
+    };
+    svg.addEventListener("pointermove", onMove);
+    svg.addEventListener("pointerleave", onLeave);
+  });
 }
 
 function predictionBlock(item, horizonKey) {
@@ -435,16 +687,61 @@ function combinedForecastBlock(item, horizonKey) {
   `;
 }
 
+function liveRiskSection(selected, q) {
+  if (!q || toNumber(q.price) === null) return "";
+  const cur = selected.currency;
+  const live = toNumber(q.price);
+  const stop = toNumber(selected.risk?.stop_price);
+  const target = toNumber(selected.risk?.target_price);
+  const fc20 = toNumber(selected.close_forecasts?.["20d"]?.predicted_close ?? selected.predictions?.["20d"]?.predicted_close);
+  const stopCushion = stop ? (live / stop - 1) * 100 : null; // + = above stop (safe)
+  const targetGap = target ? (target / live - 1) * 100 : null; // + = room left to target
+  const upside = fc20 ? (fc20 / live - 1) * 100 : null; // + = model expects higher than now
+  const alerts = [];
+  if (stop && live <= stop) alerts.push(`<div class="live-alert danger">손절가 이탈 · 현재가 ${fmtPrice(live, cur)} ≤ 손절 ${fmtPrice(stop, cur)}</div>`);
+  if (target && live >= target) alerts.push(`<div class="live-alert good">목표가 도달 · 현재가 ${fmtPrice(live, cur)} ≥ 목표 ${fmtPrice(target, cur)}</div>`);
+  const card = (label, value, note, tone) =>
+    `<div class="live-card"><span>${label}</span><strong>${value}</strong>${note ? `<small class="${tone || ""}">${escapeHtml(note)}</small>` : ""}</div>`;
+  return `
+    <div class="focus-section live-section">
+      <h3 class="focus-section-title">실시간 가격 · 리스크 <small class="live-tag">● LIVE</small></h3>
+      ${alerts.join("")}
+      <div class="live-grid">
+        ${card("현재가", fmtPrice(live, cur), `${fmtSignedPct(q.change_pct)} 장중`, moveTone(q.change_pct))}
+        ${card("손절가", fmtPrice(stop, cur), stopCushion === null ? "" : `${fmtSignedPct(stopCushion)} 여유`, stopCushion !== null && stopCushion <= 0 ? "down" : "up")}
+        ${card("목표가", fmtPrice(target, cur), targetGap === null ? "" : (targetGap <= 0 ? "도달" : `${fmtSignedPct(targetGap)} 남음`), targetGap !== null && targetGap <= 0 ? "up" : "")}
+        ${card("20일 예측종가", fmtPrice(fc20, cur), upside === null ? "" : `현재가 대비 ${fmtSignedPct(upside)}`, moveTone(upside))}
+      </div>
+    </div>`;
+}
+
 function renderDetail() {
   const all = state.data?.symbols || [];
   const filtered = filteredSymbols();
-  const pool = filtered.length ? filtered : all;
+  const pool = state.signalFilter === "all" ? all : filtered;
   const selected = pool.find((item) => item.symbol === state.selectedSymbol) || pool[0];
   if (!selected) {
-    $("detailPanel").innerHTML = `<div class="empty-state">표시할 종목이 없습니다.</div>`;
+    $("detailPanel").innerHTML = `<div class="empty-state">선택한 분류에 표시할 종목이 없습니다.</div>`;
     return;
   }
   state.selectedSymbol = selected.symbol;
+  const q = liveQuote(selected.symbol);
+  const cur = selected.currency;
+  const headPrice = q
+    ? `
+      <div class="focus-price live">
+        <div class="focus-live-row">
+          <strong>${fmtPrice(q.price, q.currency || cur)}</strong>
+          <span class="move ${moveTone(q.change_pct)}">${fmtSignedPct(q.change_pct)}</span>
+          <em class="market-badge state-${escapeHtml(q.market_state || "UNKNOWN")}">${isLiveMarket(q) ? "● " : ""}${escapeHtml(marketStateLabel[q.market_state] || q.market_state || "")}</em>
+        </div>
+        <span class="focus-close-note">종가 ${fmtPrice(selected.price, cur)} · ${escapeHtml(compactDate(selected.as_of))} 기준</span>
+      </div>`
+    : `
+      <div class="focus-price">
+        <strong>${fmtPrice(selected.price, cur)}</strong>
+        <span>${escapeHtml(cur)} · ${escapeHtml(compactDate(selected.as_of))}</span>
+      </div>`;
   $("detailPanel").innerHTML = `
     <div class="focus-head">
       <div class="focus-id">
@@ -452,14 +749,11 @@ function renderDetail() {
         <h2>${escapeHtml(selected.name)}</h2>
       </div>
       ${actionPill(selected.action_level)}
-      <div class="focus-price">
-        <strong>${fmtPrice(selected.price, selected.currency)}</strong>
-        <span>${escapeHtml(selected.currency)} · ${escapeHtml(compactDate(selected.as_of))}</span>
-      </div>
+      ${headPrice}
     </div>
-    <p class="decision-text">${escapeHtml(selected.action_text)}</p>
+    ${liveRiskSection(selected, q)}
     <div class="focus-section">
-      <h3 class="focus-section-title">예측</h3>
+      <h3 class="focus-section-title">예측 <small class="muted-note">기준일 종가 기준 · 실시간 아님</small></h3>
       <div class="forecast-grid">
         ${combinedForecastBlock(selected, "1d")}
         ${combinedForecastBlock(selected, "5d")}
@@ -467,8 +761,16 @@ function renderDetail() {
       </div>
     </div>
     <div class="focus-section">
-      <h3 class="focus-section-title">가격 추이</h3>
-      ${chartSvg(selected)}
+      <div class="chart-grid">
+        <div class="chart-col">
+          <h3 class="focus-section-title">가격 추이 <small class="muted-note">일일 종가 · 목표/손절</small></h3>
+          ${chartSvg(selected)}
+        </div>
+        <div class="chart-col">
+          <h3 class="focus-section-title">실시간 추이 <small class="live-tag">● LIVE · 30초</small></h3>
+          ${liveChartSvg(selected)}
+        </div>
+      </div>
     </div>
     <div class="focus-grid">
       <div class="scenario-list">
@@ -484,6 +786,7 @@ function renderDetail() {
       </div>
     </div>
   `;
+  attachChartInteractions($("detailPanel"));
 }
 
 function renderSystemPanel() {
@@ -545,10 +848,35 @@ function showCurrentView() {
   $("actionRow").classList.toggle("hidden", isPortfolio);
 }
 
+function renderLiveBar() {
+  const bar = $("liveBar");
+  if (!bar) return;
+  const live = state.live;
+  if (!live || !live.quotes || !Object.keys(live.quotes).length) {
+    bar.classList.add("hidden");
+    return;
+  }
+  bar.classList.remove("hidden");
+  const us = marketStateLabel[live.us_market_state] || live.us_market_state || "-";
+  const kr = marketStateLabel[live.kr_market_state] || live.kr_market_state || "-";
+  const usLive = ["REGULAR", "PRE", "POST"].includes(live.us_market_state);
+  const krLive = live.kr_market_state === "REGULAR";
+  const t = live.generated_at ? String(live.generated_at).slice(11, 19) : "";
+  bar.innerHTML = `
+    <span class="live-pulse" aria-hidden="true"></span>
+    <strong>실시간 시세</strong>
+    <span class="live-market ${usLive ? "on" : ""}">미국 ${escapeHtml(us)}</span>
+    <span class="live-market ${krLive ? "on" : ""}">한국 ${escapeHtml(kr)}</span>
+    <span class="live-updated">갱신 ${escapeHtml(t)}</span>
+  `;
+}
+
 function render() {
   if (!state.data) return;
-  setFx(state.data.fx || {});
+  // Prefer the live polled FX over the daily reference rate when available.
+  setFx(state.live?.fx ? { ...state.live.fx, date: state.live.generated_at } : state.data.fx || {});
   setSystem(state.data.system || {});
+  renderLiveBar();
   renderActionRow();
   renderSystemPanel();
   showCurrentView();
@@ -660,9 +988,12 @@ function renderPfHero(p) {
   const dailyPct = prevMv > 0 ? (daily / prevMv) * 100 : 0;
   const fx = pfFx();
   const recon = p.reconciliation_status || "PASS";
+  const liveTag = p.live_as_of
+    ? `<span class="pf-live-tag">● 실시간 ${escapeHtml(String(p.live_as_of).slice(11, 19))}</span>`
+    : "";
   $("pfHero").innerHTML = `
     <div class="pf-total">
-      <span>내 투자 · 평가금</span>
+      <span>내 투자 · 평가금 ${liveTag}</span>
       <strong>${pfMoney(mv)}</strong>
       <em class="pnl ${pfPnlTone(totalPnl)}">${pfSigned(totalPnl)} (${fmtPctPoints(totalPct)})</em>
     </div>
@@ -766,11 +1097,13 @@ function renderPfHoldings(p) {
     .map((h) => {
       const tone = PF_ACTION_TONE[String(h.recommendation || "HOLD")] || "neutral";
       const label = PF_ACTION_LABEL[String(h.recommendation || "HOLD")] || (h.recommendation || "-");
+      const intr = toNumber(h.intraday_pct);
       return `<tr>
         <td class="pf-sym"><b>${escapeHtml(pfName(h.symbol))}</b><i>${escapeHtml(h.symbol)}</i></td>
         <td class="num">${pfShares(h.shares)}</td>
         <td class="num">${pfMoney(h.avg_price_usd)}</td>
         <td class="num">${pfMoney(h.current_price_usd)}</td>
+        <td class="num ${intr === null ? "" : moveTone(intr)}">${intr === null ? "–" : fmtSignedPct(intr)}</td>
         <td class="num">${pfMoney(h.market_value_usd)}</td>
         <td class="num">${fmtPctPoints(h.weight_pct)}</td>
         <td class="num pnl ${pfPnlTone(h.return_pct)}">${h.return_pct === null ? "없음" : fmtPctPoints(h.return_pct)}</td>
@@ -779,7 +1112,7 @@ function renderPfHoldings(p) {
     })
     .join("");
   target.innerHTML = `<table class="pf-table"><thead><tr>
-      <th>종목</th><th class="num">보유 주수</th><th class="num">평단</th><th class="num">현재가</th>
+      <th>종목</th><th class="num">보유 주수</th><th class="num">평단</th><th class="num">현재가</th><th class="num">장중</th>
       <th class="num">평가금</th><th class="num">비중</th><th class="num">수익률</th><th>권고</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
@@ -949,6 +1282,41 @@ async function loadDashboard() {
   render();
 }
 
+async function pollLiveQuotes() {
+  try {
+    const live = await fetchJson("/api/live-quotes");
+    if (live && live.quotes) {
+      state.live = live;
+      // Accumulate a live intraday price point per symbol on every poll, so the
+      // session chart fills in for as long as the dashboard stays open.
+      recordLiveHistory(live.quotes);
+      // Live FX: update the rate display every poll (no manual button needed).
+      if (live.fx && toNumber(live.fx.usdkrw) !== null) {
+        setFx({ ...live.fx, date: live.generated_at });
+      }
+      // Re-render only the price-bearing views; never re-fetch the heavy payload.
+      if (state.data) {
+        renderLiveBar();
+        if (state.activeTab === "portfolio") {
+          // Re-price the portfolio from live quotes (engine re-run is cheap).
+          if (state.portfolioLoaded) loadPortfolio();
+        } else if (state.activeTab !== "system" && state.activeTab !== "run") {
+          renderSymbolGrid();
+          renderDetail();
+        }
+      }
+    }
+  } catch (error) {
+    /* transient network error — keep last known quotes */
+  }
+}
+
+function startLiveQuotePolling() {
+  if (state.liveTimer) clearInterval(state.liveTimer);
+  pollLiveQuotes();
+  state.liveTimer = setInterval(pollLiveQuotes, LIVE_POLL_MS);
+}
+
 async function fetchLiveFx() {
   const result = await fetchJson("/api/fx/refresh", {
     method: "POST",
@@ -982,22 +1350,19 @@ async function refreshFx() {
 }
 
 async function calculateFx() {
-  const button = $("fxCalcBtn");
-  const previousText = button.textContent;
-  button.disabled = true;
-  button.textContent = "조회";
   $("fxCalcResult").textContent = "계산 중";
   try {
-    const fx = await fetchLiveFx();
-    const usdkrw = fx.usdkrw ?? fx.fx_close;
+    // Prefer the live polled rate; fall back to an on-demand fetch only if the
+    // poll has not landed yet. Never trigger the heavy dashboard rebuild here.
+    let usdkrw = toNumber(state.live?.fx?.usdkrw);
+    if (usdkrw === null) {
+      const fx = await fetchLiveFx();
+      usdkrw = fx.usdkrw ?? fx.fx_close;
+    }
     $("fxCalcResult").textContent = fmtExchangeResult($("fxAmount").value, $("fxDirection").value, usdkrw);
-    await loadDashboard();
   } catch (error) {
     $("fxCalcResult").textContent = "실패";
     $("fxCalcResult").title = error.message;
-  } finally {
-    button.textContent = previousText;
-    button.disabled = false;
   }
 }
 
@@ -1084,13 +1449,16 @@ function init() {
     button.addEventListener("click", () => setActiveTab(button.dataset.tab));
   });
   $("refreshBtn").addEventListener("click", loadDashboard);
-  $("fxRefreshBtn").addEventListener("click", refreshFx);
   $("fxCalcBtn").addEventListener("click", calculateFx);
   $("runForm").addEventListener("submit", startRun);
   $("stopRunBtn").addEventListener("click", stopRun);
   wirePortfolioEvents();
   loadDashboard().catch((error) => {
     $("actionRow").innerHTML = `<article class="action-card blocked"><span>오류</span><h2>대시보드 로드 실패</h2><p>${escapeHtml(error.message)}</p></article>`;
+  });
+  startLiveQuotePolling();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") pollLiveQuotes();
   });
 }
 

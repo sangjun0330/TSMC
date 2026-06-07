@@ -1048,10 +1048,15 @@ def evaluate_local_models(comparison: pd.DataFrame, latest_prediction: dict[str,
     return rows
 
 
-def select_combined_pooled_row(pooled_comparison: pd.DataFrame) -> pd.DataFrame:
+def select_combined_pooled_row(pooled_comparison: pd.DataFrame, horizon_days: int | None = None) -> pd.DataFrame:
     if pooled_comparison.empty:
         return pooled_comparison
     preferred = pooled_comparison[pooled_comparison["split"].astype(str).eq("combined_test_holdout")]
+    if horizon_days is not None and "horizon_days" in preferred.columns:
+        horizon_values = pd.to_numeric(preferred["horizon_days"], errors="coerce")
+        horizon_match = preferred[horizon_values.eq(float(horizon_days))]
+        if not horizon_match.empty:
+            preferred = horizon_match
     if "evaluation_scope" in preferred.columns:
         strict_scope = preferred[preferred["evaluation_scope"].astype(str).eq("trade_ready_entry_only")]
         if not strict_scope.empty:
@@ -1097,6 +1102,11 @@ def pooled_oof_fold_selection_stats(pooled_comparison: pd.DataFrame, row: pd.Ser
         & pooled_comparison.get("model_name", pd.Series("", index=pooled_comparison.index)).astype(str).eq(model_name)
         & pooled_comparison.get("evaluation_scope", pd.Series("", index=pooled_comparison.index)).astype(str).eq(evaluation_scope)
     ].copy()
+    if "horizon_days" in fold_rows.columns and "horizon_days" in row.index:
+        row_horizon = as_float(row.get("horizon_days"))
+        if math.isfinite(row_horizon):
+            fold_horizons = pd.to_numeric(fold_rows["horizon_days"], errors="coerce")
+            fold_rows = fold_rows[fold_horizons.eq(row_horizon)]
     fold_rows = fold_rows[pd.to_numeric(fold_rows.get("event_count", pd.Series(dtype=float)), errors="coerce") > 0]
     if fold_rows.empty:
         return np.nan, ""
@@ -1107,13 +1117,14 @@ def pooled_oof_fold_selection_stats(pooled_comparison: pd.DataFrame, row: pd.Ser
 
 def evaluate_pooled_models(pooled_comparison: pd.DataFrame, pooled_latest: dict[str, object], tsm_calibration: pd.DataFrame) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    selected = select_combined_pooled_row(pooled_comparison)
+    selected = select_combined_pooled_row(pooled_comparison, horizon_days=LOCAL_DECISION_HORIZON_DAYS)
     if selected.empty:
         rows.append(gate_row("pooled_model", "pooled_comparison_available", False, "missing", "present", "POOLED_MODEL_COMPARISON_MISSING"))
     else:
         row = selected.iloc[0]
         model_name = str(row.get("model_name", ""))
         split = str(row.get("split", ""))
+        horizon = row.get("horizon_days", "")
         selected_fraction = row_selected_fraction(row)
         min_selected_fold, weak_folds = pooled_oof_fold_selection_stats(pooled_comparison, row)
         validation_design = str(row.get("validation_design", ""))
@@ -1132,21 +1143,21 @@ def evaluate_pooled_models(pooled_comparison: pd.DataFrame, pooled_latest: dict[
         )
         rows.extend(
             [
-                gate_row("pooled_model", "event_count", row_float(row, "event_count") >= MIN_POOLED_EVAL_EVENTS, row_float(row, "event_count"), f">={MIN_POOLED_EVAL_EVENTS}", "POOLED_EVENT_COUNT_LT_MIN", model_name=model_name, split=split),
-                gate_row("pooled_model", "selected_event_count", row_float(row, "selected_event_count") >= MIN_POOLED_SELECTED_EVENTS, row_float(row, "selected_event_count"), f">={MIN_POOLED_SELECTED_EVENTS}", "POOLED_SELECTED_EVENT_COUNT_LT_MIN", model_name=model_name, split=split),
-                gate_row("pooled_model", "brier_improvement_positive", row_float(row, "brier_improvement_pct") > 0.0, row_float(row, "brier_improvement_pct"), ">0", "POOLED_NO_BRIER_IMPROVEMENT", model_name=model_name, split=split),
-                gate_row("pooled_model", "decision_ece_within_limit", decision_ece <= MAX_POOLED_ECE, decision_ece, f"<={MAX_POOLED_ECE}", "POOLED_ECE_GT_LIMIT", model_name=model_name, split=split),
-                gate_row("pooled_model", "decision_min_calibration_bin_n", decision_min_bin_n >= MIN_CALIBRATION_BIN_N, decision_min_bin_n, f">={MIN_CALIBRATION_BIN_N}", "POOLED_DECISION_CALIBRATION_BIN_N_LT_30", model_name=model_name, split=split),
-                gate_row("pooled_model_diagnostic", "fixed_width_calibration_bin_n_diagnostic", row_float(row, "fixed_width_min_calibration_bin_n", decision_min_bin_n) >= MIN_CALIBRATION_BIN_N, row_float(row, "fixed_width_min_calibration_bin_n", decision_min_bin_n), f">={MIN_CALIBRATION_BIN_N}", "FIXED_WIDTH_CALIBRATION_WARN", severity="WARN", model_name=model_name, split=split),
-                gate_row("pooled_model", "selected_fraction_30_to_60_pct", 0.30 <= selected_fraction <= 0.60, selected_fraction, "0.30..0.60", "POOLED_SELECTED_FRACTION_OUT_OF_RANGE", model_name=model_name, split=split),
-                gate_row("pooled_model", "selected_minus_all_positive", row_float(row, "selected_minus_all_pct") > 0.0, row_float(row, "selected_minus_all_pct"), ">0", "POOLED_SELECTED_MINUS_ALL_LE_0", model_name=model_name, split=split),
-                gate_row("pooled_model", "selected_minus_all_ci_lower_positive", selected_minus_all_lower > 0.0, selected_minus_all_lower, ">0 paired/block", "POOLED_SELECTED_MINUS_ALL_CI_LOWER_LE_0", model_name=model_name, split=split),
-                gate_row("pooled_model", "selected_minus_score_baseline_ci_lower_positive", selected_minus_score_lower > 0.0, selected_minus_score_lower, ">0 paired/block", "POOLED_SELECTED_MINUS_SCORE_BASELINE_CI_LOWER_LE_0", model_name=model_name, split=split),
-                gate_row("pooled_model", "selected_expectancy_ci_lower_positive", row_float(row, "selected_expectancy_ci_lower_pct") > 0.0, row_float(row, "selected_expectancy_ci_lower_pct"), ">0", "POOLED_SELECTED_EXPECTANCY_CI_LOWER_LE_0", model_name=model_name, split=split),
-                gate_row("pooled_model", "economic_uplift_pass", uplift_pass, row.get("uplift_failure_reasons", uplift_pass), "True", "POOLED_UPLIFT_NOT_PASSED", model_name=model_name, split=split),
-                gate_row("pooled_model", "threshold_decision_eligible", row_bool(row, "threshold_decision_eligible"), row.get("threshold_decision_eligible", False), "True", "POOLED_THRESHOLD_NOT_DECISION_ELIGIBLE", model_name=model_name, split=split),
-                gate_row("pooled_model", "positive_expectancy_fold_count", validation_design != "walk_forward_oof" or row_float(row, "positive_expectancy_fold_count") >= MIN_POSITIVE_EXPECTANCY_FOLDS, row_float(row, "positive_expectancy_fold_count"), f">={MIN_POSITIVE_EXPECTANCY_FOLDS}", "POOLED_POSITIVE_EXPECTANCY_FOLDS_LT_4", model_name=model_name, split=split),
-                gate_row("pooled_model", "trial_count_recorded", row_float(row, "trial_count", 0) > 0, row_float(row, "trial_count", 0), ">0", "POOLED_TRIAL_LEDGER_MISSING", model_name=model_name, split=split),
+                gate_row("pooled_model", "event_count", row_float(row, "event_count") >= MIN_POOLED_EVAL_EVENTS, row_float(row, "event_count"), f">={MIN_POOLED_EVAL_EVENTS}", "POOLED_EVENT_COUNT_LT_MIN", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "selected_event_count", row_float(row, "selected_event_count") >= MIN_POOLED_SELECTED_EVENTS, row_float(row, "selected_event_count"), f">={MIN_POOLED_SELECTED_EVENTS}", "POOLED_SELECTED_EVENT_COUNT_LT_MIN", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "brier_improvement_positive", row_float(row, "brier_improvement_pct") > 0.0, row_float(row, "brier_improvement_pct"), ">0", "POOLED_NO_BRIER_IMPROVEMENT", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "decision_ece_within_limit", decision_ece <= MAX_POOLED_ECE, decision_ece, f"<={MAX_POOLED_ECE}", "POOLED_ECE_GT_LIMIT", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "decision_min_calibration_bin_n", decision_min_bin_n >= MIN_CALIBRATION_BIN_N, decision_min_bin_n, f">={MIN_CALIBRATION_BIN_N}", "POOLED_DECISION_CALIBRATION_BIN_N_LT_30", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model_diagnostic", "fixed_width_calibration_bin_n_diagnostic", row_float(row, "fixed_width_min_calibration_bin_n", decision_min_bin_n) >= MIN_CALIBRATION_BIN_N, row_float(row, "fixed_width_min_calibration_bin_n", decision_min_bin_n), f">={MIN_CALIBRATION_BIN_N}", "FIXED_WIDTH_CALIBRATION_WARN", severity="WARN", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "selected_fraction_30_to_60_pct", 0.30 <= selected_fraction <= 0.60, selected_fraction, "0.30..0.60", "POOLED_SELECTED_FRACTION_OUT_OF_RANGE", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "selected_minus_all_positive", row_float(row, "selected_minus_all_pct") > 0.0, row_float(row, "selected_minus_all_pct"), ">0", "POOLED_SELECTED_MINUS_ALL_LE_0", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "selected_minus_all_ci_lower_positive", selected_minus_all_lower > 0.0, selected_minus_all_lower, ">0 paired/block", "POOLED_SELECTED_MINUS_ALL_CI_LOWER_LE_0", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "selected_minus_score_baseline_ci_lower_positive", selected_minus_score_lower > 0.0, selected_minus_score_lower, ">0 paired/block", "POOLED_SELECTED_MINUS_SCORE_BASELINE_CI_LOWER_LE_0", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "selected_expectancy_ci_lower_positive", row_float(row, "selected_expectancy_ci_lower_pct") > 0.0, row_float(row, "selected_expectancy_ci_lower_pct"), ">0", "POOLED_SELECTED_EXPECTANCY_CI_LOWER_LE_0", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "economic_uplift_pass", uplift_pass, row.get("uplift_failure_reasons", uplift_pass), "True", "POOLED_UPLIFT_NOT_PASSED", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "threshold_decision_eligible", row_bool(row, "threshold_decision_eligible"), row.get("threshold_decision_eligible", False), "True", "POOLED_THRESHOLD_NOT_DECISION_ELIGIBLE", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "positive_expectancy_fold_count", validation_design != "walk_forward_oof" or row_float(row, "positive_expectancy_fold_count") >= MIN_POSITIVE_EXPECTANCY_FOLDS, row_float(row, "positive_expectancy_fold_count"), f">={MIN_POSITIVE_EXPECTANCY_FOLDS}", "POOLED_POSITIVE_EXPECTANCY_FOLDS_LT_4", horizon_days=horizon, model_name=model_name, split=split),
+                gate_row("pooled_model", "trial_count_recorded", row_float(row, "trial_count", 0) > 0, row_float(row, "trial_count", 0), ">0", "POOLED_TRIAL_LEDGER_MISSING", horizon_days=horizon, model_name=model_name, split=split),
             ]
         )
         if validation_design == "walk_forward_oof":
@@ -1158,6 +1169,7 @@ def evaluate_pooled_models(pooled_comparison: pd.DataFrame, pooled_latest: dict[
                     f"{row.get('threshold_stability_pass', False)}; weak={row.get('weak_oof_folds', weak_folds)}",
                     "True",
                     "POOLED_THRESHOLD_STABILITY_FAILED",
+                    horizon_days=horizon,
                     model_name=model_name,
                     split=split,
                 )
@@ -1170,6 +1182,7 @@ def evaluate_pooled_models(pooled_comparison: pd.DataFrame, pooled_latest: dict[
                     f"{min_selected_fold:g}; weak={weak_folds}" if math.isfinite(min_selected_fold) else "missing",
                     f">={MIN_SELECTED_EVENTS_PER_FOLD}",
                     "POOLED_OOF_FOLD_SELECTED_EVENTS_LT_10",
+                    horizon_days=horizon,
                     model_name=model_name,
                     split=split,
                 )

@@ -7,6 +7,7 @@ from tsm_pooled_model_engine import (
     fit_tsm_like_weight_table,
     choose_tsm_like_route,
     choose_fold_consensus_trade_ready_threshold_v5,
+    threshold_stability_from_fold_metrics,
 )
 from tsm_universe_validator import validate_symbol_frame
 
@@ -113,7 +114,7 @@ def test_rank_percentile_policy_keeps_fold_selection_fraction_stable():
         common = {
             "symbol": f"S{i % 20}",
             "symbol_group": "semi",
-            "date": pd.Timestamp("2023-07-01") + pd.Timedelta(days=i),
+            "date": pd.Timestamp("2023-07-01"),
             "signal_idx": i,
             "score_price_algo_total": i,
             "p_success_model": 0.2 + i / 200.0,
@@ -125,7 +126,7 @@ def test_rank_percentile_policy_keeps_fold_selection_fraction_stable():
         }
         threshold_rows.append(common)
         test_common = dict(common)
-        test_common["date"] = pd.Timestamp("2024-07-01") + pd.Timedelta(days=i)
+        test_common["date"] = pd.Timestamp("2024-07-01")
         test_rows.append(test_common)
 
     result = choose_fold_consensus_trade_ready_threshold_v5(
@@ -141,8 +142,28 @@ def test_rank_percentile_policy_keeps_fold_selection_fraction_stable():
     )
     records = result["records"]
 
-    assert records["applied_threshold_policy_type"].iloc[0] == "rank_percentile_policy"
+    assert records["applied_threshold_policy_type"].iloc[0] == "fold_rank_percentile_policy"
+    assert records["risk_adjusted_selection_score_col"].iloc[0] == "p_success_model"
     assert 0.30 <= records["selected_by_threshold"].mean() <= 0.60
+
+
+def test_threshold_stability_merges_undersized_oof_fold_diagnostic():
+    metrics = pd.DataFrame(
+        [
+            {"split": "oof_test_2021", "event_count": 590, "selected_event_count": 207, "selected_fraction": 0.350, "threshold": 0.80, "applied_threshold_policy_type": "fold_rank_percentile_policy", "target_selected_fraction": 0.35},
+            {"split": "oof_test_2022", "event_count": 33, "selected_event_count": 25, "selected_fraction": 0.758, "threshold": 0.20, "applied_threshold_policy_type": "fold_rank_percentile_policy", "target_selected_fraction": 0.35},
+            {"split": "oof_test_2023", "event_count": 346, "selected_event_count": 122, "selected_fraction": 0.353, "threshold": 0.02, "applied_threshold_policy_type": "fold_rank_percentile_policy", "target_selected_fraction": 0.35},
+            {"split": "oof_test_2024", "event_count": 525, "selected_event_count": 184, "selected_fraction": 0.350, "threshold": 0.49, "applied_threshold_policy_type": "fold_rank_percentile_policy", "target_selected_fraction": 0.35},
+            {"split": "oof_test_2025_2026", "event_count": 656, "selected_event_count": 230, "selected_fraction": 0.351, "threshold": 0.24, "applied_threshold_policy_type": "fold_rank_percentile_policy", "target_selected_fraction": 0.35},
+        ]
+    )
+
+    stable, weak_folds, threshold_iqr = threshold_stability_from_fold_metrics(metrics)
+
+    assert stable is True
+    assert "oof_test_2022:undersized_fold_events_33_merged_for_stability" in weak_folds
+    assert "selected_fraction_out_of_range" not in weak_folds
+    assert threshold_iqr == 0.0
 
 
 def test_paper_gate_never_enables_live_and_can_pass_without_strict_gate():

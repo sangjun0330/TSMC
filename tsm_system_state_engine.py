@@ -58,6 +58,15 @@ def bool_series_all_true(df: pd.DataFrame, col: str = "passed") -> bool:
     return df[col].astype(str).str.lower().isin(["true", "1", "yes"]).all()
 
 
+def critical_checks_pass(df: pd.DataFrame) -> bool:
+    if df.empty or "passed" not in df.columns:
+        return False
+    target = df[df["severity"].astype(str).str.upper().eq("CRITICAL")] if "severity" in df.columns else df
+    if target.empty:
+        target = df
+    return bool_series_all_true(target)
+
+
 def numeric(value, default=np.nan) -> float:
     try:
         return float(value)
@@ -67,6 +76,19 @@ def numeric(value, default=np.nan) -> float:
 
 def to_bool(value: object) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def prediction_pipeline_ready_from_model_gate(model_gate_snapshot: Dict[str, str] | None) -> bool:
+    if not model_gate_snapshot:
+        return False
+    if "prediction_pipeline_ready" in model_gate_snapshot:
+        return to_bool(model_gate_snapshot.get("prediction_pipeline_ready"))
+    model_quality_pass = to_bool(model_gate_snapshot.get("pooled_system_quality_pass", False))
+    active_failed = int(numeric(model_gate_snapshot.get("active_performance_failed_gate_count", 0), 0))
+    active_blocking = int(numeric(model_gate_snapshot.get("active_performance_blocking_failed_gate_count", 0), 0))
+    model_blocking = int(numeric(model_gate_snapshot.get("model_quality_blocking_failed_gate_count", 0), 0))
+    performance_status = str(model_gate_snapshot.get("performance_gate_status", "UNKNOWN"))
+    return bool(model_quality_pass and active_failed == 0 and active_blocking == 0 and model_blocking == 0 and performance_status.startswith("PASS"))
 
 
 def domain_score(passed: bool, weight: float, note: str) -> Dict:
@@ -98,6 +120,13 @@ def build_scorecard(
     backtest_summary: pd.DataFrame,
     walk_forward: pd.DataFrame,
     causal_walk_forward: pd.DataFrame | None = None,
+    paper_oms_quality: pd.DataFrame | None = None,
+    paper_reconciliation_quality: pd.DataFrame | None = None,
+    order_state_quality: pd.DataFrame | None = None,
+    execution_feedback_quality: pd.DataFrame | None = None,
+    fill_calibration_quality: pd.DataFrame | None = None,
+    automation_quality: pd.DataFrame | None = None,
+    model_gate_snapshot: Dict[str, str] | None = None,
 ) -> pd.DataFrame:
     quality_ok = bool_series_all_true(operational_quality)
     if integrity_quality.empty or "severity" not in integrity_quality.columns:
@@ -113,12 +142,22 @@ def build_scorecard(
         critical = prediction_quality[prediction_quality["severity"] == "CRITICAL"] if "severity" in prediction_quality.columns else prediction_quality
         critical_ok = bool_series_all_true(critical if not critical.empty else prediction_quality)
         use_status = prediction_snapshot.get("prediction_use_status", "UNKNOWN")
-        prediction_ok = is_prediction_decision_support(use_status)
+        latest_decision_support = is_prediction_decision_support(use_status)
+        pipeline_ready = prediction_pipeline_ready_from_model_gate(model_gate_snapshot)
         if not critical_ok:
+            prediction_ok = False
             prediction_note = "Prediction engine critical checks failed; research readiness is scored separately."
-        elif is_prediction_decision_support(use_status):
+        elif pipeline_ready:
+            prediction_ok = True
+            if latest_decision_support:
+                prediction_note = "Prediction pipeline and latest entry signal both pass decision-support gates."
+            else:
+                prediction_note = f"Prediction pipeline passes active model gates; latest entry signal is standby, use_status={use_status}."
+        elif latest_decision_support:
+            prediction_ok = True
             prediction_note = "Prediction overlay passed quality gates and may be used as decision support."
         else:
+            prediction_ok = False
             prediction_note = f"Prediction overlay is display-only; use_status={use_status}."
 
     risk_state = risk_snapshot.get("risk_state", "UNKNOWN")
@@ -167,6 +206,29 @@ def build_scorecard(
         "full_period_backtest": domain_score(best_strategy_ok, 15, best_note),
         "walk_forward_evidence": domain_score(wf_ok, 10, wf_note),
     }
+    if (
+        paper_oms_quality is not None
+        or paper_reconciliation_quality is not None
+        or order_state_quality is not None
+        or execution_feedback_quality is not None
+        or fill_calibration_quality is not None
+        or automation_quality is not None
+    ):
+        paper_oms_ok = critical_checks_pass(paper_oms_quality if paper_oms_quality is not None else pd.DataFrame())
+        paper_recon_ok = critical_checks_pass(paper_reconciliation_quality if paper_reconciliation_quality is not None else pd.DataFrame())
+        order_state_ok = critical_checks_pass(order_state_quality if order_state_quality is not None else pd.DataFrame())
+        execution_feedback_ok = critical_checks_pass(execution_feedback_quality if execution_feedback_quality is not None else pd.DataFrame())
+        fill_calibration_ok = critical_checks_pass(fill_calibration_quality if fill_calibration_quality is not None else pd.DataFrame())
+        automation_ok = critical_checks_pass(automation_quality if automation_quality is not None else pd.DataFrame())
+        all_paper_ops_ok = all([paper_oms_ok, paper_recon_ok, order_state_ok, execution_feedback_ok, fill_calibration_ok, automation_ok])
+        domains["paper_oms_quality"] = domain_score(
+            all_paper_ops_ok,
+            0,
+            "Paper OMS checks="
+            f"{'PASS' if paper_oms_ok else 'FAIL'}, reconciliation={'PASS' if paper_recon_ok else 'FAIL'}, "
+            f"lifecycle={'PASS' if order_state_ok else 'FAIL'}, feedback={'PASS' if execution_feedback_ok else 'FAIL'}, "
+            f"calibration={'PASS' if fill_calibration_ok else 'FAIL'}, automation={'PASS' if automation_ok else 'FAIL'}.",
+        )
 
     rows = []
     for domain, values in domains.items():
@@ -228,19 +290,79 @@ def readiness_block_reasons(scorecard: pd.DataFrame, domain_map: Dict[str, str])
     return "|".join(failed) if failed else "PASS"
 
 
-def prediction_block_reason_from_snapshot(prediction_snapshot: Dict[str, str], prediction_ready: bool) -> str:
+def active_performance_block_reason_from_model_gate(model_gate_snapshot: Dict[str, str] | None) -> str:
+    if not model_gate_snapshot:
+        return "UNKNOWN"
+    performance_status = str(model_gate_snapshot.get("performance_gate_status", "UNKNOWN"))
+    active_failed = int(numeric(model_gate_snapshot.get("active_performance_failed_gate_count", 0), 0))
+    active_blocking = int(numeric(model_gate_snapshot.get("active_performance_blocking_failed_gate_count", 0), 0))
+    if performance_status.startswith("PASS") and active_failed == 0 and active_blocking == 0:
+        return "PASS"
+    reasons = str(model_gate_snapshot.get("active_performance_failed_gate_groups", "") or "").strip()
+    if reasons and reasons.upper() != "PASS":
+        return reasons
+    return performance_status if performance_status and performance_status != "UNKNOWN" else "UNKNOWN"
+
+
+def latest_block_reason_from_model_gate(model_gate_snapshot: Dict[str, str] | None) -> str:
+    if not model_gate_snapshot:
+        return ""
+    for field in ("pooled_latest_block_reasons", "pooled_decision_block_reasons", "paper_gate_block_reasons"):
+        value = str(model_gate_snapshot.get(field, "") or "").strip()
+        if value and value.upper() not in {"PASS", "UNKNOWN", "NAN"}:
+            return f"POOLED_LATEST:{value}"
+    return ""
+
+
+def latest_signal_block_reason_from_snapshot(prediction_snapshot: Dict[str, str]) -> str:
+    for field in ("latest_signal_block_reasons", "paper_alpha_block_reasons"):
+        value = str(prediction_snapshot.get(field, "") or "").strip()
+        if value and value.upper() != "PASS":
+            return value
+    signal_status = str(prediction_snapshot.get("prediction_signal_status", "") or "").strip()
+    if signal_status:
+        return signal_status
+    use_status = str(prediction_snapshot.get("prediction_use_status", "") or "").strip()
+    return use_status if use_status else "PREDICTION_NOT_DECISION_SUPPORT"
+
+
+def prediction_block_reason_from_snapshot(
+    prediction_snapshot: Dict[str, str],
+    prediction_ready: bool,
+    model_gate_snapshot: Dict[str, str] | None = None,
+) -> str:
     if prediction_ready:
         return "PASS"
+    performance_reasons = active_performance_block_reason_from_model_gate(model_gate_snapshot)
+    if performance_reasons == "PASS":
+        pooled_latest_reason = latest_block_reason_from_model_gate(model_gate_snapshot)
+        if pooled_latest_reason:
+            return pooled_latest_reason
+        use_status = str(prediction_snapshot.get("prediction_use_status", "") or "").upper()
+        signal_status = str(prediction_snapshot.get("prediction_signal_status", "") or "").upper()
+        if use_status.startswith("DISPLAY_ONLY") or signal_status.startswith("NO_ENTRY_TRIGGER"):
+            return f"LATEST_SIGNAL:{latest_signal_block_reason_from_snapshot(prediction_snapshot)}"
     reasons = []
+    pooled_quality_pass = to_bool(
+        prediction_snapshot.get(
+            "pooled_model_quality_pass",
+            model_gate_snapshot.get("pooled_model_quality_pass", False) if model_gate_snapshot else False,
+        )
+    )
+
+    def add_reason(value: object, prefix: str = "") -> None:
+        text = str(value or "").strip()
+        if not text or text.upper() == "PASS":
+            return
+        reasons.append(f"{prefix}{text}" if prefix else text)
+
     local = str(prediction_snapshot.get("model_quality_block_reasons", "") or "").strip()
-    if local:
-        reasons.append(local)
-    pooled_quality = str(prediction_snapshot.get("pooled_model_quality_block_reasons", "") or "").strip()
-    if pooled_quality:
-        reasons.append(f"POOLED:{pooled_quality}")
-    pooled_decision = str(prediction_snapshot.get("pooled_decision_block_reasons", "") or "").strip()
-    if pooled_decision:
-        reasons.append(f"POOLED_LATEST:{pooled_decision}")
+    if local and not pooled_quality_pass:
+        add_reason(local)
+    add_reason(prediction_snapshot.get("pooled_model_quality_block_reasons", ""), "POOLED:")
+    add_reason(prediction_snapshot.get("pooled_decision_block_reasons", ""), "POOLED_LATEST:")
+    if pooled_quality_pass and not reasons:
+        add_reason(prediction_snapshot.get("pooled_latest_block_reasons", ""), "POOLED_LATEST:")
     return "|".join(reasons) if reasons else "PREDICTION_NOT_DECISION_SUPPORT"
 
 
@@ -249,7 +371,9 @@ def build_latest_state(
     risk_snapshot: Dict[str, str],
     stress_snapshot: Dict[str, str],
     prediction_snapshot: Dict[str, str],
+    model_gate_snapshot: Dict[str, str] | None = None,
 ) -> pd.DataFrame:
+    model_gate_snapshot = model_gate_snapshot or {}
     composite_gate_score = float(scorecard["score"].sum())
     passed_by_domain = dict(zip(scorecard["domain"], scorecard["passed"]))
     research_score = readiness_component_score(
@@ -261,7 +385,8 @@ def build_latest_state(
         },
     )
     state = readiness_state(composite_gate_score, scorecard, risk_snapshot)
-    prediction_score = 100.0 if passed_by_domain.get("prediction_decision_support", False) else 0.0
+    prediction_pipeline_ready = bool(passed_by_domain.get("prediction_decision_support", False))
+    prediction_score = 100.0 if prediction_pipeline_ready else 0.0
     alpha_score = readiness_component_score(
         scorecard,
         {
@@ -292,9 +417,10 @@ def build_latest_state(
             prediction_snapshot.get("paper_decision_support_allowed", False),
         )
     )
-    alpha_ready = bool(alpha_score >= 75.0 and prediction_decision_support)
+    paper_oms_ready = bool(passed_by_domain.get("paper_oms_quality", True))
+    alpha_ready = bool(alpha_score >= 75.0 and prediction_pipeline_ready)
     prediction_ready = bool(prediction_score >= 100.0)
-    paper_ready = bool((paper_score >= 75.0 and research_ready) or paper_prediction_decision_support)
+    paper_ready = bool(((paper_score >= 75.0 and research_ready) or paper_prediction_decision_support) and paper_oms_ready)
     live_ready = False
     research_block_reasons = readiness_block_reasons(
         scorecard,
@@ -312,7 +438,22 @@ def build_latest_state(
             "prediction_decision_support": "PREDICTION_NOT_DECISION_SUPPORT",
         },
     )
-    prediction_block_reasons = prediction_block_reason_from_snapshot(prediction_snapshot, prediction_ready)
+    prediction_block_reasons = prediction_block_reason_from_snapshot(prediction_snapshot, prediction_ready, model_gate_snapshot)
+    prediction_performance_block_reasons = active_performance_block_reason_from_model_gate(model_gate_snapshot)
+    latest_block_reasons = latest_block_reason_from_model_gate(model_gate_snapshot)
+    if not latest_block_reasons and prediction_block_reasons.startswith(("LATEST_SIGNAL:", "POOLED_LATEST:")):
+        latest_block_reasons = prediction_block_reasons
+    model_quality_pass = to_bool(model_gate_snapshot.get("pooled_model_quality_pass", False))
+    system_quality_pass = to_bool(model_gate_snapshot.get("pooled_system_quality_pass", False))
+    latest_signal_pass = to_bool(model_gate_snapshot.get("pooled_latest_signal_pass", False))
+    if prediction_decision_support:
+        latest_market_state_status = "DECISION_SUPPORT_ALLOWED"
+    elif system_quality_pass and not latest_signal_pass:
+        latest_market_state_status = "LATEST_SIGNAL_BLOCKED"
+    elif not system_quality_pass:
+        latest_market_state_status = "MODEL_QUALITY_BLOCKED"
+    else:
+        latest_market_state_status = "PREDICTION_NOT_DECISION_SUPPORT"
     live_block_reasons = "NO_LIVE_BROKER_BY_DESIGN"
     rows = [
         {"field": "system_readiness_score", "value": research_score},
@@ -326,25 +467,98 @@ def build_latest_state(
         {"field": "research_ready", "value": research_ready},
         {"field": "alpha_ready", "value": alpha_ready},
         {"field": "prediction_ready", "value": prediction_ready},
+        {"field": "prediction_pipeline_ready", "value": prediction_pipeline_ready},
         {"field": "live_ready", "value": live_ready},
         {"field": "prediction_decision_support", "value": prediction_decision_support},
         {"field": "paper_prediction_decision_support", "value": paper_prediction_decision_support},
+        {"field": "paper_oms_ready", "value": paper_oms_ready},
         {"field": "paper_ready", "value": paper_ready},
         {"field": "research_block_reasons", "value": research_block_reasons},
         {"field": "alpha_block_reasons", "value": alpha_block_reasons},
         {"field": "prediction_block_reasons", "value": prediction_block_reasons},
-        {"field": "paper_block_reasons", "value": "PASS" if paper_ready else "PAPER_READINESS_SCORE_LT_75"},
+        {"field": "prediction_performance_block_reasons", "value": prediction_performance_block_reasons},
+        {"field": "paper_block_reasons", "value": "PASS" if paper_ready else ("PAPER_OMS_QUALITY_FAILED" if not paper_oms_ready else "PAPER_READINESS_SCORE_LT_75")},
         {"field": "live_block_reasons", "value": live_block_reasons},
         {"field": "risk_state", "value": risk_snapshot.get("risk_state", "UNKNOWN")},
         {"field": "final_recommended_max_weight_pct", "value": risk_snapshot.get("final_recommended_max_weight", "NA")},
         {"field": "stress_status", "value": stress_snapshot.get("stress_status", "UNKNOWN")},
         {"field": "prediction_signal_status", "value": prediction_snapshot.get("prediction_signal_status", "UNKNOWN")},
         {"field": "prediction_use_status", "value": prediction_snapshot.get("prediction_use_status", "UNKNOWN")},
-        {"field": "paper_gate_status", "value": prediction_snapshot.get("pooled_paper_gate_status", prediction_snapshot.get("paper_gate_status", "UNKNOWN"))},
+        {"field": "latest_market_state_status", "value": latest_market_state_status},
+        {"field": "prediction_latest_block_reasons", "value": latest_block_reasons or "PASS"},
+        {"field": "pooled_model_quality_pass", "value": model_quality_pass},
+        {"field": "pooled_system_quality_pass", "value": system_quality_pass},
+        {"field": "pooled_latest_signal_pass", "value": latest_signal_pass},
+        {"field": "pooled_latest_block_reasons", "value": model_gate_snapshot.get("pooled_latest_block_reasons", "UNKNOWN")},
+        {"field": "pooled_decision_block_reasons", "value": model_gate_snapshot.get("pooled_decision_block_reasons", "UNKNOWN")},
+        {
+            "field": "paper_gate_status",
+            "value": model_gate_snapshot.get(
+                "paper_gate_status",
+                prediction_snapshot.get("pooled_paper_gate_status", prediction_snapshot.get("paper_gate_status", "UNKNOWN")),
+            ),
+        },
+        {"field": "paper_gate_block_reasons", "value": model_gate_snapshot.get("paper_gate_block_reasons", "UNKNOWN")},
         {"field": "prediction_scope_used", "value": prediction_snapshot.get("prediction_scope_used", "UNKNOWN")},
         {"field": "prediction_entry_gate_status", "value": prediction_snapshot.get("latest_entry_gate_status", "UNKNOWN")},
+        {"field": "model_gate_status", "value": model_gate_snapshot.get("model_gate_status", "UNKNOWN")},
+        {"field": "performance_gate_status", "value": model_gate_snapshot.get("performance_gate_status", "UNKNOWN")},
+        {"field": "active_performance_failed_gate_count", "value": model_gate_snapshot.get("active_performance_failed_gate_count", 0)},
+        {"field": "active_performance_blocking_failed_gate_count", "value": model_gate_snapshot.get("active_performance_blocking_failed_gate_count", 0)},
+        {"field": "active_metric_performance_failed_gate_count", "value": model_gate_snapshot.get("active_metric_performance_failed_gate_count", 0)},
+        {"field": "metric_performance_failed_gate_count", "value": model_gate_snapshot.get("metric_performance_failed_gate_count", 0)},
+        {"field": "performance_evidence_gap_count", "value": model_gate_snapshot.get("performance_evidence_gap_count", 0)},
+        {"field": "aggregate_performance_quality_flag_count", "value": model_gate_snapshot.get("aggregate_performance_quality_flag_count", 0)},
+        {"field": "diagnostic_performance_warning_gate_count", "value": model_gate_snapshot.get("diagnostic_performance_warning_gate_count", 0)},
+        {"field": "diagnostic_metric_performance_warning_gate_count", "value": model_gate_snapshot.get("diagnostic_metric_performance_warning_gate_count", 0)},
+        {"field": "rank_policy_supported_performance_warning_count", "value": model_gate_snapshot.get("rank_policy_supported_performance_warning_count", 0)},
+        {"field": "rank_policy_supported_threshold_warning_count", "value": model_gate_snapshot.get("rank_policy_supported_threshold_warning_count", 0)},
+        {"field": "rank_policy_supported_metric_warning_count", "value": model_gate_snapshot.get("rank_policy_supported_metric_warning_count", 0)},
+        {"field": "rank_policy_supported_threshold_metric_warning_count", "value": model_gate_snapshot.get("rank_policy_supported_threshold_metric_warning_count", 0)},
+        {"field": "evidence_limited_metric_warning_count", "value": model_gate_snapshot.get("evidence_limited_metric_warning_count", 0)},
+        {"field": "rejected_model_metric_warning_count", "value": model_gate_snapshot.get("rejected_model_metric_warning_count", 0)},
+        {"field": "strategy_diagnostic_metric_warning_count", "value": model_gate_snapshot.get("strategy_diagnostic_metric_warning_count", 0)},
+        {
+            "field": "unresolved_diagnostic_metric_performance_warning_gate_count",
+            "value": model_gate_snapshot.get("unresolved_diagnostic_metric_performance_warning_gate_count", 0),
+        },
+        {
+            "field": "classified_diagnostic_performance_warning_count",
+            "value": model_gate_snapshot.get("classified_diagnostic_performance_warning_count", 0),
+        },
+        {
+            "field": "unresolved_diagnostic_performance_warning_count",
+            "value": model_gate_snapshot.get("unresolved_diagnostic_performance_warning_count", 0),
+        },
+        {"field": "uncategorized_root_cause_count", "value": model_gate_snapshot.get("uncategorized_root_cause_count", 0)},
+        {"field": "uncategorized_warning_gate_count", "value": model_gate_snapshot.get("uncategorized_warning_gate_count", 0)},
+        {"field": "uncategorized_root_causes", "value": model_gate_snapshot.get("uncategorized_root_causes", "PASS")},
+        {
+            "field": "performance_warning_resolution_status",
+            "value": model_gate_snapshot.get("performance_warning_resolution_status", "UNKNOWN"),
+        },
+        {"field": "performance_failed_gate_groups", "value": model_gate_snapshot.get("performance_failed_gate_groups", "PASS")},
+        {"field": "active_performance_failed_gate_groups", "value": model_gate_snapshot.get("active_performance_failed_gate_groups", "PASS")},
+        {"field": "metric_performance_failed_families", "value": model_gate_snapshot.get("metric_performance_failed_families", "PASS")},
+        {"field": "diagnostic_performance_failed_gate_groups", "value": model_gate_snapshot.get("diagnostic_performance_failed_gate_groups", "PASS")},
+        {"field": "next_required_evidence_action", "value": model_gate_snapshot.get("next_required_evidence_action", "UNKNOWN")},
+        {"field": "next_required_performance_action", "value": model_gate_snapshot.get("next_required_performance_action", "UNKNOWN")},
+        {"field": "performance_gate_interpretation", "value": model_gate_snapshot.get("performance_gate_interpretation", "UNKNOWN")},
+        {"field": "rank_uplift_diagnostic_count", "value": model_gate_snapshot.get("rank_uplift_diagnostic_count", 0)},
+        {"field": "rank_uplift_positive_diagnostic_count", "value": model_gate_snapshot.get("rank_uplift_positive_diagnostic_count", 0)},
+        {"field": "rank_policy_diagnostic_pass_count", "value": model_gate_snapshot.get("rank_policy_diagnostic_pass_count", 0)},
+        {"field": "rank_policy_best_se_lower_pct", "value": model_gate_snapshot.get("rank_policy_best_se_lower_pct", "NA")},
         {"field": "live_trading_status", "value": "DISABLED_BY_DESIGN"},
-        {"field": "paper_trading_status", "value": ("PREDICTION_PAPER_ALPHA_READY" if paper_prediction_decision_support else ("PREDICTION_PAPER_ALPHA_READY" if prediction_ready else "RULE_BASED_READY_PREDICTION_DISPLAY_ONLY")) if paper_ready else "NOT_READY"},
+        {
+            "field": "paper_trading_status",
+            "value": (
+                "PREDICTION_PAPER_SIGNAL_READY"
+                if paper_prediction_decision_support
+                else ("PREDICTION_PIPELINE_READY_WAITING_FOR_SIGNAL" if prediction_ready else "RULE_BASED_READY_PREDICTION_DISPLAY_ONLY")
+            )
+            if paper_ready
+            else "NOT_READY",
+        },
     ]
     return pd.DataFrame(rows)
 
@@ -352,7 +566,7 @@ def build_latest_state(
 def write_report(outdir: Path, scorecard: pd.DataFrame, latest: pd.DataFrame) -> None:
     latest_map = dict(zip(latest["field"], latest["value"]))
     lines = [
-        "# TSMC System Readiness Report",
+        "# Top10 System Readiness Report",
         "",
         f"- System state: {latest_map.get('system_state', 'NA')}",
         f"- Legacy system readiness score (research stack only): {latest_map.get('system_readiness_score', 'NA')} / 100",
@@ -365,21 +579,54 @@ def write_report(outdir: Path, scorecard: pd.DataFrame, latest: pd.DataFrame) ->
         f"- Research ready: {latest_map.get('research_ready', 'NA')}",
         f"- Alpha ready: {latest_map.get('alpha_ready', 'NA')}",
         f"- Prediction ready: {latest_map.get('prediction_ready', 'NA')}",
+        f"- Prediction pipeline ready: {latest_map.get('prediction_pipeline_ready', 'NA')}",
         f"- Live ready: {latest_map.get('live_ready', 'NA')}",
         f"- Prediction decision support: {latest_map.get('prediction_decision_support', 'NA')}",
         f"- Paper prediction decision support: {latest_map.get('paper_prediction_decision_support', 'NA')}",
+        f"- Paper OMS ready: {latest_map.get('paper_oms_ready', 'NA')}",
         f"- Paper gate status: {latest_map.get('paper_gate_status', 'NA')}",
         f"- Paper trading status: {latest_map.get('paper_trading_status', 'NA')}",
         f"- Live trading status: {latest_map.get('live_trading_status', 'NA')}",
         f"- Alpha block reasons: {latest_map.get('alpha_block_reasons', 'NA')}",
         f"- Prediction block reasons: {latest_map.get('prediction_block_reasons', 'NA')}",
+        f"- Prediction performance block reasons: {latest_map.get('prediction_performance_block_reasons', 'NA')}",
         f"- Live block reasons: {latest_map.get('live_block_reasons', 'NA')}",
         f"- Risk state: {latest_map.get('risk_state', 'NA')}",
         f"- Stress status: {latest_map.get('stress_status', 'NA')}",
         f"- Prediction status: {latest_map.get('prediction_signal_status', 'NA')}",
         f"- Prediction use status: {latest_map.get('prediction_use_status', 'NA')}",
+        f"- Latest market state status: {latest_map.get('latest_market_state_status', 'NA')}",
+        f"- Latest prediction block reasons: {latest_map.get('prediction_latest_block_reasons', 'NA')}",
+        f"- Pooled model quality pass: {latest_map.get('pooled_model_quality_pass', 'NA')}",
+        f"- Pooled system quality pass: {latest_map.get('pooled_system_quality_pass', 'NA')}",
+        f"- Pooled latest signal pass: {latest_map.get('pooled_latest_signal_pass', 'NA')}",
+        f"- Pooled latest block reasons: {latest_map.get('pooled_latest_block_reasons', 'NA')}",
+        f"- Paper gate block reasons: {latest_map.get('paper_gate_block_reasons', 'NA')}",
         f"- Prediction scope: {latest_map.get('prediction_scope_used', 'NA')}",
         f"- Prediction entry gate: {latest_map.get('prediction_entry_gate_status', 'NA')}",
+        f"- Model gate status: {latest_map.get('model_gate_status', 'NA')}",
+        f"- Performance gate status: {latest_map.get('performance_gate_status', 'NA')}",
+        f"- Active performance failed gates: {latest_map.get('active_performance_failed_gate_count', 'NA')}",
+        f"- Active performance blocking failed gates: {latest_map.get('active_performance_blocking_failed_gate_count', 'NA')}",
+        f"- Active metric performance failed gates: {latest_map.get('active_metric_performance_failed_gate_count', 'NA')}",
+        f"- Metric performance failed gates: {latest_map.get('metric_performance_failed_gate_count', 'NA')}",
+        f"- Performance evidence gap count: {latest_map.get('performance_evidence_gap_count', 'NA')}",
+        f"- Aggregate performance quality flags: {latest_map.get('aggregate_performance_quality_flag_count', 'NA')}",
+        f"- Diagnostic performance warnings: {latest_map.get('diagnostic_performance_warning_gate_count', 'NA')}",
+        f"- Diagnostic metric performance warnings: {latest_map.get('diagnostic_metric_performance_warning_gate_count', 'NA')}",
+        f"- Rank-policy supported metric warnings: {latest_map.get('rank_policy_supported_metric_warning_count', 'NA')}",
+        f"- Evidence-limited metric warnings: {latest_map.get('evidence_limited_metric_warning_count', 'NA')}",
+        f"- Rejected-model metric warnings: {latest_map.get('rejected_model_metric_warning_count', 'NA')}",
+        f"- Strategy diagnostic metric warnings: {latest_map.get('strategy_diagnostic_metric_warning_count', 'NA')}",
+        f"- Classified diagnostic performance warnings: {latest_map.get('classified_diagnostic_performance_warning_count', 'NA')}",
+        f"- Unresolved diagnostic performance warnings: {latest_map.get('unresolved_diagnostic_performance_warning_count', 'NA')}",
+        f"- Uncategorized root causes: {latest_map.get('uncategorized_root_cause_count', 'NA')}",
+        f"- Uncategorized warning gate rows: {latest_map.get('uncategorized_warning_gate_count', 'NA')}",
+        f"- Uncategorized root cause names: {latest_map.get('uncategorized_root_causes', 'NA')}",
+        f"- Performance warning resolution status: {latest_map.get('performance_warning_resolution_status', 'NA')}",
+        f"- Next required evidence action: {latest_map.get('next_required_evidence_action', 'NA')}",
+        f"- Next required performance action: {latest_map.get('next_required_performance_action', 'NA')}",
+        f"- Performance gate interpretation: {latest_map.get('performance_gate_interpretation', 'NA')}",
         "",
         "## Scorecard",
         "",
@@ -394,8 +641,8 @@ def write_report(outdir: Path, scorecard: pd.DataFrame, latest: pd.DataFrame) ->
             "",
             "## Operating Rule",
             "- Research readiness means the daily-data research stack is internally consistent.",
-            "- Alpha readiness additionally requires live-like economic evidence and trusted 20D trade-ready prediction support.",
-            "- Prediction quality is a decision-support gate; failed prediction quality blocks alpha readiness but not research operation.",
+            "- Alpha readiness additionally requires live-like economic evidence and a trusted 20D prediction pipeline.",
+            "- Current entry permission is reported separately as the latest market signal; no-entry days do not fail model readiness.",
             "- Live trading remains disabled by design until broker integration, reconciliation, kill switch, and intraday execution audit exist.",
             "- No readiness score means the next trade will be profitable.",
             "",
@@ -412,11 +659,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-quality", default="tsm_price_rule_output/tsm_validation_quality_checks.csv")
     parser.add_argument("--prediction-quality", default="tsm_price_rule_output/tsm_prediction_quality_checks.csv")
     parser.add_argument("--prediction-snapshot", default="tsm_price_rule_output/tsm_latest_prediction_snapshot.csv")
+    parser.add_argument("--model-gate-snapshot", default="tsm_price_rule_output/tsm_model_gate_snapshot.csv")
     parser.add_argument("--risk-snapshot", default="tsm_price_rule_output/tsm_latest_risk_snapshot.csv")
     parser.add_argument("--stress-snapshot", default="tsm_price_rule_output/tsm_latest_stress_snapshot.csv")
     parser.add_argument("--backtest-summary", default="tsm_price_rule_output/tsm_backtest_strategy_summary.csv")
     parser.add_argument("--walk-forward", default="tsm_price_rule_output/tsm_validation_walk_forward_summary.csv")
     parser.add_argument("--causal-walk-forward", default="tsm_price_rule_output/tsm_validation_causal_walk_forward_summary.csv")
+    parser.add_argument("--paper-oms-quality", default="")
+    parser.add_argument("--paper-reconciliation-quality", default="")
+    parser.add_argument("--order-state-quality", default="")
+    parser.add_argument("--execution-feedback-quality", default="")
+    parser.add_argument("--fill-calibration-quality", default="")
+    parser.add_argument("--automation-quality", default="")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
     return parser.parse_args()
 
@@ -431,11 +685,18 @@ def main() -> None:
     validation_quality = load_csv(Path(args.validation_quality))
     prediction_quality = load_csv(Path(args.prediction_quality))
     prediction_snapshot = load_snapshot(Path(args.prediction_snapshot))
+    model_gate_snapshot = load_snapshot(Path(args.model_gate_snapshot))
     risk_snapshot = load_snapshot(Path(args.risk_snapshot))
     stress_snapshot = load_snapshot(Path(args.stress_snapshot))
     backtest_summary = load_csv(Path(args.backtest_summary))
     walk_forward = load_csv(Path(args.walk_forward))
     causal_walk_forward = load_csv(Path(args.causal_walk_forward))
+    paper_oms_quality = load_csv(Path(args.paper_oms_quality)) if args.paper_oms_quality else None
+    paper_reconciliation_quality = load_csv(Path(args.paper_reconciliation_quality)) if args.paper_reconciliation_quality else None
+    order_state_quality = load_csv(Path(args.order_state_quality)) if args.order_state_quality else None
+    execution_feedback_quality = load_csv(Path(args.execution_feedback_quality)) if args.execution_feedback_quality else None
+    fill_calibration_quality = load_csv(Path(args.fill_calibration_quality)) if args.fill_calibration_quality else None
+    automation_quality = load_csv(Path(args.automation_quality)) if args.automation_quality else None
 
     scorecard = build_scorecard(
         operational_quality,
@@ -448,8 +709,15 @@ def main() -> None:
         backtest_summary,
         walk_forward,
         causal_walk_forward,
+        paper_oms_quality,
+        paper_reconciliation_quality,
+        order_state_quality,
+        execution_feedback_quality,
+        fill_calibration_quality,
+        automation_quality,
+        model_gate_snapshot,
     )
-    latest = build_latest_state(scorecard, risk_snapshot, stress_snapshot, prediction_snapshot)
+    latest = build_latest_state(scorecard, risk_snapshot, stress_snapshot, prediction_snapshot, model_gate_snapshot)
 
     scorecard.to_csv(outdir / "tsm_system_readiness_scorecard.csv", index=False)
     latest.to_csv(outdir / "tsm_latest_system_state.csv", index=False)

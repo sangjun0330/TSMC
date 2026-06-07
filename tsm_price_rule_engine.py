@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMC ADR(TSM) 10년 일별 주가 통합 분석 + 규칙/알고리즘 수치화 엔진
+Top10 호환 일별 주가 통합 분석 + 규칙/알고리즘 수치화 엔진
 
 입력 파일
 - tsm_daily_10y_enriched.csv : 핵심 기준 파일. OHLCV + 수익률/변동성/추세/모멘텀/유동성/벤치마크 지표 포함
@@ -31,7 +31,9 @@ TSMC ADR(TSM) 10년 일별 주가 통합 분석 + 규칙/알고리즘 수치화 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -39,8 +41,19 @@ import numpy as np
 import pandas as pd
 
 from causal_utils import causal_rolling_quantile, rolling_percentile_rank, rolling_winsorize
+from tsm_core.config import RuleEngineConfig, load_run_config
 
 TRADING_DAYS = 252
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def stable_id(*parts: object, prefix: str = "sig") -> str:
+    text = "|".join("" if part is None else str(part) for part in parts)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
 
 
 # -----------------------------
@@ -66,6 +79,18 @@ def require_columns(df: pd.DataFrame, required: Iterable[str]) -> None:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"필수 컬럼 누락: {missing}")
+
+
+def numeric_series(df: pd.DataFrame, columns: str | Iterable[str], default: float = np.nan) -> pd.Series:
+    """Return a numeric Series for the first available column, preserving df.index."""
+    if isinstance(columns, str):
+        column_names = (columns,)
+    else:
+        column_names = tuple(columns)
+    for column in column_names:
+        if column in df.columns:
+            return pd.to_numeric(df[column], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
 
 
 NEWS_DAILY_COLUMNS = [
@@ -283,8 +308,15 @@ def add_discovered_states(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, flo
     return df, q
 
 
-def add_scores_and_signals(df: pd.DataFrame, q: Dict[str, float]) -> pd.DataFrame:
+def add_scores_and_signals(
+    df: pd.DataFrame,
+    q: Dict[str, float],
+    config: RuleEngineConfig | None = None,
+    symbol: str = "TSM",
+    symbol_group: str = "semiconductor",
+) -> pd.DataFrame:
     df = df.copy()
+    config = config or RuleEngineConfig()
 
     # 점수화: 같은 종목의 10년 분포 내 상대 점수. 0~100.
     # 모멘텀은 최근 20/60/126/252일 수익률 + 12-1 모멘텀을 결합.
@@ -344,7 +376,7 @@ def add_scores_and_signals(df: pd.DataFrame, q: Dict[str, float]) -> pd.DataFram
         df["news_penalty_event"] = 0.0
     df["news_penalty_event"] = pd.to_numeric(df["news_penalty_event"], errors="coerce").fillna(0.0)
 
-    # 단일 종목 트레이딩 총점: 펀더멘털 없이 가격/위험/유동성 중심
+    # 종목별 트레이딩 총점: 펀더멘털 없이 가격/위험/유동성 중심
     df["score_price_algo_total"] = (
         0.30 * df["score_trend"] +
         0.25 * df["score_momentum"] +
@@ -373,10 +405,15 @@ def add_scores_and_signals(df: pd.DataFrame, q: Dict[str, float]) -> pd.DataFram
     )
 
     df["trade_action"] = "NO_TRADE"
-    df.loc[(df["score_price_algo_total"] >= 75) & (df["entry_trigger"] != "NONE") & (~df["algo_vol_extreme"]), "trade_action"] = "ENTRY_ALLOWED"
+    entry_threshold = float(config.score_entry_threshold)
+    watchlist_threshold = float(config.watchlist_threshold)
+    stop_atr_multiple = float(config.stop_atr_multiple)
+    take_profit_r_multiple = float(config.take_profit_r_multiple)
+
+    df.loc[(df["score_price_algo_total"] >= entry_threshold) & (df["entry_trigger"] != "NONE") & (~df["algo_vol_extreme"]), "trade_action"] = "ENTRY_ALLOWED"
     df.loc[df["entry_trigger"] == "DEEP_DD_RECOVERY", "trade_action"] = "RESEARCH_ONLY_DEEP_DD"
-    df.loc[(df["score_price_algo_total"] >= 75) & (df["entry_trigger"] == "NONE") & df["algo_trend_up_loose"], "trade_action"] = "HOLD_OR_WAIT_TRIGGER"
-    df.loc[(df["score_price_algo_total"].between(65, 75)) & df["algo_trend_up_loose"], "trade_action"] = "WATCHLIST_PULLBACK_ONLY"
+    df.loc[(df["score_price_algo_total"] >= entry_threshold) & (df["entry_trigger"] == "NONE") & df["algo_trend_up_loose"], "trade_action"] = "HOLD_OR_WAIT_TRIGGER"
+    df.loc[(df["score_price_algo_total"].between(watchlist_threshold, entry_threshold)) & df["algo_trend_up_loose"], "trade_action"] = "WATCHLIST_PULLBACK_ONLY"
     df.loc[df["algo_overextended_highvol"], "trade_action"] = "REDUCE_OR_DO_NOT_CHASE"
     df.loc[df["algo_deep_downtrend_avoid"], "trade_action"] = "AVOID_TREND_LONG"
     df.loc[df["close"] < df["sma_200"], "trade_action"] = np.where(
@@ -387,16 +424,16 @@ def add_scores_and_signals(df: pd.DataFrame, q: Dict[str, float]) -> pd.DataFram
     df.loc[df["entry_trigger"] == "DEEP_DD_RECOVERY", "trade_action"] = "RESEARCH_ONLY_DEEP_DD"
 
     # 리스크/주문 수치화
-    df["atr_stop_2x"] = df["close"] - 2.0 * df["atr_14"]
+    df["atr_stop_2x"] = df["close"] - stop_atr_multiple * df["atr_14"]
     df["atr_trailing_stop_3x"] = df["close"] - 3.0 * df["atr_14"]
-    df["risk_per_share_2atr"] = 2.0 * df["atr_14"]
+    df["risk_per_share_2atr"] = stop_atr_multiple * df["atr_14"]
     df["risk_pct_2atr"] = df["risk_per_share_2atr"] / df["close"]
 
     # 위험에 따른 최대 비중: 평상 12%, 고변동 7%, 극단 4%, 200일선 아래 0~3% 관찰
-    df["max_weight_by_vol"] = 0.12
-    df.loc[df["algo_vol_high"], "max_weight_by_vol"] = 0.07
-    df.loc[df["algo_vol_extreme"], "max_weight_by_vol"] = 0.04
-    df.loc[df["close"] < df["sma_200"], "max_weight_by_vol"] = 0.03
+    df["max_weight_by_vol"] = float(config.max_weight_normal)
+    df.loc[df["algo_vol_high"], "max_weight_by_vol"] = float(config.max_weight_high_vol)
+    df.loc[df["algo_vol_extreme"], "max_weight_by_vol"] = float(config.max_weight_extreme_vol)
+    df.loc[df["close"] < df["sma_200"], "max_weight_by_vol"] = float(config.max_weight_below_200d)
     df.loc[df["algo_deep_downtrend_avoid"], "max_weight_by_vol"] = 0.00
 
     # 1% 계좌위험 기준 이론 포지션 비중 = 1% / 손절폭%. 다만 max_weight_by_vol로 제한.
@@ -404,24 +441,200 @@ def add_scores_and_signals(df: pd.DataFrame, q: Dict[str, float]) -> pd.DataFram
     df["position_weight_if_0_5pct_account_risk"] = np.minimum(0.005 / df["risk_pct_2atr"], df["max_weight_by_vol"])
 
     # 익절 기준: 2R, 3R
-    df["take_profit_2R"] = df["close"] + 2 * df["risk_per_share_2atr"]
+    df["take_profit_2R"] = df["close"] + take_profit_r_multiple * df["risk_per_share_2atr"]
     df["take_profit_3R"] = df["close"] + 3 * df["risk_per_share_2atr"]
 
     df = add_two_stage_signal_layers(df)
+    df = add_semiconductor_momentum_v2_layers(df)
+
+    df["signal_version"] = str(config.signal_version)
+    df["rule_family"] = str(config.rule_family)
+    df["hypothesis_id"] = str(config.hypothesis_id)
+    df["decision_policy_version"] = str(config.decision_policy_version)
+    df["symbol"] = str(symbol).upper()
+    df["symbol_group"] = str(symbol_group)
+    df["available_at_utc"] = df["date"].dt.strftime("%Y-%m-%dT21:00:00+00:00") if "date" in df.columns else now_utc_iso()
+    df["signal_id"] = [
+        stable_id(symbol, date.date().isoformat() if hasattr(date, "date") else date, version, trigger, action, prefix="sig")
+        for symbol, date, version, trigger, action in zip(
+            df["symbol"],
+            df["date"] if "date" in df.columns else pd.Series(range(len(df)), index=df.index),
+            df["signal_version"],
+            df["entry_trigger"],
+            df["trade_action"],
+        )
+    ]
 
     return df
+
+
+V2_ACTIONABLE_TIERS = {"STRICT_ENTRY_ALLOWED", "AGGRESSIVE_TREND_ENTRY", "BREAKOUT_EXTENSION_TINY", "PULLBACK_REENTRY"}
+MEMORY_AI_GROUP_TOKENS = ("memory", "fabless_ai", "ai")
+
+
+def add_semiconductor_momentum_v2_layers(df: pd.DataFrame) -> pd.DataFrame:
+    """Add semiconductor-specific 5-20D momentum decision columns.
+
+    The v1 strict signal is preserved. V2 records raw momentum events even when
+    volatility or extension would make v1 suppress the clean trigger.
+    """
+    out = df.copy()
+    close = numeric_series(out, "close")
+    high = numeric_series(out, ("high", "close"))
+    sma50 = numeric_series(out, "sma_50")
+    sma200 = numeric_series(out, "sma_200")
+    ema10 = numeric_series(out, ("ema_10", "sma_10"))
+    ret20 = numeric_series(out, "return_20d", default=0.0).fillna(0.0)
+    ret60 = numeric_series(out, "return_60d", default=0.0).fillna(0.0)
+    close_change = numeric_series(out, "close_change_pct", default=0.0).fillna(0.0)
+    open_gap = numeric_series(out, "open_gap_pct", default=0.0).fillna(0.0)
+    open_to_close = numeric_series(out, "open_to_close_pct", default=0.0).fillna(0.0)
+    score = numeric_series(out, "score_price_algo_total", default=0.0).fillna(0.0)
+    score_momentum = numeric_series(out, "score_momentum", default=50.0).fillna(50.0)
+    score_relative = numeric_series(out, "score_relative_strength", default=50.0).fillna(50.0)
+    dist50 = numeric_series(out, "dist_close_sma_50_pct", default=0.0).fillna(0.0)
+    rel_smh = numeric_series(out, ("relative_return_vs_smh_20d", "relative_return_vs_smh_60d"))
+    rel_qqq = numeric_series(out, ("relative_return_vs_qqq_20d", "relative_return_vs_qqq_60d"))
+    relative_strength_vs_smh_qqq = pd.concat([rel_smh, rel_qqq], axis=1).mean(axis=1, skipna=True).fillna(0.0)
+    symbol_group = out.get("symbol_group", pd.Series("semiconductor", index=out.index)).fillna("semiconductor").astype(str).str.lower()
+
+    prev_20d_high = pd.to_numeric(out.get("prev_20d_high"), errors="coerce") if "prev_20d_high" in out.columns else high.shift(1).rolling(20, min_periods=10).max()
+    prev_60d_high = pd.to_numeric(out.get("prev_60d_high"), errors="coerce") if "prev_60d_high" in out.columns else high.shift(1).rolling(60, min_periods=30).max()
+    prev_252d_high = pd.to_numeric(out.get("prev_252d_high"), errors="coerce") if "prev_252d_high" in out.columns else high.shift(1).rolling(252, min_periods=126).max()
+
+    out["raw_breakout_20d"] = close.gt(prev_20d_high).fillna(False)
+    out["raw_breakout_60d"] = close.gt(prev_60d_high).fillna(False)
+    out["raw_52w_high_near"] = (close.ge(prev_252d_high * 0.97) | out.get("breakout_252d_high", pd.Series(False, index=out.index)).fillna(False).astype(bool)).fillna(False)
+    out["positive_thrust_day"] = ((close_change >= 0.03) | (open_gap >= 0.04) | (open_to_close >= 0.025)).fillna(False)
+    out["negative_shock_day"] = ((close_change <= -0.04) | (open_gap <= -0.04) | (open_to_close <= -0.035)).fillna(False)
+    out["relative_strength_vs_smh_qqq"] = relative_strength_vs_smh_qqq
+
+    memory_ai_group = symbol_group.apply(lambda g: any(token in g for token in MEMORY_AI_GROUP_TOKENS))
+    raw_breakout_any = out["raw_breakout_20d"] | out["raw_breakout_60d"] | out["raw_52w_high_near"]
+    trend_ok = out.get("algo_trend_up_loose", pd.Series(False, index=out.index)).fillna(False).astype(bool) & close.ge(sma50) & close.ge(sma200)
+    strong_relative = (relative_strength_vs_smh_qqq > 0.0) | out.get("algo_relative_strength", pd.Series(False, index=out.index)).fillna(False).astype(bool) | score_relative.ge(60.0)
+
+    out["semi_group_momentum_score"] = (
+        ret20.gt(0).astype(float) * 18.0
+        + ret60.gt(0).astype(float) * 18.0
+        + raw_breakout_any.astype(float) * 22.0
+        + strong_relative.astype(float) * 18.0
+        + score_momentum.ge(70.0).astype(float) * 14.0
+        + out["positive_thrust_day"].astype(float) * 10.0
+    ).clip(0, 100)
+    out["memory_ai_regime_score"] = (
+        out["semi_group_momentum_score"] * 0.65
+        + memory_ai_group.astype(float) * 20.0
+        + ret20.gt(0.08).astype(float) * 8.0
+        + ret60.gt(0.15).astype(float) * 7.0
+    ).clip(0, 100)
+    out["semi_momentum_regime"] = np.select(
+        [
+            out["memory_ai_regime_score"].ge(70.0),
+            out["semi_group_momentum_score"].ge(65.0),
+            out["semi_group_momentum_score"].ge(45.0),
+        ],
+        ["MEMORY_AI_LEADERSHIP", "SEMI_MOMENTUM_UP", "SEMI_NEUTRAL"],
+        default="SEMI_WEAK",
+    )
+    out["raw_entry_event"] = np.select(
+        [
+            out["raw_breakout_60d"],
+            out["raw_breakout_20d"],
+            out["raw_52w_high_near"],
+            out["positive_thrust_day"],
+        ],
+        ["RAW_60D_BREAKOUT", "RAW_20D_BREAKOUT", "RAW_52W_HIGH_NEAR", "POSITIVE_THRUST_DAY"],
+        default="NONE",
+    )
+
+    vol_extreme = out.get("algo_vol_extreme", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    overextended = out.get("algo_overextended_highvol", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    event_shock = out.get("algo_event_shock_day", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    below_200d = close.lt(sma200).fillna(False)
+    avoid = below_200d | out.get("algo_deep_downtrend_avoid", pd.Series(False, index=out.index)).fillna(False).astype(bool) | out["negative_shock_day"] | out.get("algo_trend_down_clean", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+    strong_semi = out["semi_group_momentum_score"].ge(65.0) | out["memory_ai_regime_score"].ge(70.0)
+    high_vol_or_extension = vol_extreme | overextended | event_shock | dist50.gt(0.20)
+    strict_entry = out.get("trade_action", pd.Series("", index=out.index)).fillna("").astype(str).eq("ENTRY_ALLOWED")
+    aggressive_entry = (~avoid) & raw_breakout_any & strong_semi & strong_relative & score.ge(60.0) & (~vol_extreme) & (~overextended)
+    extension_tiny = (~avoid) & raw_breakout_any & out["positive_thrust_day"] & strong_semi & score.ge(50.0) & high_vol_or_extension
+    pullback_reentry = (~avoid) & out.get("algo_pullback_to_50_bounce", pd.Series(False, index=out.index)).fillna(False).astype(bool) & strong_semi & score.ge(55.0)
+    watch_trend = (~avoid) & trend_ok & strong_semi & score.ge(55.0)
+
+    out["decision_tier"] = np.select(
+        [strict_entry, aggressive_entry, extension_tiny, pullback_reentry, watch_trend, avoid],
+        ["STRICT_ENTRY_ALLOWED", "AGGRESSIVE_TREND_ENTRY", "BREAKOUT_EXTENSION_TINY", "PULLBACK_REENTRY", "WATCH_TREND", "AVOID_OR_WAIT"],
+        default="AVOID_OR_WAIT",
+    )
+    base_weight = numeric_series(out, "position_weight_if_0_5pct_account_risk", default=0.0).fillna(0.0).clip(lower=0.0)
+    strict_weight = np.minimum(np.maximum(base_weight, 0.04), 0.07)
+    aggressive_weight = np.minimum(np.maximum(base_weight, 0.04), 0.07)
+    reduced_weight = np.minimum(np.maximum(base_weight, 0.02), 0.04)
+    tiny_weight = np.minimum(np.maximum(base_weight, 0.005), 0.03)
+    out["suggested_weight"] = np.select(
+        [
+            out["decision_tier"].eq("STRICT_ENTRY_ALLOWED"),
+            out["decision_tier"].eq("AGGRESSIVE_TREND_ENTRY"),
+            out["decision_tier"].eq("BREAKOUT_EXTENSION_TINY"),
+            out["decision_tier"].eq("PULLBACK_REENTRY"),
+        ],
+        [strict_weight, aggressive_weight, tiny_weight, reduced_weight],
+        default=0.0,
+    ).astype(float)
+    out["sizing_tier"] = np.select(
+        [
+            out["decision_tier"].eq("STRICT_ENTRY_ALLOWED"),
+            out["decision_tier"].eq("AGGRESSIVE_TREND_ENTRY"),
+            out["decision_tier"].eq("BREAKOUT_EXTENSION_TINY"),
+            out["decision_tier"].eq("PULLBACK_REENTRY"),
+            out["decision_tier"].eq("WATCH_TREND"),
+        ],
+        ["STANDARD_4_7", "STANDARD_4_7", "TINY_0_5_3", "REDUCED_2_4", "WATCH_0"],
+        default="NO_SIZE",
+    )
+    out["suggested_action"] = np.select(
+        [
+            out["decision_tier"].eq("STRICT_ENTRY_ALLOWED"),
+            out["decision_tier"].eq("AGGRESSIVE_TREND_ENTRY"),
+            out["decision_tier"].eq("BREAKOUT_EXTENSION_TINY"),
+            out["decision_tier"].eq("PULLBACK_REENTRY"),
+            out["decision_tier"].eq("WATCH_TREND"),
+        ],
+        ["STRICT_BUY_ALLOWED", "SEMI_MOMENTUM_ENTRY", "HIGH_VOL_TINY_EXTENSION", "PULLBACK_REENTRY", "WATCH_FOR_5_20D_SETUP"],
+        default="AVOID_OR_WAIT",
+    )
+    out["execution_status"] = np.where(out["decision_tier"].isin(V2_ACTIONABLE_TIERS), "PAPER_INTENT_ALLOWED_LIVE_DISABLED", "DISPLAY_ONLY")
+    out["stop_price_1_8atr"] = close - 1.8 * numeric_series(out, "atr_14")
+    out["invalidation_5d_low"] = numeric_series(out, ("low", "close")).rolling(5, min_periods=1).min()
+    out["invalidation_ema10"] = ema10
+    out["next_check_condition"] = np.select(
+        [
+            out["decision_tier"].eq("BREAKOUT_EXTENSION_TINY"),
+            out["decision_tier"].eq("AGGRESSIVE_TREND_ENTRY"),
+            out["decision_tier"].eq("PULLBACK_REENTRY"),
+            out["decision_tier"].eq("WATCH_TREND"),
+        ],
+        [
+            "HOLD_ONLY_IF_CLOSE_ABOVE_5D_LOW_AND_10D_EMA",
+            "TRAIL_WITH_1_8ATR_OR_10D_EMA",
+            "INVALIDATE_IF_CLOSE_BELOW_50D_BAND",
+            "WAIT_FOR_RAW_BREAKOUT_OR_PULLBACK_REENTRY",
+        ],
+        default="WAIT_FOR_NEW_SETUP",
+    )
+    return out
 
 
 def add_two_stage_signal_layers(df: pd.DataFrame) -> pd.DataFrame:
     """Add a softer research/paper signal layer without changing strict live signals."""
     out = df.copy()
-    score = pd.to_numeric(out.get("score_price_algo_total"), errors="coerce").fillna(0.0)
-    close = pd.to_numeric(out.get("close"), errors="coerce")
-    sma20 = pd.to_numeric(out.get("sma_20"), errors="coerce")
-    sma50 = pd.to_numeric(out.get("sma_50"), errors="coerce")
-    sma200 = pd.to_numeric(out.get("sma_200"), errors="coerce")
-    ret20 = pd.to_numeric(out.get("return_20d"), errors="coerce").fillna(0.0)
-    drawdown = pd.to_numeric(out.get("drawdown_from_ath"), errors="coerce").fillna(-1.0)
+    score = numeric_series(out, "score_price_algo_total", default=0.0).fillna(0.0)
+    close = numeric_series(out, "close")
+    sma20 = numeric_series(out, "sma_20")
+    sma50 = numeric_series(out, "sma_50")
+    sma200 = numeric_series(out, "sma_200")
+    ret20 = numeric_series(out, "return_20d", default=0.0).fillna(0.0)
+    drawdown = numeric_series(out, "drawdown_from_ath", default=-1.0).fillna(-1.0)
     entry_trigger = out.get("entry_trigger", pd.Series("NONE", index=out.index)).fillna("NONE").astype(str)
     trade_action = out.get("trade_action", pd.Series("NO_TRADE", index=out.index)).fillna("NO_TRADE").astype(str)
 
@@ -517,7 +730,7 @@ def add_two_stage_signal_layers(df: pd.DataFrame) -> pd.DataFrame:
         ],
         default="NO_TRIGGER_OR_SCORE_TOO_LOW",
     )
-    base_paper_weight = pd.to_numeric(out.get("position_weight_if_0_5pct_account_risk"), errors="coerce").fillna(0.0)
+    base_paper_weight = numeric_series(out, "position_weight_if_0_5pct_account_risk", default=0.0).fillna(0.0)
     out["paper_tracking_weight"] = 0.0
     out.loc[paper_setup, "paper_tracking_weight"] = np.minimum(base_paper_weight.loc[paper_setup], 0.02)
     return out
@@ -536,8 +749,17 @@ def integrated_summary(df: pd.DataFrame, validation: pd.DataFrame, q: Dict[str, 
     rows = [
         ("period", f"{start['date'].date()} ~ {end['date'].date()}"),
         ("trading_days", len(df)),
+        ("listing_currency", end.get("listing_currency", "USD")),
+        ("display_currency", end.get("display_currency", "USD")),
+        ("engine_currency", end.get("engine_currency", "USD")),
+        ("fx_pair", end.get("fx_pair", "")),
+        ("latest_fx_rate_to_usd", end.get("fx_rate_to_usd", 1.0)),
+        ("latest_usdkrw", end.get("usdkrw", np.nan)),
         ("start_close_usd", start["close"]),
         ("end_close_usd", end["close"]),
+        ("start_close_native", start.get("close_native", start["close"])),
+        ("end_close_native", end.get("close_native", end["close"])),
+        ("latest_close_native", end.get("close_native", end["close"])),
         ("price_total_return_pct", pct(total_close_ret)),
         ("adj_total_return_pct", pct(total_adj_ret)),
         ("price_cagr_pct", pct((1 + total_close_ret) ** (1 / years) - 1)),
@@ -787,6 +1009,9 @@ def rule_forward_return_stats(df: pd.DataFrame) -> pd.DataFrame:
         "trigger_breakout_60d": df.get("trigger_breakout_60d", df["algo_breakout60_clean"]),
         "trigger_pullback_50d": df.get("trigger_pullback_50d", df["algo_pullback_to_50_bounce"]),
         "trigger_deep_dd_recovery": df.get("trigger_deep_dd_recovery", df["algo_regime_recovery"]),
+        "v2_aggressive_trend_entry": (df.get("decision_tier", pd.Series("", index=df.index)) == "AGGRESSIVE_TREND_ENTRY"),
+        "v2_breakout_extension_tiny": (df.get("decision_tier", pd.Series("", index=df.index)) == "BREAKOUT_EXTENSION_TINY"),
+        "v2_pullback_reentry": (df.get("decision_tier", pd.Series("", index=df.index)) == "PULLBACK_REENTRY"),
         "pullback_to_50_bounce": df["algo_pullback_to_50_bounce"],
         "overextended_highvol": df["algo_overextended_highvol"],
         "deep_downtrend_avoid": df["algo_deep_downtrend_avoid"],
@@ -805,7 +1030,7 @@ def rule_forward_return_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 def regime_forward_return_stats(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for col in ["trend_regime", "vol_regime", "trade_action", "entry_trigger"]:
+    for col in ["trend_regime", "vol_regime", "trade_action", "entry_trigger", "decision_tier", "semi_momentum_regime"]:
         if col not in df.columns:
             continue
         for val, g in df.groupby(col, dropna=False):
@@ -834,7 +1059,10 @@ def news_cause_forward_return_stats(df: pd.DataFrame) -> pd.DataFrame:
 def latest_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     last = df.iloc[-1]
     fields = [
-        "date", "open", "high", "low", "close", "adj_close", "volume",
+        "date", "symbol", "symbol_group", "open", "high", "low", "close", "adj_close", "volume",
+        "open_native", "high_native", "low_native", "close_native", "adj_close_native",
+        "open_usd", "high_usd", "low_usd", "close_usd", "adj_close_usd",
+        "listing_currency", "display_currency", "engine_currency", "fx_pair", "fx_rate_to_usd", "usdkrw", "fx_date",
         "close_change_pct", "return_20d", "return_60d", "return_126d", "return_252d",
         "sma_20", "sma_50", "sma_200", "dist_close_sma_20_pct", "dist_close_sma_50_pct", "dist_close_sma_200_pct",
         "rsi_14", "atr_14", "atr_14_pct", "vol_20d_ann", "vol_63d_ann", "vol_252d_ann",
@@ -849,6 +1077,11 @@ def latest_snapshot(df: pd.DataFrame) -> pd.DataFrame:
         "position_weight_if_0_5pct_account_risk", "position_weight_if_1pct_account_risk", "take_profit_2R", "take_profit_3R",
         "strict_signal_stage", "research_signal_stage", "research_signal_action", "research_signal_level",
         "research_signal_score", "research_signal_reason", "paper_tracking_weight",
+        "raw_entry_event", "raw_breakout_20d", "raw_breakout_60d", "raw_52w_high_near",
+        "positive_thrust_day", "negative_shock_day", "relative_strength_vs_smh_qqq",
+        "semi_group_momentum_score", "memory_ai_regime_score", "semi_momentum_regime",
+        "decision_tier", "sizing_tier", "suggested_action", "suggested_weight",
+        "execution_status", "stop_price_1_8atr", "invalidation_5d_low", "invalidation_ema10", "next_check_condition",
     ]
     rows = []
     ratio_like = {
@@ -858,6 +1091,7 @@ def latest_snapshot(df: pd.DataFrame) -> pd.DataFrame:
         "relative_return_vs_spy_60d", "relative_return_vs_smh_60d", "risk_pct_2atr",
         "position_weight_if_0_5pct_account_risk", "position_weight_if_1pct_account_risk",
         "paper_tracking_weight",
+        "suggested_weight",
         "atr14_q75_hist", "atr14_q90_hist", "atr14_q95_hist",
         "vol20_q75_hist", "vol20_q90_hist", "vol20_q95_hist", "range_q95_hist",
     }
@@ -885,7 +1119,7 @@ def write_rulebook_md(outdir: Path, df: pd.DataFrame, q: Dict[str, float], summa
         return f"n={int(r['n_signals'])}, 평균 {r['mean_fwd_return_pct']:.2f}%, 중앙값 {r['median_fwd_return_pct']:.2f}%, 승률 {r['win_rate_pct']:.1f}%"
 
     lines = []
-    lines.append("# TSMC ADR(TSM) 10년 일별 주가 기반 규칙/알고리즘 정리본")
+    lines.append("# Top10 호환 일별 주가 기반 규칙/알고리즘 정리본")
     lines.append("")
     lines.append("## 1. 데이터 기준")
     lines.append(f"- 기간: {metric('period')}")
@@ -962,7 +1196,11 @@ def main() -> None:
     parser.add_argument("--events", default="tsm_event_impact_10y.csv")
     parser.add_argument("--news-daily", default="")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
+    parser.add_argument("--config", default="config/tsm_research.toml")
+    parser.add_argument("--symbol", default="TSM")
+    parser.add_argument("--symbol-group", default="semiconductor")
     args = parser.parse_args()
+    run_config = load_run_config(args.config)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -972,7 +1210,7 @@ def main() -> None:
     df = add_forward_returns(df)
     df, q = add_discovered_states(df)
     df = integrate_news_daily(df, args.news_daily)
-    df = add_scores_and_signals(df, q)
+    df = add_scores_and_signals(df, q, run_config.rule_engine, symbol=args.symbol, symbol_group=args.symbol_group)
 
     summary_out = integrated_summary(df, validation, q)
     yearly_out = yearly_stats(df)
@@ -988,6 +1226,9 @@ def main() -> None:
     # 일별 신호 파일은 너무 크지 않게 핵심 컬럼만 저장
     signal_cols = [
         "date", "open", "high", "low", "close", "adj_close", "volume", "dollar_volume", "dollar_volume_ma_20",
+        "open_native", "high_native", "low_native", "close_native", "adj_close_native", "open_usd", "high_usd", "low_usd", "close_usd", "adj_close_usd",
+        "listing_currency", "display_currency", "engine_currency", "fx_pair", "fx_rate_to_usd", "usdkrw", "fx_date",
+        "symbol", "symbol_group",
         "close_change_pct", "open_gap_pct", "open_to_close_pct", "intraday_range_pct_prev_close",
         "return_20d", "return_60d", "return_126d", "return_252d", "momentum_12m_ex_1m",
         "sma_20", "sma_50", "sma_200", "dist_close_sma_20_pct", "dist_close_sma_50_pct", "dist_close_sma_200_pct",
@@ -999,11 +1240,17 @@ def main() -> None:
         "algo_trend_up_clean", "algo_trend_up_loose", "algo_vol_high", "algo_vol_extreme", "algo_breakout20_clean", "algo_breakout60_clean",
         "algo_pullback_to_50_bounce", "algo_overextended_highvol", "algo_deep_downtrend_avoid", "algo_event_shock_day", "algo_relative_strength",
         "trigger_breakout_20d", "trigger_breakout_60d", "trigger_pullback_50d", "trigger_deep_dd_recovery",
+        "raw_entry_event", "raw_breakout_20d", "raw_breakout_60d", "raw_52w_high_near",
+        "positive_thrust_day", "negative_shock_day", "relative_strength_vs_smh_qqq",
+        "semi_group_momentum_score", "memory_ai_regime_score", "semi_momentum_regime",
+        "decision_tier", "sizing_tier", "suggested_action", "suggested_weight",
+        "execution_status", "stop_price_1_8atr", "invalidation_5d_low", "invalidation_ema10", "next_check_condition",
         "score_trend", "score_momentum", "score_relative_strength", "score_low_vol", "score_liquidity", "penalty_event", "news_penalty_event", "score_price_algo_total",
         "news_event_count_1d", "news_event_count_3d", "news_sentiment_score_1d", "news_primary_cause_type", "news_primary_cluster_id",
         "news_match_confidence", "news_match_confidence_score", "news_coverage_status", "news_source_count", "news_primary_source_url", "news_cause_summary",
         "entry_trigger", "trade_action", "atr_stop_2x", "atr_trailing_stop_3x", "risk_pct_2atr", "position_weight_if_0_5pct_account_risk", "position_weight_if_1pct_account_risk", "take_profit_2R", "take_profit_3R",
-        "strict_signal_stage", "research_signal_stage", "research_signal_action", "research_signal_level", "research_signal_score", "research_signal_reason", "paper_tracking_weight"
+        "strict_signal_stage", "research_signal_stage", "research_signal_action", "research_signal_level", "research_signal_score", "research_signal_reason", "paper_tracking_weight",
+        "signal_id", "signal_version", "rule_family", "hypothesis_id", "available_at_utc", "decision_policy_version"
     ]
     signal_cols = [c for c in signal_cols if c in df.columns]
     signals_out = df[signal_cols].copy()

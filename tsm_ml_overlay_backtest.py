@@ -357,7 +357,7 @@ def fmt(value, digits: int = 2) -> str:
 
 def write_report(outdir: Path, summary: pd.DataFrame, quality: pd.DataFrame) -> None:
     lines = [
-        "# TSMC ML Overlay Backtest Report",
+        "# Top10 ML Overlay Backtest Report",
         "",
         "This report evaluates OOS prediction-filtered event streams. It is not an order engine.",
         "",

@@ -1,9 +1,15 @@
 const state = {
   data: null,
+  rootData: null,
+  selectedSymbol: "TSM",
+  symbolOptions: [],
   activeView: "overview",
   activeFile: null,
   lastRunStatus: "IDLE",
   lastRun: null,
+  portfolio: null,
+  portfolioCurrency: "KRW",
+  portfolioLoaded: false,
 };
 
 const THEME_KEY = "tsm-dashboard-theme-v3";
@@ -21,6 +27,7 @@ const colors = {
 
 const pageTitles = {
   overview: "Ontology Command",
+  portfolio: "내 포트폴리오",
   decision: "매매 판단",
   market: "차트",
   data: "데이터·이벤트",
@@ -264,6 +271,7 @@ const valueLabels = {
   stress_engine: "큰 하락 가정 계산",
   integrity_engine: "데이터 일관성 확인",
   prediction_engine: "예측 계산",
+  next_close_forecast_engine: "종가 예측 계산",
   external_feature_engine: "외부 피처 계산",
   ml_overlay_backtest: "예측을 붙였을 때 성과 계산",
   pooled_dataset_builder: "여러 종목 데이터 만들기",
@@ -772,6 +780,15 @@ const columnLabels = {
   p_stop_survival_20d: "20일 안에 손절 안 날 가능성",
   p_stop_hit: "손절 날 가능성",
   p_stop_hit_lgbm: "LightGBM 손절 가능성",
+  p_stop_hit_raw: "원시 손절 가능성",
+  p_stop_hit_raw_20d: "20일 원시 손절 가능성",
+  p_stop_hit_calibrated: "보정 손절 가능성",
+  p_stop_hit_calibrated_20d: "20일 보정 손절 가능성",
+  p_stop_hit_raw_minus_calibrated_20d: "원시-보정 손절 차이",
+  p_stop_hit_oos_percentile_20d: "OOS 손절 백분위",
+  strict_stop_risk_gap_20d: "엄격 손절 기준 초과폭",
+  paper_stop_risk_gap_20d: "가상 손절 기준 초과폭",
+  stop_risk_calibration_warning: "손절 보정 경고",
   p_hit_1r: "1차 목표 도달 가능성",
   p_hit_2r: "2차 목표 도달 가능성",
   p_positive_given_survival: "손절 없이 버틴 뒤 수익 가능성",
@@ -1542,13 +1559,71 @@ function latestManifestStatus(data) {
   return rows.some((row) => String(row.status || "").toUpperCase() === "FAIL") ? "FAIL" : "PASS";
 }
 
+function normalizeSymbol(value) {
+  return String(value || "TSM").trim().toUpperCase();
+}
+
+function symbolMetaFromData(data) {
+  const meta = data?.meta || {};
+  const decision = data?.snapshots?.decision || {};
+  const latest = data?.snapshots?.latest_price || {};
+  const symbol = normalizeSymbol(meta.symbol || decision.symbol || latest.symbol || state.selectedSymbol);
+  const name = meta.symbol_display_name || meta.symbol_name || symbolDisplayFallback(symbol);
+  const group = meta.group_label || meta.symbol_group || (symbol.endsWith(".KS") ? "KRX" : "US");
+  const currency = meta.display_currency || latest.display_currency || latest.listing_currency || (symbol.endsWith(".KS") ? "KRW" : "USD");
+  return { symbol, name, group, currency };
+}
+
+function symbolDisplayFallback(symbol) {
+  const names = {
+    NVDA: "NVIDIA",
+    TSM: "TSMC",
+    AVGO: "Broadcom",
+    AMD: "Advanced Micro Devices",
+    INTC: "Intel",
+    MU: "Micron",
+    TXN: "Texas Instruments",
+    LRCX: "Lam Research",
+    AMAT: "Applied Materials",
+    QCOM: "Qualcomm",
+    "005930.KS": "Samsung Electronics",
+    "000660.KS": "SK hynix",
+  };
+  return names[symbol] || symbol;
+}
+
+function deriveSymbolOptions(data) {
+  const configured = data?.snapshots?.daily_update || {};
+  const symbols = [
+    ...(configured.overseas_symbols || []),
+    ...(configured.kr_symbols || []),
+  ].map(normalizeSymbol).filter(Boolean);
+  const unique = Array.from(new Set(symbols));
+  if (unique.length) return unique;
+  return ["NVDA", "TSM", "AVGO", "AMD", "INTC", "MU", "TXN", "LRCX", "AMAT", "QCOM", "005930.KS", "000660.KS"];
+}
+
+function renderSymbolPicker(data) {
+  const select = $("symbolSelect");
+  if (!select) return;
+  const options = deriveSymbolOptions(data);
+  state.symbolOptions = options;
+  const selected = normalizeSymbol(state.selectedSymbol);
+  select.innerHTML = options
+    .map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)} · ${escapeHtml(symbolDisplayFallback(symbol))}</option>`)
+    .join("");
+  select.value = options.includes(selected) ? selected : "TSM";
+}
+
 function renderWorkspaceHeader(data) {
   const snapshots = data.snapshots || {};
+  const meta = symbolMetaFromData(data);
   const decision = snapshots.decision || {};
   const latestPrice = snapshots.latest_price || {};
   const summary = snapshots.integrated_price || snapshots.summary || {};
   const risk = snapshots.risk || {};
-  const prediction = snapshots.pooled_prediction || snapshots.prediction || {};
+  const prediction = snapshots.prediction || {};
+  const nextDay = snapshots.next_day_prediction || prediction || {};
   const dataQuality = snapshots.data_quality || {};
   const system = snapshots.system || {};
   const close = snapshotValue(decision, ["close", "latest_close", "latest_close_usd"])
@@ -1559,24 +1634,26 @@ function renderWorkspaceHeader(data) {
     || snapshotValue(summary, ["latest_close_change_pct"]);
   const score = snapshotValue(decision, ["score_price_algo_total", "research_signal_score"]);
   const signal = snapshotValue(decision, ["entry_trigger", "trade_action", "latest_entry_gate_status"]) || "NO_SIGNAL";
-  const predictionValue = snapshotValue(prediction, [
-    "p_success_tsm_calibrated",
-    "p_success_calibrated",
-    "p_success_20d",
-    "p_success",
-    "decision_score_tsm_like_calibrated",
+  const predictionValue = snapshotValue(nextDay, [
+    "p_up",
+    "next_day_p_up_1d",
+    "next_day_p_up",
+    "p_success_1d",
   ]);
   const riskText = snapshotValue(risk, ["risk_state", "latest_entry_gate_status", "prediction_entry_gate_status"]) || "NO_NEW_RISK";
   const updated = snapshotValue(decision, ["date", "asof_date", "signal_date"])
     || snapshotValue(latestPrice, ["date"])
     || snapshotValue(summary, ["end_date", "latest_date"]);
 
+  setTextIfPresent("symbolLogo", meta.symbol.replace(".KS", "").slice(0, 4));
+  setTextIfPresent("symbolName", meta.name);
+  setTextIfPresent("symbolMeta", `${meta.symbol} · ${meta.group} · ${meta.currency}`);
   setTextIfPresent("tickerPrice", fmtCurrency(close));
   setTextIfPresent("tickerScore", isBlankSnapshotValue(score) ? "없음" : `${fmtNumber(score, 1)}점`);
   setTextIfPresent("tickerSignal", labelValue(signal));
   setTextIfPresent(
     "tickerPrediction",
-    isBlankSnapshotValue(predictionValue) ? labelValue(prediction.prediction_use_status || prediction.prediction_status || "DISPLAY_ONLY") : fmtMaybePct(predictionValue, 1)
+    isBlankSnapshotValue(predictionValue) ? labelValue(nextDay.prediction_signal_status || prediction.prediction_use_status || "DISPLAY_ONLY") : fmtMaybePct(predictionValue, 1)
   );
   setTextIfPresent("tickerRisk", labelValue(riskText));
   setTextIfPresent("tickerDataTrust", labelValue(dataQuality.data_quality_status || "MISSING"));
@@ -1595,12 +1672,27 @@ function renderWorkspaceHeader(data) {
 async function loadData() {
   $("asOfText").textContent = "업데이트 중";
   const data = await fetchJson("/api/summary");
+  state.rootData = data;
   state.data = data;
+  state.selectedSymbol = "TSM";
+  renderSymbolPicker(data);
   renderAll();
   updateRunState(data.run || {});
   const rootName = String(data.paths?.root || "").split("/").filter(Boolean).at(-1) || "작업 폴더";
   $("asOfText").textContent = `생성 ${fmtKstDateTime(data.generated_at)} · ${rootName}`;
   $("asOfText").title = data.paths?.root || "";
+}
+
+async function selectSymbol(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  state.selectedSymbol = normalized;
+  $("asOfText").textContent = `${normalized} 불러오는 중`;
+  const data = normalized === "TSM" ? (state.rootData || await fetchJson("/api/summary")) : await fetchJson(`/api/symbol?sym=${encodeURIComponent(normalized)}`);
+  state.data = data;
+  renderSymbolPicker(state.rootData || data);
+  renderAll();
+  updateRunState(data.run || state.rootData?.run || {});
+  $("asOfText").textContent = `${normalized} · 생성 ${fmtKstDateTime(data.generated_at)}`;
 }
 
 function renderAll() {
@@ -1904,6 +1996,7 @@ function deriveDecisionSynthesis(data) {
   const risk = data.snapshots.risk || {};
   const prediction = data.snapshots.prediction || {};
   const pooled = data.snapshots.pooled_prediction || {};
+  const nextDay = data.snapshots.next_day_prediction || {};
   const system = data.snapshots.system || {};
   const news = data.snapshots.latest_news || {};
   const dataQuality = data.snapshots.data_quality || {};
@@ -1914,8 +2007,9 @@ function deriveDecisionSynthesis(data) {
   const researchSignalScore = toNumber(decision.research_signal_score);
   const researchScore = researchSignalScore === null ? (researchStage === "EARLY_BULLISH_WATCH" ? 66 : researchStage === "PAPER_BUY_SETUP" ? 74 : 38) : researchSignalScore;
   const maxWeight = snapshotWeightValue(risk, ["final_recommended_max_weight", "final_recommended_max_weight_pct"]);
-  const pSuccess = snapshotValue(pooled, ["p_success_20d", "p_success_tsm_like_20d"]) || snapshotValue(prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d"]);
-  const pStop = snapshotValue(pooled, ["p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]);
+  const mainPrediction = nextDayPredictionSource(prediction, nextDay);
+  const pSuccess = mainPrediction.pUp || snapshotValue(pooled, ["p_success_20d", "p_success_tsm_like_20d"]) || snapshotValue(prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d"]);
+  const pStop = snapshotValue(pooled, ["p_stop_hit_calibrated_20d", "p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]);
   const riskScore = maxWeight === null ? 42 : clampNumber(maxWeight * 100 * 14, 20, 92);
   const finalScore = averageScore([score, trigger ? 82 : 42, researchScore, riskScore, probabilityScore(pSuccess, 52), boolScore(system.prediction_decision_support), statusScore(dataQuality.data_quality_status)]);
   const blockers = [];
@@ -1939,7 +2033,7 @@ function deriveDecisionSynthesis(data) {
       driver("가격 트리거", labelValue(decision.entry_trigger || "NO_ENTRY_TRIGGER"), trigger ? 82 : 38, `${fmtNumber(score, 1)}점 · 종가 ${fmtCurrency(decision.close)}`, "decision snapshot", trigger ? "good" : "warn"),
       driver("연구/Paper 신호", labelValue(decision.research_signal_stage || "NO_RESEARCH_SIGNAL"), researchScore, labelValue(decision.research_signal_reason || decision.research_signal_action), "decision snapshot", ["EARLY_BULLISH_WATCH", "PAPER_BUY_SETUP"].includes(researchStage) ? "good" : "warn"),
       driver("리스크 비중", fmtMaybePct(maxWeight, 2), riskScore, `${labelValue(risk.risk_state)} · ${labelValue(risk.limiting_reason)}`, "risk snapshot", gateTone(riskStatusFromSnapshot(data))),
-      driver("20D 예측", fmtMaybePct(pSuccess, 1), probabilityScore(pSuccess, 52), `손절 ${fmtMaybePct(pStop, 1)} · ${labelValue(pooled.model_name || prediction.best_model_20d)}`, "prediction snapshots"),
+      driver("내일 예측", fmtMaybePct(mainPrediction.pUp, 1), probabilityScore(mainPrediction.pUp, 52), `기준 ${fmtMaybePct(mainPrediction.threshold, 1)} · ${labelValue(mainPrediction.model)}`, "next_day_prediction"),
       driver("뉴스 원인", labelValue(news.news_primary_cause_type || "NO_HIGH_CONFIDENCE_NEWS"), newsTone(news) === "warn" ? 42 : 62, `${labelValue(news.news_match_confidence || "NO_MATCH")} · 감점 ${fmtNumber(news.news_penalty_event, 1)}`, "latest news", newsTone(news)),
       driver("Paper/Live", labelValue(system.paper_trading_status || "PAPER_RECORD_ONLY"), boolScore(system.paper_ready, 76, 44), `실거래 ${labelValue(system.live_trading_status || "DISABLED_BY_DESIGN")}`, "system snapshot", isTruthy(system.paper_ready) ? "good" : "warn"),
     ],
@@ -2111,10 +2205,17 @@ function deriveNewsSynthesis(data) {
 function derivePredictionSynthesis(data) {
   const p = data.snapshots.prediction || {};
   const pooled = data.snapshots.pooled_prediction || {};
+  const nextDay = data.snapshots.next_day_prediction || {};
   const source = predictionDisplaySource(p, pooled);
-  const pSuccess = source.pSuccess20;
-  const threshold = source.threshold ?? pooled.threshold_20d ?? p.threshold_20d;
-  const pStop = pooled.p_stop_hit_20d ?? p.trade_ready_p_stop_hit_20d ?? p.trigger_p_stop_hit_20d ?? p.context_p_stop_hit_20d;
+  const main = nextDayPredictionSource(p, nextDay);
+  const pSuccess = main.pUp || source.pSuccess20;
+  const threshold = main.threshold || source.threshold || pooled.threshold_20d || p.threshold_20d;
+  const pStopRaw = pooled.p_stop_hit_raw_20d;
+  const pStopCalibrated = pooled.p_stop_hit_calibrated_20d ?? pooled.p_stop_hit_20d ?? p.trade_ready_p_stop_hit_20d ?? p.trigger_p_stop_hit_20d ?? p.context_p_stop_hit_20d;
+  const pStop = pStopCalibrated;
+  const pStopPercentile = pooled.p_stop_hit_oos_percentile_20d;
+  const strictStopGap = pooled.strict_stop_risk_gap_20d;
+  const stopWarning = pooled.stop_risk_calibration_warning;
   const expectedR = pooled.expected_r_net_20d ?? p.trade_ready_expected_r_20d ?? p.expected_r_20d;
   const ece = pooled.decision_ece ?? pooled.ece ?? p.trade_ready_ece_20d;
   const pScore = threshold ? clampNumber(52 + (probabilityPercent(pSuccess) - probabilityPercent(threshold)) * 2.1, 0, 100) : probabilityScore(pSuccess, 50);
@@ -2122,21 +2223,29 @@ function derivePredictionSynthesis(data) {
   const stopScore = probabilityPercent(pStop) === null ? 50 : clampNumber(90 - probabilityPercent(pStop) * 1.15, 10, 90);
   const score = averageScore([pScore, calibrationScore, stopScore, boolScore(pooled.decision_support_allowed), boolScore(pooled.model_quality_pass)]);
   const blockers = [];
-  if (!isTruthy(pooled.decision_support_allowed)) blockers.push(item("판단 허용", labelValue(pooled.decision_block_reasons || "모델 기준 미달"), "warn"));
-  if (!isTruthy(pooled.model_quality_pass)) blockers.push(item("모델 품질", labelValue(pooled.model_quality_block_reasons || p.model_quality_block_reasons_20d), "warn"));
+  if (!isTruthy(main.qualityPass)) blockers.push(item("내일 모델", labelValue(main.qualityReasons || "모델 품질 기준 미달"), "warn"));
+  if (!isTruthy(pooled.decision_support_allowed)) blockers.push(item("20D 판단 허용", labelValue(pooled.decision_block_reasons || "모델 기준 미달"), "warn"));
+  if (!isTruthy(pooled.model_quality_pass)) blockers.push(item("20D 모델 품질", labelValue(pooled.model_quality_block_reasons || p.model_quality_block_reasons_20d), "warn"));
   if (probabilityPercent(pSuccess) !== null && probabilityPercent(threshold) !== null && probabilityPercent(pSuccess) < probabilityPercent(threshold)) blockers.push(item("선택 기준", "성공 확률이 현재 선택 기준보다 낮습니다.", "warn"));
   return synthesis(
     "예측 사용 가능성",
     "Prediction Ontology",
-    isTruthy(pooled.decision_support_allowed) ? "판단 참고 가능" : "참고용 표시",
-    `단독 예측, pooled 예측, threshold, calibration, stop risk, expected R을 합쳐 예측을 실제 판단에 연결할 수 있는지 판정합니다.`,
-    isTruthy(pooled.decision_support_allowed) ? "good" : "warn",
+    "내일 상승 모델 메인",
+    `메인 예측은 다음 거래일 종가가 오늘보다 오를 확률입니다. 20일·60일 모델은 손절/기대값 보조 지표로 분리합니다.`,
+    isTruthy(main.qualityPass) ? "good" : "warn",
     score,
     [
-      driver("대표 예측", fmtMaybePct(pSuccess, 1), pScore, `${source.scopeLabel} · 기준 ${fmtMaybePct(threshold, 1)}`, "prediction snapshots", pScore >= 70 ? "good" : "warn"),
-      driver("Pooled 예측", fmtMaybePct(pooled.p_success_20d, 1), probabilityScore(pooled.p_success_20d, 52), `${labelValue(pooled.model_name)} · 표본 ${fmtNumber(pooled.oos_event_count, 0)}`, "pooled_prediction"),
+      driver("메인 내일 예측", fmtMaybePct(main.pUp, 1), pScore, `${labelValue(main.model)} · 기준 ${fmtMaybePct(main.threshold, 1)}`, "next_day_prediction", pScore >= 70 ? "good" : "warn"),
+      driver("보조 20D 예측", fmtMaybePct(pooled.p_success_20d, 1), probabilityScore(pooled.p_success_20d, 52), `${labelValue(pooled.model_name)} · 표본 ${fmtNumber(pooled.oos_event_count, 0)}`, "pooled_prediction"),
       driver("Calibration", toNumber(ece) === null ? "없음" : `ECE ${fmtNumber(ece, 3)}`, calibrationScore, `Brier 개선 ${fmtMaybePct(pooled.brier_improvement_pct, 2)} · route ${labelValue(pooled.tsm_calibration_route || pooled.tsm_like_calibration_route)}`, "calibration metrics", calibrationScore < 45 ? "warn" : "good"),
-      driver("Stop Risk", fmtMaybePct(pStop, 1), stopScore, `손절 회피 ${fmtMaybePct(pooled.p_stop_survival_20d ?? source.pStopSurvival20, 1)} · 기대 R ${fmtNumber(expectedR, 2)}`, "prediction risk", stopScore < 45 ? "warn" : "neutral"),
+      driver(
+        "Stop Risk",
+        fmtMaybePct(pStop, 1),
+        stopScore,
+        `raw ${fmtMaybePct(pStopRaw, 1)} · OOS ${fmtMaybePct(pStopPercentile, 1)} · strict gap ${fmtMaybePct(strictStopGap, 1)}${stopWarning && stopWarning !== "PASS" ? " · 최근 보수 과대평가 가능성" : ""}`,
+        "prediction risk",
+        stopScore < 45 || (stopWarning && stopWarning !== "PASS") ? "warn" : "neutral"
+      ),
       driver("Policy Audit", `${fmtNumber((data.tables.prediction_policy_audit || []).length, 0)}개`, passRate(data.tables.prediction_policy_audit || [], "status") ?? 62, "정책 감사와 피처 계약은 상세 접힘 영역에서 확인", "policy audit"),
     ],
     blockers,
@@ -2538,6 +2647,7 @@ function runModeOutputs(mode) {
     intraday: { dependencies: ["분봉 provider", "검증", "차트"], outputs: ["분봉", "라인리지"] },
     news_causal_engine: { dependencies: ["뉴스 수집", "클러스터", "가격 매칭", "피처"], outputs: ["뉴스 원인", "뉴스 피처"] },
     prediction_engine: { dependencies: ["피처 계약", "워크포워드", "확률 보정"], outputs: ["예측", "calibration"] },
+    next_close_forecast_engine: { dependencies: ["pooled 피처", "일/시간/분봉 정렬 피처", "워크포워드"], outputs: ["1D/5D/20D 예상 종가", "80% 구간", "품질 gate"] },
     pooled_model_engine: { dependencies: ["유니버스", "학습", "게이트", "보정"], outputs: ["pooled 예측", "모델 비교"] },
     system_state_engine: { dependencies: ["품질", "모델 게이트", "리스크", "Paper"], outputs: ["readiness", "block reasons"] },
   };
@@ -2556,11 +2666,13 @@ function renderOntologyCommand(id, data) {
   const risk = data.snapshots.risk || {};
   const prediction = data.snapshots.prediction || {};
   const pooled = data.snapshots.pooled_prediction || {};
+  const nextDay = data.snapshots.next_day_prediction || {};
   const latestNews = data.snapshots.latest_news || {};
   const decisionState = overviewDecisionState(decision, prediction, system);
   const maxWeight = snapshotWeightValue(risk, ["final_recommended_max_weight", "final_recommended_max_weight_pct"]);
-  const pSuccess = snapshotValue(pooled, ["p_success_20d", "p_success_tsm_like_20d"]) || snapshotValue(prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d"]);
-  const stopRisk = snapshotValue(pooled, ["p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]);
+  const mainPrediction = nextDayPredictionSource(prediction, nextDay);
+  const pSuccess = mainPrediction.pUp || snapshotValue(pooled, ["p_success_20d", "p_success_tsm_like_20d"]) || snapshotValue(prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d"]);
+  const stopRisk = snapshotValue(pooled, ["p_stop_hit_calibrated_20d", "p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]);
   const asOf = shortDate(decision.date || prediction.prediction_asof_date || pooled.asof_date);
   const cards = [
     {
@@ -2576,10 +2688,10 @@ function renderOntologyCommand(id, data) {
       tone: gateTone(riskStatusFromSnapshot(data)),
     },
     {
-      label: "20D 예측",
+      label: "내일 예측",
       value: fmtMaybePct(pSuccess, 1),
-      note: `손절 ${fmtMaybePct(stopRisk, 1)} · ${statusByBool(system.prediction_decision_support, "판단 가능", "참고용")}`,
-      tone: isTruthy(system.prediction_decision_support) ? "good" : "warn",
+      note: `기준 ${fmtMaybePct(mainPrediction.threshold, 1)} · ${labelValue(mainPrediction.status)}`,
+      tone: isTruthy(mainPrediction.qualityPass) ? "good" : "warn",
     },
     {
       label: "운영 상태",
@@ -2684,7 +2796,7 @@ function deriveOntologySynthesis(data) {
   const maxWeight = snapshotWeightValue(risk, ["final_recommended_max_weight", "final_recommended_max_weight_pct"]);
   const maxWeightPct = maxWeight === null ? null : maxWeight * 100;
   const pSuccess = probabilityPercent(snapshotValue(pooled, ["p_success_20d", "p_success_tsm_like_20d"]) || snapshotValue(prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d"]));
-  const pStop = probabilityPercent(snapshotValue(pooled, ["p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]));
+  const pStop = probabilityPercent(snapshotValue(pooled, ["p_stop_hit_calibrated_20d", "p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]));
   const threshold = probabilityPercent(snapshotValue(pooled, ["threshold_20d", "threshold"]) || snapshotValue(prediction, ["trade_ready_threshold_20d", "trigger_threshold_20d", "context_threshold_20d"]));
   const expectedR = toNumber(snapshotValue(pooled, ["expected_r_net_20d"]) || snapshotValue(prediction, ["trade_ready_expected_r_20d", "trigger_expected_r_20d", "context_expected_r_20d"]));
   const eventCount = toNumber(pooled.decision_event_count || sample.trade_ready_20d_labeled) || 0;
@@ -3092,7 +3204,7 @@ function renderOntologyLinkedCharts(id, data) {
   const breakout60 = moneyNumber(planValue(planRows, "진입", "60일 고점 돌파 기준가"));
   const stopPrice = toNumber(risk.stop_price_2atr);
   const pSuccess = probabilityPercent(pooled.p_success_20d || prediction.trade_ready_p_success_20d || prediction.context_p_success_20d);
-  const pStop = probabilityPercent(pooled.p_stop_hit_20d || prediction.trade_ready_p_stop_hit_20d || prediction.context_p_stop_hit_20d);
+  const pStop = probabilityPercent(pooled.p_stop_hit_calibrated_20d || pooled.p_stop_hit_20d || prediction.trade_ready_p_stop_hit_20d || prediction.context_p_stop_hit_20d);
 
   const cards = [
     {
@@ -3149,7 +3261,7 @@ function renderOntologyLinkedCharts(id, data) {
     {
       label: "예측 확률 객체",
       title: `${fmtMaybePct(pooled.p_success_20d, 1)} · ${labelValue(pooled.model_name || prediction.model_health_best_model_20d)}`,
-      note: `손절 ${fmtMaybePct(pooled.p_stop_hit_20d, 1)} · 기대 R ${fmtNumber(pooled.expected_r_net_20d, 2)}`,
+      note: `보정 손절 ${fmtMaybePct(pooled.p_stop_hit_calibrated_20d ?? pooled.p_stop_hit_20d, 1)} · raw ${fmtMaybePct(pooled.p_stop_hit_raw_20d, 1)} · 기대 R ${fmtNumber(pooled.expected_r_net_20d, 2)}`,
       tone: isTruthy(pooled.decision_support_allowed) ? "good" : "warn",
       links: ["표본", "예측", "리스크", "판단"],
       chart: miniBarsSvg([
@@ -3275,7 +3387,7 @@ function renderOntologyRelationMatrix(id, data) {
       from: "예측",
       to: "판단",
       signal: `${fmtMaybePct(pooled.p_success_20d || prediction.trade_ready_p_success_20d, 1)} 성공`,
-      impact: `${statusByBool(system.prediction_decision_support, "판단 가능", "참고용")} · 손절 ${fmtMaybePct(pooled.p_stop_hit_20d, 1)}`,
+      impact: `${statusByBool(system.prediction_decision_support, "판단 가능", "참고용")} · 보정 손절 ${fmtMaybePct(pooled.p_stop_hit_calibrated_20d ?? pooled.p_stop_hit_20d, 1)}`,
       tone: isTruthy(system.prediction_decision_support) ? "good" : "warn",
     },
     {
@@ -3502,7 +3614,7 @@ function renderOntologyRiskReward(id, data) {
   const maxWeight = snapshotWeightValue(risk, ["final_recommended_max_weight", "final_recommended_max_weight_pct"]);
   const maxWeightPct = maxWeight === null ? null : maxWeight * 100;
   const pSuccess = probabilityPercent(snapshotValue(pooled, ["p_success_20d", "p_success_tsm_like_20d"]) || snapshotValue(prediction, ["trade_ready_p_success_20d", "trigger_p_success_20d", "context_p_success_20d"]));
-  const stopRisk = probabilityPercent(snapshotValue(pooled, ["p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]));
+  const stopRisk = probabilityPercent(snapshotValue(pooled, ["p_stop_hit_calibrated_20d", "p_stop_hit_20d"]) || snapshotValue(prediction, ["trade_ready_p_stop_hit_20d", "trigger_p_stop_hit_20d", "context_p_stop_hit_20d"]));
   const expectedR = toNumber(snapshotValue(pooled, ["expected_r_net_20d"]) || snapshotValue(prediction, ["trade_ready_expected_r_20d", "trigger_expected_r_20d", "context_expected_r_20d"]));
   const meters = [
     {
@@ -3929,7 +4041,7 @@ function renderPaperGateBoard(id, data) {
     {
       label: "Latest signal",
       value: gateStatusText(paper.latest_trade_ready),
-      note: `${explainReasonList(paper.paper_latest_block_reasons || "PASS", 1)} · stop ${fmtMaybePct(paper.latest_stop_hit_20d, 1)}`,
+      note: `${explainReasonList(paper.paper_latest_block_reasons || "PASS", 1)} · stop ${fmtMaybePct(paper.latest_stop_hit_calibrated_20d ?? paper.latest_stop_hit_20d, 1)}`,
       tone: isTruthy(paper.latest_trade_ready) ? "good" : "warn",
     },
     {
@@ -4014,7 +4126,8 @@ function renderDecisionBoard(id, data) {
       items: [
         ["모델 게이트", labelValue(modelGate.model_gate_status)],
         ["통합 확률", fmtMaybePct(pooled.p_success_20d, 1)],
-        ["손절 가능성", fmtMaybePct(pooled.p_stop_hit_20d, 1)],
+        ["보정 손절", fmtMaybePct(pooled.p_stop_hit_calibrated_20d ?? pooled.p_stop_hit_20d, 1)],
+        ["원시 손절", fmtMaybePct(pooled.p_stop_hit_raw_20d, 1)],
       ],
     },
     {
@@ -4212,16 +4325,19 @@ function decisionPredictionPlanRows(data) {
   const pooled = data.snapshots.pooled_prediction || {};
   const latestNews = data.snapshots.latest_news || {};
   const latestFeatures = data.snapshots.latest_prediction_features || {};
+  const nextDay = data.snapshots.next_day_prediction || {};
   const source = predictionDisplaySource(p, pooled);
+  const main = nextDayPredictionSource(p, nextDay);
   const rows = [
     planRow("예측", "표시 기준", "막혀도 모두 표시", "", "매매에 바로 못 쓰는 예측도 참고용으로 숨기지 않음"),
-    planRow("예측", "대표 예측", source.scopeLabel, "", source.successNote),
+    planRow("예측", "대표 예측", main.scopeLabel, "", `${labelValue(main.model)} · ${labelValue(main.status)}`),
     planRow("예측", "최신 신호 종류", labelValue(p.latest_candidate_scope), "", "현재 신호가 매수 후보인지 관찰용인지 표시"),
     planRow("예측", "매수 기준 상태", labelValue(snapshotValue(p, ["latest_entry_gate_status", "prediction_entry_gate_status"])), "", "기본 규칙이 매수를 허용했는지 표시"),
     planRow("예측", "예측 사용 상태", labelValue(p.prediction_use_status), "", "예측이 매매 판단용인지 참고용인지 표시"),
     planRow("예측", "실제 판단에 쓴 예측", labelValue(p.prediction_scope_used), "", "최종 판단에 직접 반영된 예측 종류"),
-    planRow("예측", "대표 20일 성공 확률", fmtMaybePct(source.pSuccess20, 1), "%", source.modelLabel),
-    planRow("예측", "대표 20일 손절 회피", fmtMaybePct(source.pStopSurvival20, 1), "%", source.sampleNote),
+    planRow("예측", "내일 상승 확률", fmtMaybePct(main.pUp, 1), "%", main.intervalNote),
+    planRow("예측", "내일 선택 기준", fmtMaybePct(main.threshold, 1), "%", main.sampleNote),
+    planRow("예측", "보조 20일 성공 확률", fmtMaybePct(source.pSuccess20, 1), "%", source.modelLabel),
     planRow("뉴스 원인", "대표 원인", labelValue(latestNews.news_primary_cause_type || "NO_HIGH_CONFIDENCE_NEWS"), "", latestNews.news_cause_summary || "HIGH 신뢰도 원인만 대표 원인으로 사용"),
     planRow("뉴스 원인", "매칭 신뢰도", labelValue(latestNews.news_match_confidence || "NO_MATCH"), "", `점수 ${fmtNumber(latestNews.news_match_confidence_score, 1)} · 출처 ${fmtNumber(latestNews.news_source_count, 0)}개`),
     planRow("뉴스 원인", "위험 감점", fmtNumber(latestFeatures.news_penalty_event ?? latestNews.news_penalty_event, 1), "점", "고신뢰 부정 이벤트만 룰 점수에서 보수적으로 차감"),
@@ -4496,12 +4612,13 @@ function renderPrediction(data) {
   renderPageSynthesis("predictionSynthesis", derivePredictionSynthesis(data));
   const p = data.snapshots.prediction || {};
   const pooled = data.snapshots.pooled_prediction || {};
-  renderPredictionHero(p, pooled);
-  renderPredictionNotice(p, pooled);
+  const nextDay = data.snapshots.next_day_prediction || {};
+  renderPredictionHero(p, pooled, nextDay);
+  renderPredictionNotice(p, pooled, nextDay);
   renderPaperGateBoard("paperGateBoard", data);
   renderNewsConnectionBoard("predictionNewsBoard", data);
-  renderAllPredictionTable("predictionAllTable", p, pooled);
-  renderStageProbChart("stageProbChart", p, pooled);
+  renderAllPredictionTable("predictionAllTable", p, pooled, nextDay);
+  renderStageProbChart("stageProbChart", p, pooled, nextDay);
   const audit = data.tables.prediction_audit || [];
   horizontalBarChart(
     $("auditBars"),
@@ -4512,8 +4629,11 @@ function renderPrediction(data) {
   );
   renderTable(
     "predictionComparisonTable",
-    data.tables.prediction_comparison || [],
-    ["candidate_scope", "horizon_days", "model_name", "prediction_quality_pass", "oos_event_count", "mean_effective_sample_size", "brier_improvement_pct", "ece", "pr_auc", "expectancy_improvement_pct", "rank_score"],
+    [
+      ...(data.tables.next_day_model_comparison || []).map((row) => ({ model_scope: "메인 내일", ...row })),
+      ...(data.tables.prediction_comparison || []).map((row) => ({ model_scope: "보조 20/60", ...row })),
+    ],
+    ["model_scope", "candidate_scope", "horizon_days", "model_name", "prediction_quality_pass", "performance_quality_pass", "oos_event_count", "mean_effective_sample_size", "brier_improvement_pct", "ece", "pr_auc", "expectancy_improvement_pct", "rank_score"],
     160
   );
   renderTable(
@@ -4831,12 +4951,16 @@ function renderTsmLikeFacts(id, data) {
 
 function renderPaperGateFacts(id, data) {
   const paper = data.snapshots.paper_gate || {};
+  const pooled = data.snapshots.pooled_prediction || {};
   renderFacts(id, [
     ["Strict", labelValue(paper.strict_gate_status)],
     ["Paper", labelValue(paper.paper_gate_status)],
     ["Paper 판단 가능", statusByBool(paper.paper_decision_support_allowed, "가능", "차단")],
     ["최신 trade-ready", statusByBool(paper.latest_trade_ready, "예", "아니오")],
-    ["최신 손절 가능성", fmtMaybePct(paper.latest_stop_hit_20d, 1)],
+    ["보정 손절 가능성", fmtMaybePct(pooled.p_stop_hit_calibrated_20d ?? paper.latest_stop_hit_20d, 1)],
+    ["원시 손절 가능성", fmtMaybePct(pooled.p_stop_hit_raw_20d, 1)],
+    ["OOS 손절 백분위", fmtMaybePct(pooled.p_stop_hit_oos_percentile_20d, 1)],
+    ["손절 초과폭", `${fmtMaybePct(pooled.strict_stop_risk_gap_20d, 1)} / ${fmtMaybePct(pooled.paper_stop_risk_gap_20d, 1)}`],
     ["Live", labelValue(paper.live_trading_status || "DISABLED_BY_DESIGN")],
   ]);
 }
@@ -4848,7 +4972,7 @@ function renderModelOpsHero(pooled, system) {
     ["최신 신호", statusByBool(pooled.latest_signal_pass, "통과", "차단"), explainReasonList(pooled.latest_block_reasons, 2), false],
     ["여러 종목 모델", labelValue(pooled.model_family || pooled.model_name), `${compactText(labelValue(pooled.model_name), 28)} · 선택비율 ${fmtMaybePct(pooled.selected_fraction, 1)}`, false],
     ["결정 점수", fmtNumber(pooled.decision_score_20d, 3), `기준 ${fmtNumber(pooled.threshold_20d, 3)}`, false],
-    ["20일 오를 가능성", fmtMaybePct(pooled.p_success_20d, 1), `손절 가능성 ${fmtMaybePct(pooled.p_stop_hit_20d, 1)}`, false],
+    ["20일 오를 가능성", fmtMaybePct(pooled.p_success_20d, 1), `보정 손절 ${fmtMaybePct(pooled.p_stop_hit_calibrated_20d ?? pooled.p_stop_hit_20d, 1)} · raw ${fmtMaybePct(pooled.p_stop_hit_raw_20d, 1)}`, false],
     ["Uplift 검증", statusByBool(pooled.uplift_pass, "통과", "보류"), `p ${fmtNumber(pooled.uplift_bootstrap_p_value_paired ?? pooled.uplift_bootstrap_p_value, 3)} · ${labelValue(pooled.bootstrap_method)}`, false],
     ["가상 기록", statusByBool(system.paper_ready, "준비됨", "미준비"), labelValue(system.paper_trading_status), false],
   ];
@@ -5070,10 +5194,12 @@ function snapshotRows(snapshot) {
 
 function diagnosticCalibrationPolicyRows(data) {
   const calibration = (data.tables.prediction_calibration_summary || []).map((row) => ({ source: "단독 예측 확률 오차", ...row }));
+  const nextDayCalibration = (data.tables.next_day_calibration_summary || []).map((row) => ({ source: "내일 상승 확률 오차", ...row }));
   const threshold = (data.tables.prediction_threshold_policy || []).map((row) => ({ source: "단독 예측 선택 기준", ...row }));
+  const nextDayThreshold = (data.tables.next_day_threshold_policy || []).map((row) => ({ source: "내일 상승 선택 기준", ...row }));
   const pooledThreshold = (data.tables.pooled_threshold_policy || []).map((row) => ({ source: "여러 종목 선택 기준", ...row }));
   const pooledCalibration = (data.tables.pooled_tsm_calibration_metrics || []).map((row) => ({ source: "TSMC 확률 조정", ...row }));
-  return [...calibration, ...threshold, ...pooledThreshold, ...pooledCalibration];
+  return [...nextDayCalibration, ...nextDayThreshold, ...calibration, ...threshold, ...pooledThreshold, ...pooledCalibration];
 }
 
 function renderMlOverlayEquity(id, rows) {
@@ -5095,24 +5221,23 @@ function renderMlOverlayEquity(id, rows) {
   groupedLineChart($(id), series, "equity", { yFormat: (v) => fmtNumber(v, 2) });
 }
 
-function renderPredictionHero(p, pooled = {}) {
+function renderPredictionHero(p, pooled = {}, nextDay = {}) {
   const source = predictionDisplaySource(p, pooled);
-  const scopeNote = source.prefix
-    ? `${labelValue(snapshotValue(p, ["latest_entry_gate_status", "prediction_entry_gate_status"]))} / 참고값 표시`
-    : `${labelValue(p.prediction_signal_status)} / ${labelValue(p.prediction_use_status)}`;
+  const main = nextDayPredictionSource(p, nextDay);
+  const scopeNote = `${labelValue(main.status)} / ${labelValue(main.qualityStatus)}`;
   const cards = [
-    ["현재 예측 종류", source.scopeLabel, scopeNote, true],
-    ["20일 오를 가능성", fmtMaybePct(source.pSuccess20, 1), source.successNote, false],
-    ["20일 손절 안 날 가능성", fmtMaybePct(source.pStopSurvival20, 1), source.sampleNote, false],
-    ["20일 수익 가능성", fmtMaybePct(source.pPositive20, 1), `예측 방식 ${source.modelLabel}`, false],
+    ["메인 예측", main.scopeLabel, scopeNote, true],
+    ["내일 상승 확률", fmtMaybePct(main.pUp, 1), main.intervalNote, false],
+    ["내일 기준값", fmtMaybePct(main.threshold, 1), main.sampleNote, false],
+    ["보조 20일 확률", fmtMaybePct(source.pSuccess20, 1), `보조 모델 ${source.modelLabel}`, false],
   ];
   $("predictionHero").innerHTML = cards
     .map(([label, value, note, primary]) => `<article class="prediction-card${primary ? " primary" : ""}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><p>${escapeHtml(note)}</p></article>`)
     .join("");
 }
 
-function renderAllPredictionTable(id, p, pooled = {}) {
-  const rows = predictionRows(p, pooled);
+function renderAllPredictionTable(id, p, pooled = {}, nextDay = {}) {
+  const rows = predictionRows(p, pooled, nextDay);
   renderTable(
     id,
     rows,
@@ -5144,8 +5269,10 @@ function renderAllPredictionTable(id, p, pooled = {}) {
   );
 }
 
-function predictionRows(p, pooled = {}) {
+function predictionRows(p, pooled = {}, nextDay = {}) {
   const rows = [];
+  const nextRow = predictionRowFromNextDay(p, nextDay);
+  if (nextRow) rows.push(nextRow);
   const valueGroups = [
     ["매수 신호 후보", "trigger"],
     ["관찰 후보", "context"],
@@ -5169,6 +5296,34 @@ function predictionRows(p, pooled = {}) {
     }
   }
   return rows;
+}
+
+function predictionRowFromNextDay(p, nextDay = {}) {
+  const main = nextDayPredictionSource(p, nextDay);
+  if (toNumber(main.pUp) === null && !main.model) return null;
+  return {
+    prediction_scope_label: "메인 내일 상승",
+    horizon_days: 1,
+    model_name: main.model,
+    prediction_status: predictionStatusLabel(main.qualityPass, main.qualityReasons),
+    p_success: main.pUp,
+    p_stop_survival: null,
+    p_stop_hit: main.pDown,
+    p_positive_given_survival: null,
+    p_hit_1r: null,
+    p_hit_2r: null,
+    expected_r: null,
+    expected_net_return_pct: main.expectancyImprovement,
+    threshold: main.threshold,
+    oos_event_count: main.oosEventCount,
+    effective_oos_event_count: null,
+    selected_oos_event_count: main.selectedOosEventCount,
+    selected_fraction: null,
+    model_quality_pass: main.qualityPass,
+    latest_signal_pass: null,
+    decision_support_allowed: false,
+    quality_block_reasons: main.qualityReasons,
+  };
 }
 
 function predictionRowFromSnapshot(p, label, prefix, horizon) {
@@ -5215,7 +5370,7 @@ function predictionRowFromPooled(pooled, p) {
     prediction_status: predictionStatusLabel(quality, pooled.model_quality_block_reasons ?? p.pooled_model_quality_block_reasons),
     p_success: pSuccess,
     p_stop_survival: pooled.p_stop_survival_20d ?? p.pooled_p_stop_survival_20d,
-    p_stop_hit: pooled.p_stop_hit_20d ?? p.pooled_p_stop_hit_20d,
+    p_stop_hit: pooled.p_stop_hit_calibrated_20d ?? pooled.p_stop_hit_20d ?? p.pooled_p_stop_hit_20d,
     p_positive_given_survival: null,
     p_hit_1r: pooled.p_hit_1r_20d ?? p.pooled_p_hit_1r_20d,
     p_hit_2r: pooled.p_hit_2r_20d ?? p.pooled_p_hit_2r_20d,
@@ -5240,14 +5395,44 @@ function predictionStatusLabel(passValue, reasons) {
   return "참고용";
 }
 
-function renderPredictionNotice(p, pooled = {}) {
+function renderPredictionNotice(p, pooled = {}, nextDay = {}) {
   const notice = $("predictionNotice");
   if (!notice) return;
+  const main = nextDayPredictionSource(p, nextDay);
   const latestStatus = `${labelValue(snapshotValue(p, ["latest_entry_gate_status", "prediction_entry_gate_status"]))} / ${labelValue(p.latest_candidate_scope)}`;
   const pooledReason = pooled.decision_block_reasons ? `여러 종목 예측이 막힌 이유: ${labelValue(pooled.decision_block_reasons)}` : "";
   const splitStatus = `모델 품질 ${statusByBool(pooled.model_quality_pass, "통과", "미통과")}, 최신 신호 ${statusByBool(pooled.latest_signal_pass, "통과", "차단")}`;
   notice.classList.add("visible");
-  notice.innerHTML = `매매에 바로 못 쓰는 예측도 숨기지 않고 보여줍니다.<span>최신 신호 상태는 ${escapeHtml(latestStatus)}입니다. 여러 종목 기준은 ${escapeHtml(splitStatus)}로 분리해 표시합니다.${pooledReason ? ` ${escapeHtml(pooledReason)}` : ""}</span>`;
+  notice.innerHTML = `메인 예측은 내일 상승 모델입니다.<span>현재 ${escapeHtml(fmtMaybePct(main.pUp, 1))} / 기준 ${escapeHtml(fmtMaybePct(main.threshold, 1))}이며 상태는 ${escapeHtml(labelValue(main.status))}입니다. 20일·60일 모델은 보조 지표로 남깁니다. 최신 신호 상태는 ${escapeHtml(latestStatus)}입니다. 여러 종목 기준은 ${escapeHtml(splitStatus)}로 분리해 표시합니다.${pooledReason ? ` ${escapeHtml(pooledReason)}` : ""}</span>`;
+}
+
+function nextDayPredictionSource(p = {}, nextDay = {}) {
+  const source = Object.keys(nextDay || {}).length ? nextDay : p;
+  const pUp = snapshotValue(source, ["p_up", "next_day_p_up_1d", "next_day_p_up", "p_success_1d"]);
+  const pDown = snapshotValue(source, ["p_down", "next_day_p_down_1d", "next_day_p_down"]);
+  const lower = snapshotValue(source, ["p_up_lower_80", "next_day_p_up_lower_80_1d"]);
+  const upper = snapshotValue(source, ["p_up_upper_80", "next_day_p_up_upper_80_1d"]);
+  const threshold = snapshotValue(source, ["threshold", "next_day_threshold_1d"]);
+  const model = snapshotValue(source, ["best_model", "next_day_best_model_1d"]);
+  const qualityReasons = snapshotValue(source, ["model_quality_block_reasons", "next_day_model_quality_block_reasons_1d", "model_quality_status", "next_day_model_quality_status"]);
+  return {
+    scopeLabel: "내일 상승 예측",
+    pUp,
+    pDown,
+    lower,
+    upper,
+    threshold,
+    model,
+    status: snapshotValue(source, ["prediction_signal_status", "next_day_prediction_signal_status"]) || "DISPLAY_ONLY",
+    qualityStatus: snapshotValue(source, ["model_quality_status", "next_day_model_quality_status"]) || qualityReasons || "UNKNOWN",
+    qualityPass: snapshotValue(source, ["prediction_quality_pass", "next_day_prediction_quality_pass_1d"]),
+    qualityReasons,
+    oosEventCount: snapshotValue(source, ["oos_event_count", "next_day_oos_event_count_1d"]),
+    selectedOosEventCount: snapshotValue(source, ["selected_oos_event_count", "next_day_selected_oos_event_count_1d"]),
+    expectancyImprovement: snapshotValue(source, ["expectancy_improvement_pct", "next_day_expectancy_improvement_pct_1d"]),
+    intervalNote: lower || upper ? `${fmtMaybePct(lower, 1)} ~ ${fmtMaybePct(upper, 1)}` : `하락 ${fmtMaybePct(pDown, 1)}`,
+    sampleNote: `OOS ${fmtNumber(snapshotValue(source, ["oos_event_count", "next_day_oos_event_count_1d"]), 0)}건 · ${labelValue(model)}`,
+  };
 }
 
 function predictionDisplaySource(p, pooled = {}) {
@@ -5313,12 +5498,15 @@ function predictionDisplaySource(p, pooled = {}) {
   };
 }
 
-function renderStageProbChart(id, p, pooled = {}) {
+function renderStageProbChart(id, p, pooled = {}, nextDay = {}) {
+  const main = nextDayPredictionSource(p, nextDay);
   const probRow = (label, value) => {
     const n = toNumber(value);
     return { label, value: n === null ? null : n * 100 };
   };
   const rows = [
+    probRow("메인 내일 상승 확률", main.pUp),
+    probRow("메인 내일 하락 확률", main.pDown),
     probRow("최종 판단 20일 오를 가능성", p.p_success_20d),
     probRow("최종 판단 20일 손절 안 날 가능성", p.p_stop_survival_20d),
     probRow("매수 신호 20일 오를 가능성", p.trigger_p_success_20d),
@@ -5419,6 +5607,7 @@ function renderSystem(data) {
     };
   });
   renderSystemFacts("systemFacts", data);
+  renderDailyUpdateSummary("dailyUpdateSummary", data);
   renderReadinessBars("systemReadinessBars", data.tables.readiness_scorecard || []);
   renderTable("systemScorecardTable", data.tables.readiness_scorecard || [], ["domain", "passed", "weight", "score", "note"], 40);
   renderTable("systemBlockTable", systemBlocks, ["component", "status", "block_reasons", "block_reason_explanation", "details"], 200);
@@ -5428,15 +5617,124 @@ function renderSystem(data) {
   renderFailedChecks("failedChecks", data.quality || {});
 }
 
+function coverageText(coverage) {
+  if (!coverage) return "없음";
+  const present = toNumber(coverage.present) ?? 0;
+  const expected = toNumber(coverage.expected) ?? 0;
+  return `${fmtNumber(present, 0)} / ${fmtNumber(expected, 0)}`;
+}
+
+function qualityFailedText(section) {
+  if (!section) return "없음";
+  const critical = toNumber(section.critical_failed) ?? 0;
+  const warning = toNumber(section.warning_failed) ?? 0;
+  if (critical > 0) return `CRITICAL ${fmtNumber(critical, 0)}`;
+  if (warning > 0) return `WARN ${fmtNumber(warning, 0)}`;
+  return "통과";
+}
+
+function compactStatusCounts(counts) {
+  const entries = Object.entries(counts || {});
+  if (!entries.length) return "없음";
+  return entries.map(([key, value]) => `${labelValue(key)} ${fmtNumber(value, 0)}`).join(" · ");
+}
+
+function renderDailyUpdateSummary(id, data) {
+  const container = $(id);
+  if (!container) return;
+  const daily = data.snapshots?.daily_update || {};
+  if (!Object.keys(daily).length) {
+    container.innerHTML = `<div class="preview-empty">일일 업데이트 요약 없음</div>`;
+    return;
+  }
+  const coverage = daily.coverage || {};
+  const latest = daily.latest_predictions || {};
+  const quality = daily.quality || {};
+  const threshold = daily.threshold_sensitivity || {};
+  const risk = daily.portfolio_risk || {};
+  const paper = daily.paper_oms || {};
+  const market = daily.market_data || {};
+  const failures = (daily.full_audit_required_failures || [])
+    .map((row) => labelValue(row.component || row.details || row.status))
+    .slice(0, 3)
+    .join(" · ");
+  const cards = [
+    {
+      label: "Full Audit",
+      value: labelValue(daily.full_audit_status || "UNKNOWN"),
+      note: failures || "required checks 통과",
+      tone: String(daily.full_audit_status || "").toUpperCase() === "PASS" ? "good" : "warn",
+    },
+    {
+      label: "해외 10 예측",
+      value: coverageText(coverage.latest_prediction_overseas),
+      note: `fallback ${fmtNumber(latest.fallback_rows ?? 0, 0)} · ${labelValue((latest.sources || []).join("|") || "source 없음")}`,
+      tone: (coverage.latest_prediction_overseas?.missing || []).length || (latest.fallback_rows || 0) ? "warn" : "good",
+    },
+    {
+      label: "Top12 커버리지",
+      value: coverageText(coverage.latest_prediction_top12),
+      note: `enabled ${fmtNumber(daily.enabled_symbol_count, 0)} · market ${fmtNumber(market.top12_rows, 0)} rows`,
+      tone: (coverage.latest_prediction_top12?.missing || []).length ? "warn" : "good",
+    },
+    {
+      label: "Pooled 데이터",
+      value: `${coverageText(coverage.pooled_feature_overseas)} / ${coverageText(coverage.pooled_label_overseas)}`,
+      note: `dataset ${qualityFailedText(quality.pooled_dataset)} · model ${qualityFailedText(quality.pooled_model)}`,
+      tone: (quality.pooled_dataset?.critical_failed || quality.pooled_model?.critical_failed) ? "bad" : "good",
+    },
+    {
+      label: "Threshold",
+      value: `${fmtNumber(threshold.grid_rows, 0)} grids`,
+      note: `${labelValue(threshold.recommendation || "없음")} · ${labelValue(threshold.reason || "reason 없음")}`,
+      tone: (quality.threshold_sensitivity?.critical_failed || 0) > 0 ? "bad" : "good",
+    },
+    {
+      label: "Risk / OMS",
+      value: `${fmtNumber(risk.approved_overseas, 0)} 승인 · ${fmtNumber(risk.rejected_overseas, 0)} 차단`,
+      note: `SMH ${labelValue((risk.smh_beta_limit_modes || []).join("|") || "없음")} · 주문 ${compactStatusCounts(paper.order_status_counts)}`,
+      tone: (quality.paper_oms?.critical_failed || quality.portfolio_risk?.critical_failed) ? "bad" : "neutral",
+    },
+    {
+      label: "Paper 장부",
+      value: `${fmtNumber(paper.order_rows, 0)} orders · ${fmtNumber(paper.fill_rows, 0)} fills`,
+      note: `${compactStatusCounts(paper.position_state_counts)} · live ${labelValue((paper.live_trading_statuses || []).join("|") || "DISABLED_BY_DESIGN")}`,
+      tone: "neutral",
+    },
+    {
+      label: "Market Data",
+      value: compactStatusCounts(market.bar_counts),
+      note: `상태 ${compactStatusCounts(market.status_counts)} · daily ${shortDate(market.latest_by_bar?.daily)}`,
+      tone: (market.status_counts && Object.keys(market.status_counts).every((key) => key === "OK")) ? "good" : "warn",
+    },
+  ];
+  container.innerHTML = cards
+    .map(
+      (card) => `
+        <article class="system-summary-card ${card.tone}">
+          <span>${escapeHtml(card.label)}</span>
+          <strong>${escapeHtml(card.value)}</strong>
+          <p>${escapeHtml(card.note)}</p>
+        </article>
+      `,
+    )
+    .join("");
+}
+
 function renderSystemFacts(id, data) {
   const system = data.snapshots.system || {};
   const health = data.snapshots.daily_health || {};
   const dataQuality = data.snapshots.data_quality || {};
   const modelGate = data.snapshots.model_gate || {};
+  const daily = data.snapshots.daily_update || {};
   const integrated = data.snapshots.integrated_price || data.snapshots.summary || {};
   const hourly = data.snapshots.hourly_summary || {};
   const minute = data.snapshots.minute_summary || {};
   renderFacts(id, [
+    ["최신 일일 감사", labelValue(daily.full_audit_status || "UNKNOWN")],
+    ["해외 예측 커버리지", coverageText(daily.coverage?.latest_prediction_overseas)],
+    ["Top12 예측 커버리지", coverageText(daily.coverage?.latest_prediction_top12)],
+    ["예측 fallback 행", fmtNumber(daily.latest_predictions?.fallback_rows ?? 0, 0)],
     ["오늘 점검 상태", labelValue(health.daily_health_status)],
     ["막힌 부분", labelValue(health.failed_or_blocked_components)],
     ["데이터 상태", labelValue(dataQuality.data_quality_status)],
@@ -5926,6 +6224,7 @@ function activateView(name) {
   document.querySelectorAll(".nav-item, .view-tab").forEach((item) => item.classList.toggle("active", item.dataset.view === name));
   document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${name}`));
   window.scrollTo(0, 0);
+  if (name === "portfolio" && !state.portfolioLoaded) loadPortfolio();
 }
 
 function formPayload(form) {
@@ -6000,6 +6299,10 @@ function setTheme(theme) {
 function wireEvents() {
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => activateView(button.dataset.view)));
   $("refreshBtn").addEventListener("click", loadData);
+  $("symbolSelect")?.addEventListener("change", (event) => selectSymbol(event.target.value).catch((error) => {
+    $("asOfText").textContent = error.message;
+    console.error(error);
+  }));
   $("themeToggle").addEventListener("click", () => setTheme(document.body.classList.contains("dark") ? "light" : "dark"));
   $("fileSearch").addEventListener("input", () => renderFiles(state.data || { files: [] }));
   $("fileScope").addEventListener("change", () => renderFiles(state.data || { files: [] }));
@@ -6011,8 +6314,357 @@ function wireEvents() {
   setInterval(pollRun, 2000);
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio cockpit (manual transactions -> holdings, weights, returns,
+// rebalance execution tickets). Values arrive in engine USD; the client
+// converts to KRW using the supplied fx (KRW = usd * usdkrw).
+// ---------------------------------------------------------------------------
+
+const PORTFOLIO_NAME_MAP = {
+  NVDA: "엔비디아", TSM: "TSMC(ADR)", AVGO: "브로드컴", AMD: "AMD", INTC: "인텔",
+  MU: "마이크론 테크놀로지", TXN: "텍사스 인스트루먼트", LRCX: "램 리서치",
+  AMAT: "어플라이드 머티리얼즈", QCOM: "퀄컴", "005930.KS": "삼성전자", "000660.KS": "SK하이닉스",
+};
+const TICKET_ACTION_LABEL = { ADD: "추가매수", BUY_NEW: "신규매수", TRIM: "비중축소", EXIT: "청산", HOLD: "보유" };
+const TICKET_ACTION_TONE = { ADD: "good", BUY_NEW: "good", TRIM: "warn", EXIT: "bad", HOLD: "neutral" };
+
+function portfolioName(symbol) {
+  return PORTFOLIO_NAME_MAP[String(symbol || "").toUpperCase()] || symbol;
+}
+
+function portfolioFx() {
+  return toNumber(state.portfolio?.fx?.usdkrw) || null;
+}
+
+function pDispVal(usd) {
+  const n = toNumber(usd);
+  if (n === null) return null;
+  if (state.portfolioCurrency === "KRW") {
+    const fx = portfolioFx();
+    return fx ? n * fx : null;
+  }
+  return n;
+}
+
+function pMoney(usd) {
+  const v = pDispVal(usd);
+  if (v === null) return "없음";
+  if (state.portfolioCurrency === "KRW") return "₩" + Math.round(v).toLocaleString("ko-KR");
+  return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function pSignedMoney(usd) {
+  const v = pDispVal(usd);
+  if (v === null) return "없음";
+  const sign = v > 0 ? "+" : "";
+  return sign + pMoney(usd);
+}
+
+function pShares(qty) {
+  const n = toNumber(qty);
+  if (n === null) return "없음";
+  return n.toLocaleString("ko-KR", { minimumFractionDigits: 0, maximumFractionDigits: 6 });
+}
+
+function pnlTone(value) {
+  const n = toNumber(value);
+  if (n === null || n === 0) return "flat";
+  return n > 0 ? "up" : "down";
+}
+
+async function loadPortfolio() {
+  try {
+    const data = await fetchJson("/api/portfolio");
+    state.portfolio = data;
+    state.portfolioLoaded = true;
+    renderPortfolioView();
+  } catch (error) {
+    state.portfolioLoaded = true;
+    const hero = $("portfolioHero");
+    if (hero) hero.innerHTML = `<div class="portfolio-empty bad">포트폴리오를 불러오지 못했습니다: ${escapeHtml(error.message)}</div>`;
+    console.error(error);
+  }
+}
+
+function renderPortfolioView() {
+  const p = state.portfolio;
+  if (!p) return;
+  renderPortfolioHero(p);
+  renderPortfolioTickets(p);
+  renderPortfolioHoldings(p);
+  renderPortfolioAllocation(p);
+  renderPortfolioTransactions(p);
+  document.querySelectorAll("#portfolioCurrencyToggle button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.cur === state.portfolioCurrency)
+  );
+}
+
+function renderPortfolioHero(p) {
+  const t = p.totals || {};
+  const mv = toNumber(t.market_value_usd) || 0;
+  const cost = toNumber(t.cost_basis_usd) || 0;
+  const totalPnl = mv - cost;
+  const totalPct = cost > 0 ? (totalPnl / cost) * 100 : 0;
+  const daily = toNumber(t.daily_pnl_usd) || 0;
+  const prevMv = mv - daily;
+  const dailyPct = prevMv > 0 ? (daily / prevMv) * 100 : 0;
+  const fx = portfolioFx();
+  const recon = p.reconciliation_status || "PASS";
+  $("portfolioHero").innerHTML = `
+    <div class="portfolio-total">
+      <span class="portfolio-total-label">내 투자 · 평가금</span>
+      <strong class="portfolio-total-value">${pMoney(mv)}</strong>
+      <em class="pnl ${pnlTone(totalPnl)}">${pSignedMoney(totalPnl)} (${fmtPct(totalPct, 1)})</em>
+    </div>
+    <div class="portfolio-metrics">
+      <div class="metric"><span>원금</span><b>${pMoney(cost)}</b></div>
+      <div class="metric"><span>총 수익</span><b class="pnl ${pnlTone(totalPnl)}">${pSignedMoney(totalPnl)} (${fmtPct(totalPct, 1)})</b></div>
+      <div class="metric"><span>일간 수익</span><b class="pnl ${pnlTone(daily)}">${pSignedMoney(daily)} (${fmtPct(dailyPct, 1)})</b></div>
+      <div class="metric"><span>보유 종목</span><b>${t.n_holdings ?? 0}</b></div>
+      <div class="metric"><span>환율 (USD/KRW)</span><b>${fx ? "₩" + Math.round(fx).toLocaleString("ko-KR") : "없음"}</b></div>
+      <div class="metric"><span>정합성</span><b class="${recon === "PASS" ? "ok" : "bad"}">${escapeHtml(recon)}</b></div>
+    </div>
+    <p class="portfolio-disclaimer">실제 브로커 주문/체결은 수행하지 않습니다 · 의사결정 지원 전용 (live trading ${escapeHtml(p.live_trading_status || "DISABLED_BY_DESIGN")})</p>`;
+}
+
+function renderPortfolioTickets(p) {
+  const tickets = (p.rebalance_queue || []).filter((t) => state.portfolioCurrency || true);
+  const target = $("portfolioTickets");
+  if (!tickets.length) {
+    target.innerHTML = `<div class="portfolio-empty neutral">표시할 실행 티켓이 없습니다. 거래를 입력하면 보유 비중 대비 모델 목표 비중 차이가 계산됩니다.</div>`;
+    return;
+  }
+  target.innerHTML = tickets
+    .map((t) => {
+      const action = String(t.action || "HOLD");
+      const tone = TICKET_ACTION_TONE[action] || "neutral";
+      const label = TICKET_ACTION_LABEL[action] || action;
+      const delta = toNumber(t.delta_shares) || 0;
+      const ref = pMoney(t.ref_price_usd);
+      const verb = delta > 0 ? "매수" : "매도";
+      const instruction = action === "HOLD"
+        ? "현재 비중 유지"
+        : `${pShares(Math.abs(delta))}주 ${verb} <span class="ticket-at">@ ${ref}</span>`;
+      const p_succ = toNumber(t.p_success_20d);
+      return `
+      <article class="ticket-card ${tone}">
+        <div class="ticket-top">
+          <span class="ticket-badge ${tone}">${escapeHtml(label)}</span>
+          <span class="ticket-symbol"><b>${escapeHtml(portfolioName(t.symbol))}</b><i>${escapeHtml(t.symbol)}</i></span>
+          <span class="ticket-rank">#${t.rank ?? ""}</span>
+        </div>
+        <div class="ticket-instruction">${instruction}</div>
+        <div class="ticket-facts">
+          <div><span>현재 비중</span><b>${fmtPct(toNumber(t.current_weight) * 100, 1)}</b></div>
+          <div><span>목표 비중</span><b>${fmtPct(toNumber(t.target_weight) * 100, 1)}</b></div>
+          <div><span>손절</span><b>${pMoney(t.stop_price_usd)}</b></div>
+          <div><span>목표가</span><b>${pMoney(t.target_price_usd)}</b></div>
+          <div><span>20일 성공확률</span><b>${p_succ === null ? "없음" : fmtPct(p_succ * 100, 0)}</b></div>
+          <div><span>데이터</span><b>${escapeHtml(t.data_status || "")}</b></div>
+        </div>
+        <p class="ticket-reason">${escapeHtml(t.reason || "")}</p>
+        ${t.warning ? `<p class="ticket-warning">⚠ ${escapeHtml(t.warning)}</p>` : ""}
+      </article>`;
+    })
+    .join("");
+}
+
+function renderPortfolioHoldings(p) {
+  const holdings = p.holdings || [];
+  const target = $("portfolioHoldings");
+  if (!holdings.length) {
+    target.innerHTML = `<div class="portfolio-empty neutral">보유 종목이 없습니다. 우측 상단 "+ 거래 입력"으로 매수 기록을 추가하세요.</div>`;
+    return;
+  }
+  const rows = holdings
+    .map((h) => {
+      const recTone = TICKET_ACTION_TONE[String(h.recommendation || "HOLD")] || "neutral";
+      const recLabel = TICKET_ACTION_LABEL[String(h.recommendation || "HOLD")] || (h.recommendation || "-");
+      return `<tr>
+        <td class="hsym"><b>${escapeHtml(portfolioName(h.symbol))}</b><i>${escapeHtml(h.symbol)}</i></td>
+        <td class="num">${pShares(h.shares)}</td>
+        <td class="num">${pMoney(h.avg_price_usd)}</td>
+        <td class="num">${pMoney(h.current_price_usd)}</td>
+        <td class="num">${pMoney(h.market_value_usd)}</td>
+        <td class="num">${fmtPct(h.weight_pct, 1)}</td>
+        <td class="num pnl ${pnlTone(h.return_pct)}">${h.return_pct === null ? "없음" : fmtPct(h.return_pct, 1)}</td>
+        <td><span class="rec-pill ${recTone}">${escapeHtml(recLabel)}</span></td>
+      </tr>`;
+    })
+    .join("");
+  target.innerHTML = `<table class="portfolio-table"><thead><tr>
+      <th>종목</th><th class="num">보유 주수</th><th class="num">평단</th><th class="num">현재가</th>
+      <th class="num">평가금</th><th class="num">비중</th><th class="num">수익률</th><th>권고</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderPortfolioAllocation(p) {
+  const holdings = (p.holdings || []).filter((h) => (toNumber(h.market_value_usd) || 0) > 0);
+  const target = $("portfolioAllocation");
+  if (!holdings.length) {
+    target.innerHTML = `<div class="portfolio-empty neutral">데이터 없음</div>`;
+    return;
+  }
+  const total = holdings.reduce((s, h) => s + (toNumber(h.market_value_usd) || 0), 0) || 1;
+  const palette = [colors.blue, colors.teal, colors.green, colors.amber, colors.violet, colors.red, "#8e9aaf", "#c44dff", "#26a69a", "#ef5350", "#5c6bc0", "#ffa726"];
+  let acc = 0;
+  const segs = [];
+  const legend = holdings
+    .map((h, i) => {
+      const w = ((toNumber(h.market_value_usd) || 0) / total) * 100;
+      const c = palette[i % palette.length];
+      segs.push(`${c} ${acc}% ${acc + w}%`);
+      acc += w;
+      return `<li><span class="dot" style="background:${c}"></span>${escapeHtml(portfolioName(h.symbol))}<b>${fmtPct(w, 1)}</b></li>`;
+    })
+    .join("");
+  target.innerHTML = `
+    <div class="alloc-donut" style="background:conic-gradient(${segs.join(",")})"><div class="alloc-hole"><span>${holdings.length}<small>종목</small></span></div></div>
+    <ul class="alloc-legend">${legend}</ul>`;
+}
+
+function renderPortfolioTransactions(p) {
+  const txs = p.transactions || [];
+  const target = $("portfolioTransactions");
+  if (!txs.length) {
+    target.innerHTML = `<div class="portfolio-empty neutral">입력한 거래가 없습니다.</div>`;
+    return;
+  }
+  const rows = txs
+    .map((t) => `<tr class="tx-row" data-txid="${escapeHtml(t.transaction_id)}">
+      <td>${escapeHtml(shortDate(t.trade_date))}</td>
+      <td class="hsym"><b>${escapeHtml(portfolioName(t.symbol))}</b><i>${escapeHtml(t.symbol)}</i></td>
+      <td><span class="rec-pill ${String(t.side).toUpperCase() === "BUY" ? "good" : "warn"}">${String(t.side).toUpperCase() === "BUY" ? "매수" : "매도"}</span></td>
+      <td class="num">${pShares(t.quantity)}</td>
+      <td class="num">${fmtNumber(t.price, 2)} ${escapeHtml(t.price_currency || "")}</td>
+      <td>${escapeHtml(t.note || "")}</td>
+    </tr>`)
+    .join("");
+  target.innerHTML = `<table class="portfolio-table tx-table"><thead><tr>
+      <th>거래일</th><th>종목</th><th>구분</th><th class="num">주수</th><th class="num">체결가</th><th>메모</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+  target.querySelectorAll(".tx-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const tx = (state.portfolio?.transactions || []).find((x) => String(x.transaction_id) === row.dataset.txid);
+      if (tx) openTxModal(tx);
+    });
+  });
+}
+
+function populateTxSymbols() {
+  const select = $("txSymbol");
+  if (!select) return;
+  const universe = state.portfolio?.universe || Object.keys(PORTFOLIO_NAME_MAP);
+  select.innerHTML = universe.map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(portfolioName(s))} (${escapeHtml(s)})</option>`).join("");
+}
+
+function openTxModal(tx) {
+  const form = $("txForm");
+  form.reset();
+  populateTxSymbols();
+  $("txError").hidden = true;
+  const editing = Boolean(tx && tx.transaction_id);
+  $("txModalTitle").textContent = editing ? "거래 수정" : "거래 입력";
+  $("txDeleteBtn").hidden = !editing;
+  form.elements.transaction_id.value = editing ? tx.transaction_id : "";
+  if (tx) {
+    if (tx.symbol) form.elements.symbol.value = String(tx.symbol).toUpperCase();
+    form.elements.side.value = String(tx.side || "BUY").toUpperCase();
+    form.elements.trade_date.value = shortDate(tx.trade_date) !== "없음" ? shortDate(tx.trade_date) : "";
+    form.elements.quantity.value = tx.quantity ?? "";
+    form.elements.price.value = tx.price ?? "";
+    form.elements.price_currency.value = String(tx.price_currency || "USD").toUpperCase();
+    form.elements.fees.value = tx.fees ?? 0;
+    form.elements.note.value = tx.note ?? "";
+  } else {
+    form.elements.trade_date.value = todayKstInputValue();
+    form.elements.price_currency.value = "USD";
+  }
+  $("txModalBackdrop").hidden = false;
+}
+
+function closeTxModal() {
+  $("txModalBackdrop").hidden = true;
+}
+
+async function submitTxForm(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const entries = Object.fromEntries(new FormData(form).entries());
+  const id = String(entries.transaction_id || "").trim();
+  const payload = {
+    action: id ? "update" : "add",
+    transaction: {
+      transaction_id: id,
+      trade_date: entries.trade_date,
+      symbol: entries.symbol,
+      side: entries.side,
+      quantity: entries.quantity,
+      price: entries.price,
+      price_currency: entries.price_currency,
+      fees: entries.fees,
+      note: entries.note,
+    },
+  };
+  $("txSubmitBtn").disabled = true;
+  try {
+    const data = await fetchJson("/api/portfolio/transaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.portfolio = data;
+    renderPortfolioView();
+    closeTxModal();
+  } catch (error) {
+    const err = $("txError");
+    err.textContent = error.message;
+    err.hidden = false;
+  } finally {
+    $("txSubmitBtn").disabled = false;
+  }
+}
+
+async function deleteTx() {
+  const id = $("txForm").elements.transaction_id.value;
+  if (!id) return;
+  if (!confirm("이 거래를 삭제할까요?")) return;
+  try {
+    const data = await fetchJson("/api/portfolio/transaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete", transaction_id: id }),
+    });
+    state.portfolio = data;
+    renderPortfolioView();
+    closeTxModal();
+  } catch (error) {
+    const err = $("txError");
+    err.textContent = error.message;
+    err.hidden = false;
+  }
+}
+
+function wirePortfolioEvents() {
+  $("addTxBtn")?.addEventListener("click", () => openTxModal(null));
+  $("txModalClose")?.addEventListener("click", closeTxModal);
+  $("txCancelBtn")?.addEventListener("click", closeTxModal);
+  $("txDeleteBtn")?.addEventListener("click", deleteTx);
+  $("txForm")?.addEventListener("submit", submitTxForm);
+  $("txModalBackdrop")?.addEventListener("click", (event) => {
+    if (event.target === $("txModalBackdrop")) closeTxModal();
+  });
+  $("portfolioCurrencyToggle")?.addEventListener("click", (event) => {
+    const btn = event.target.closest("button[data-cur]");
+    if (!btn) return;
+    state.portfolioCurrency = btn.dataset.cur;
+    renderPortfolioView();
+  });
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   wireEvents();
+  wirePortfolioEvents();
   try {
     await loadData();
   } catch (error) {

@@ -818,7 +818,7 @@ def write_report(
     quality_passed = bool(quality["passed"].all())
 
     lines = [
-        "# TSMC Strategy Validation Report",
+        "# Top10 Strategy Validation Report",
         "",
         "## Validation Principles",
         "- Avoid judging a strategy only by one full-period equity curve.",

@@ -251,7 +251,7 @@ def write_report(outdir: Path, checks: pd.DataFrame, snap: pd.DataFrame) -> None
     snap_map = dict(zip(snap["field"], snap["value"]))
     failed = checks[~checks["passed"]]
     lines = [
-        "# TSMC Daily Integrity Report",
+        "# Top10 Daily Integrity Report",
         "",
         f"- All checks passed: {snap_map.get('all_checks_passed')}",
         f"- All critical checks passed: {snap_map.get('all_critical_checks_passed')}",

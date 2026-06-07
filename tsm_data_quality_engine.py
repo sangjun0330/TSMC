@@ -144,7 +144,13 @@ def alignment_checks(raw: pd.DataFrame, enriched: pd.DataFrame, signals: pd.Data
     return rows
 
 
-def latest_checks(enriched: pd.DataFrame, signals: pd.DataFrame, run_date: str, max_stale_days: int) -> list[dict]:
+def latest_checks(
+    enriched: pd.DataFrame,
+    signals: pd.DataFrame,
+    run_date: str,
+    max_stale_days: int,
+    benchmark_mode: str,
+) -> list[dict]:
     rows: list[dict] = []
     if enriched.empty or signals.empty:
         rows.append(check_row("latest_inputs_available", False, "CRITICAL", "missing_input"))
@@ -166,16 +172,30 @@ def latest_checks(enriched: pd.DataFrame, signals: pd.DataFrame, run_date: str, 
     missing_values = [c for c in LATEST_SIGNAL_COLUMNS if pd.isna(latest[c])]
     rows.append(check_row("latest_signal_required_values_present", not missing_values, "CRITICAL", ",".join(missing_values) if missing_values else "ok"))
 
+    if benchmark_mode == "disabled":
+        present = [c for c in BENCHMARK_COLUMNS if c in enriched.columns]
+        rows.append(
+            check_row(
+                "benchmark_join_columns_disabled",
+                not present,
+                "CRITICAL",
+                ",".join(present) if present else "ok",
+                details="Benchmarks are intentionally disabled for this run.",
+            )
+        )
+        return rows
+
     ok, missing = has_required_columns(enriched, BENCHMARK_COLUMNS)
-    rows.append(check_row("benchmark_join_columns_present", ok, "CRITICAL", missing))
+    severity = "CRITICAL" if benchmark_mode == "required" else "INFO"
+    rows.append(check_row("benchmark_join_columns_present", ok, severity, missing))
     if ok:
         latest_enriched = enriched[pd.to_datetime(enriched["date"], errors="coerce").dt.normalize().eq(latest_signal_date)].tail(1)
         if latest_enriched.empty:
-            rows.append(check_row("latest_benchmark_row_present", False, "CRITICAL", latest_signal_date.date().isoformat()))
+            rows.append(check_row("latest_benchmark_row_present", False, severity, latest_signal_date.date().isoformat()))
         else:
             latest_bench = latest_enriched.iloc[0]
             missing_bench = [c for c in BENCHMARK_COLUMNS if pd.isna(latest_bench[c])]
-            rows.append(check_row("latest_benchmark_values_present", not missing_bench, "CRITICAL", ",".join(missing_bench) if missing_bench else "ok"))
+            rows.append(check_row("latest_benchmark_values_present", not missing_bench, severity, ",".join(missing_bench) if missing_bench else "ok"))
     return rows
 
 
@@ -192,9 +212,9 @@ def corporate_action_checks(raw: pd.DataFrame) -> list[dict]:
         check_row(
             "corporate_action_adjustment_independent",
             not all_equal,
-            "CRITICAL",
+            "WARN",
             "adj_close_equals_close_for_all_rows" if all_equal else "adjusted_close_differs_somewhere",
-            details="If the source uses unadjusted OHLC, split/dividend handling must be validated before decision support.",
+            details="If the symbol had known splits or dividends in the sample, validate adjusted-close handling before decision support.",
         )
     )
     if "data_quality_note" in raw.columns:
@@ -247,13 +267,23 @@ def build_snapshot(checks: pd.DataFrame, raw: pd.DataFrame, signals: pd.DataFram
     return pd.DataFrame(rows)
 
 
-def build_checks(raw: pd.DataFrame, enriched: pd.DataFrame, signals: pd.DataFrame, raw_path: Path, enriched_path: Path, signals_path: Path, run_date: str, max_stale_days: int) -> pd.DataFrame:
+def build_checks(
+    raw: pd.DataFrame,
+    enriched: pd.DataFrame,
+    signals: pd.DataFrame,
+    raw_path: Path,
+    enriched_path: Path,
+    signals_path: Path,
+    run_date: str,
+    max_stale_days: int,
+    benchmark_mode: str = "required",
+) -> pd.DataFrame:
     rows: list[dict] = []
     rows.extend(frame_checks(raw, "raw", raw_path))
     rows.extend(frame_checks(enriched, "enriched", enriched_path))
     rows.extend(frame_checks(signals, "signals", signals_path))
     rows.extend(alignment_checks(raw, enriched, signals))
-    rows.extend(latest_checks(enriched, signals, run_date, max_stale_days))
+    rows.extend(latest_checks(enriched, signals, run_date, max_stale_days, benchmark_mode))
     rows.extend(corporate_action_checks(raw))
     return pd.DataFrame(rows)
 
@@ -262,7 +292,7 @@ def write_report(outdir: Path, checks: pd.DataFrame, snapshot: pd.DataFrame) -> 
     snap = dict(zip(snapshot["field"], snapshot["value"]))
     failed = checks[~checks["passed"].astype(bool)] if not checks.empty else pd.DataFrame()
     lines = [
-        "# TSMC Data Quality Report",
+        "# Top10 Data Quality Report",
         "",
         f"- Data quality status: {snap.get('data_quality_status', 'NA')}",
         f"- Decision-support data gate: {snap.get('decision_support_data_gate', 'NA')}",
@@ -295,6 +325,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", default="tsm_price_rule_output")
     parser.add_argument("--run-date", default=date.today().isoformat())
     parser.add_argument("--max-stale-days", type=int, default=7)
+    parser.add_argument(
+        "--benchmark-mode",
+        choices=["required", "optional", "disabled"],
+        default="required",
+        help="Whether benchmark join columns are required, optional, or intentionally absent.",
+    )
     return parser.parse_args()
 
 
@@ -309,7 +345,17 @@ def main() -> None:
     raw = read_csv_if_exists(raw_path, parse_dates=["date"])
     enriched = read_csv_if_exists(enriched_path, parse_dates=["date"])
     signals = read_csv_if_exists(signals_path, parse_dates=["date"])
-    checks = build_checks(raw, enriched, signals, raw_path, enriched_path, signals_path, args.run_date, args.max_stale_days)
+    checks = build_checks(
+        raw,
+        enriched,
+        signals,
+        raw_path,
+        enriched_path,
+        signals_path,
+        args.run_date,
+        args.max_stale_days,
+        args.benchmark_mode,
+    )
     snapshot = build_snapshot(checks, raw, signals, args.run_date)
     issues = checks[~checks["passed"].astype(bool)].copy()
 

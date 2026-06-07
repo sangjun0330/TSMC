@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMC / TSM 10-year daily quantitative price-analysis pipeline.
+Per-symbol daily quantitative price-analysis pipeline for Top10 workflows.
 
 What this script does
 ---------------------
-1) Downloads daily OHLCV data for TSM / TSMC ADR.
+1) Downloads daily OHLCV data for the requested symbol.
 2) Cleans and validates the data.
 3) Computes detailed daily price movement, return, drawdown, volatility,
    ATR, trend, momentum, liquidity, relative-strength, and event-window metrics.
@@ -56,6 +56,14 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import requests
+
+from tsm_core.currency import (
+    currency_profile,
+    ensure_fx_rate_file,
+    load_fx_rates,
+    normalize_ohlcv_to_engine_currency,
+    requires_fx_conversion,
+)
 
 # matplotlib is imported lazily in make_charts() so that CSV generation still works
 # on machines without a display backend.
@@ -498,8 +506,20 @@ def add_benchmark_features(df: pd.DataFrame, benchmarks: Dict[str, pd.DataFrame]
     for name, bdf in benchmarks.items():
         if bdf is None or bdf.empty:
             continue
-        b = bdf[["date", "adj_close"]].rename(columns={"adj_close": f"{name.lower()}_adj_close"})
-        df = df.merge(b, on="date", how="left")
+        b = bdf[["date", "adj_close"]].copy()
+        b["date"] = pd.to_datetime(b["date"], errors="coerce").dt.normalize()
+        b = b.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
+        b = b.rename(columns={"adj_close": f"{name.lower()}_adj_close"})
+        order_col = "_benchmark_merge_order"
+        left = df.copy()
+        left[order_col] = np.arange(len(left))
+        left["date"] = pd.to_datetime(left["date"], errors="coerce").dt.normalize()
+        df = (
+            pd.merge_asof(left.sort_values("date"), b, on="date", direction="backward")
+            .sort_values(order_col)
+            .drop(columns=[order_col])
+            .reset_index(drop=True)
+        )
         bcol = f"{name.lower()}_adj_close"
         df[f"{name.lower()}_return_1d"] = safe_div(df[bcol], df[bcol].shift(1)) - 1
         for w in [20, 21, 60, 63, 120, 126, 252]:
@@ -631,6 +651,12 @@ def compute_summary(df: pd.DataFrame, source_info: DownloadResult) -> pd.DataFra
 
     rows = [
         ("ticker", df["ticker"].iloc[0]),
+        ("listing_currency", df["listing_currency"].iloc[-1] if "listing_currency" in df.columns else "USD"),
+        ("display_currency", df["display_currency"].iloc[-1] if "display_currency" in df.columns else "USD"),
+        ("engine_currency", df["engine_currency"].iloc[-1] if "engine_currency" in df.columns else "USD"),
+        ("fx_pair", df["fx_pair"].iloc[-1] if "fx_pair" in df.columns else ""),
+        ("latest_fx_rate_to_usd", df["fx_rate_to_usd"].iloc[-1] if "fx_rate_to_usd" in df.columns else 1.0),
+        ("latest_usdkrw", df["usdkrw"].iloc[-1] if "usdkrw" in df.columns else np.nan),
         ("data_source", source_info.source),
         ("data_url", source_info.url),
         ("data_note", source_info.note),
@@ -639,6 +665,10 @@ def compute_summary(df: pd.DataFrame, source_info: DownloadResult) -> pd.DataFra
         ("trading_days", len(df)),
         ("start_adj_close", start_price),
         ("end_adj_close", end_price),
+        ("start_adj_close_native", df["adj_close_native"].iloc[0] if "adj_close_native" in df.columns else start_price),
+        ("end_adj_close_native", df["adj_close_native"].iloc[-1] if "adj_close_native" in df.columns else end_price),
+        ("start_close_native", df["close_native"].iloc[0] if "close_native" in df.columns else df["close"].iloc[0]),
+        ("end_close_native", df["close_native"].iloc[-1] if "close_native" in df.columns else df["close"].iloc[-1]),
         ("total_return_pct", pct(total_return)),
         ("cagr_pct", pct(cagr)),
         ("annualized_volatility_pct", pct(ann_vol)),
@@ -682,8 +712,9 @@ def make_charts(df: pd.DataFrame, event_impact: pd.DataFrame, charts_dir: Path) 
     ax1.plot(df["date"], df["close"], label="Close", linewidth=1.2)
     for w in [20, 50, 200]:
         ax1.plot(df["date"], df[f"sma_{w}"], label=f"SMA {w}", linewidth=1.0)
-    ax1.set_title("TSMC daily close with 20/50/200-day moving averages")
-    ax1.set_ylabel("Price, USD")
+    ax1.set_title("Per-symbol daily close with 20/50/200-day moving averages")
+    engine_currency = df["engine_currency"].iloc[-1] if "engine_currency" in df.columns and not df.empty else "USD"
+    ax1.set_ylabel(f"Price, {engine_currency}")
     ax1.legend(loc="upper left")
     ax1.grid(True, alpha=0.3)
     ax2 = ax1.twinx()
@@ -706,7 +737,7 @@ def make_charts(df: pd.DataFrame, event_impact: pd.DataFrame, charts_dir: Path) 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-    ax1.set_title("TSMC rolling volatility and ATR")
+    ax1.set_title("Per-symbol rolling volatility and ATR")
     fig.tight_layout()
     fig.savefig(charts_dir / "tsm_rolling_vol_atr.png", dpi=160)
     plt.close(fig)
@@ -715,7 +746,7 @@ def make_charts(df: pd.DataFrame, event_impact: pd.DataFrame, charts_dir: Path) 
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.hist(df["close_change_pct"].dropna() * 100, bins=80)
     ax.axvline(0, linewidth=1.0)
-    ax.set_title("TSMC daily close-to-close return distribution")
+    ax.set_title("Per-symbol daily close-to-close return distribution")
     ax.set_xlabel("Daily return, %")
     ax.set_ylabel("Frequency")
     ax.grid(True, alpha=0.3)
@@ -734,7 +765,7 @@ def make_charts(df: pd.DataFrame, event_impact: pd.DataFrame, charts_dir: Path) 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-    ax1.set_title("TSMC daily return bars and 20-day average volume")
+    ax1.set_title("Per-symbol daily return bars and 20-day average volume")
     fig.tight_layout()
     fig.savefig(charts_dir / "tsm_daily_return_volume.png", dpi=160)
     plt.close(fig)
@@ -746,7 +777,7 @@ def make_charts(df: pd.DataFrame, event_impact: pd.DataFrame, charts_dir: Path) 
     pivot = tmp.pivot_table(index="year", columns="month", values="close_change_pct", aggfunc=lambda x: np.nanmean(np.abs(x)) * 100)
     fig, ax = plt.subplots(figsize=(13, 7))
     im = ax.imshow(pivot.values, aspect="auto")
-    ax.set_title("TSMC average absolute daily move by month, %")
+    ax.set_title("Per-symbol average absolute daily move by month, %")
     ax.set_xlabel("Month")
     ax.set_ylabel("Year")
     ax.set_xticks(np.arange(12))
@@ -771,7 +802,7 @@ def make_charts(df: pd.DataFrame, event_impact: pd.DataFrame, charts_dir: Path) 
             ax.axhline(0, linewidth=1.0)
             ax.set_xticks(x)
             ax.set_xticklabels(labels, rotation=70, ha="right")
-            ax.set_title("TSMC event-day and post-event returns")
+            ax.set_title("Per-symbol event-day and post-event returns")
             ax.set_ylabel("Return, %")
             ax.legend()
             ax.grid(True, alpha=0.3)
@@ -839,7 +870,7 @@ def write_column_dictionary(path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build detailed 10-year daily TSMC quant price dataset and charts.")
+    parser = argparse.ArgumentParser(description="Build detailed daily quant price dataset and charts for one requested symbol.")
     parser.add_argument("--symbol-stooq", default=DEFAULT_SYMBOL_STOOQ, help="Stooq ticker, default: tsm.us")
     parser.add_argument("--symbol-yahoo", default=DEFAULT_SYMBOL_YAHOO, help="Yahoo ticker, default: TSM")
     parser.add_argument("--start", default="2016-05-12", help="Start date YYYY-MM-DD")
@@ -847,6 +878,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", default="output", help="Output directory")
     parser.add_argument("--preferred-source", choices=["stooq", "yahoo"], default="stooq", help="Primary data source")
     parser.add_argument("--events", default="tsm_events_seed.csv", help="Event CSV path")
+    parser.add_argument("--listing-currency", default="", help="Listing/native price currency, inferred from ticker when empty.")
+    parser.add_argument("--display-currency", default="", help="Dashboard display currency, defaults to listing currency.")
+    parser.add_argument("--engine-currency", default="USD", help="Canonical engine/model currency.")
+    parser.add_argument("--fx-pair", default="", help="Yahoo FX pair used for native->engine conversion, e.g. KRW=X.")
+    parser.add_argument("--fx-rates", default="output/tsm_fx_rates_daily.csv", help="Daily FX rates CSV.")
     parser.add_argument("--skip-benchmarks", action="store_true", help="Skip SPY/SMH/QQQ benchmark downloads")
     parser.add_argument("--skip-charts", action="store_true", help="Skip PNG chart generation")
     return parser.parse_args()
@@ -865,7 +901,28 @@ def main() -> None:
         end=args.end,
         preferred_source=args.preferred_source,
     )
-    raw = source_info.df
+    profile = currency_profile(
+        args.symbol_stooq,
+        args.symbol_yahoo,
+        listing_currency=args.listing_currency,
+        display_currency=args.display_currency,
+        engine_currency=args.engine_currency,
+        fx_pair=args.fx_pair,
+    )
+    fx_rates = pd.DataFrame()
+    if requires_fx_conversion(profile.listing_currency, profile.engine_currency):
+        ensure_fx_rate_file(args.fx_rates, [profile.fx_pair], start=args.start, end=args.end)
+        fx_rates = load_fx_rates(args.fx_rates, profile.fx_pair)
+    raw = normalize_ohlcv_to_engine_currency(
+        source_info.df,
+        symbol=args.symbol_stooq,
+        symbol_yahoo=args.symbol_yahoo,
+        listing_currency=profile.listing_currency,
+        display_currency=profile.display_currency,
+        engine_currency=profile.engine_currency,
+        fx_pair=profile.fx_pair,
+        fx_rates=fx_rates,
+    )
     raw_path = outdir / "tsm_daily_10y_raw.csv"
     raw.to_csv(raw_path, index=False, encoding="utf-8-sig")
     print(f"Raw data saved: {raw_path}")

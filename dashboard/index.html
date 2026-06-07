@@ -26,6 +26,10 @@
             <button class="nav-item active" data-view="overview" type="button">메인</button>
             <button class="nav-item" data-view="decision" type="button">매매 판단</button>
           </div>
+          <div class="nav-section">
+            <span class="nav-section-label">내 투자</span>
+            <button class="nav-item" data-view="portfolio" type="button">포트폴리오</button>
+          </div>
 	          <div class="nav-section">
 	            <span class="nav-section-label">시장·데이터</span>
 	            <button class="nav-item" data-view="market" type="button">가격</button>
@@ -65,13 +69,19 @@
         <header class="workspace-header">
           <div class="market-strip" aria-label="시장 요약">
             <div class="symbol-summary">
-              <span class="symbol-logo" aria-hidden="true">TSM</span>
+              <span id="symbolLogo" class="symbol-logo" aria-hidden="true">TSM</span>
               <div>
-                <strong>TSMC</strong>
-                <span>NYSE · Rule Engine</span>
+                <strong id="symbolName">TSMC</strong>
+                <span id="symbolMeta">NYSE · Rule Engine</span>
               </div>
               <b id="tickerPrice">로딩 중</b>
               <em id="tickerChange">-</em>
+            </div>
+            <div class="symbol-picker" aria-label="종목 선택">
+              <span>종목</span>
+              <select id="symbolSelect" title="종목 선택">
+                <option value="TSM">TSM</option>
+              </select>
             </div>
             <div class="market-tile">
               <span>점수</span>
@@ -118,6 +128,7 @@
             </div>
             <nav class="view-tabs" aria-label="빠른 화면 이동">
               <button class="view-tab active" data-view="overview" type="button">홈</button>
+              <button class="view-tab" data-view="portfolio" type="button">보유</button>
               <button class="view-tab" data-view="decision" type="button">판단</button>
               <button class="view-tab" data-view="market" type="button">차트</button>
               <button class="view-tab" data-view="data" type="button">데이터</button>
@@ -749,6 +760,10 @@
                 <div class="panel-head"><div><h2>시스템 상태</h2><p>전체 준비 상태, 가상 기록 상태, 데이터 범위</p></div></div>
                 <div id="systemFacts" class="facts"></div>
               </section>
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>일일 업데이트 관제</h2><p>Top12 커버리지, pooled 모델, threshold, Paper OMS 최신 상태</p></div></div>
+                <div id="dailyUpdateSummary" class="system-summary-grid"></div>
+              </section>
               <section class="panel">
                 <div class="panel-head"><div><h2>준비 점수</h2><p>영역별로 얼마나 준비됐는지</p></div></div>
                 <div id="systemReadinessBars" class="chart"></div>
@@ -834,6 +849,8 @@
                       <option value="stress_engine">스트레스</option>
                       <option value="integrity_engine">무결성</option>
                       <option value="prediction_engine">예측 계산</option>
+                      <option value="next_day_up_model_engine">내일 상승 예측 계산</option>
+                      <option value="next_close_forecast_engine">종가 예측 계산</option>
                       <option value="external_feature_engine">외부 피처 계산</option>
                       <option value="ml_overlay_backtest">예측 적용 성과 계산</option>
                       <option value="pooled_dataset_builder">여러 종목 데이터 만들기</option>
@@ -913,7 +930,82 @@
             </div>
             <div id="runSynthesis" class="page-synthesis"></div>
           </section>
+
+          <section id="view-portfolio" class="view portfolio-view">
+            <div class="overview-tier-label portfolio-head-row">
+              <span>내 포트폴리오 · 실행 콕핏</span>
+              <div class="portfolio-head-actions">
+                <div class="currency-toggle" id="portfolioCurrencyToggle" role="group" aria-label="표시 통화">
+                  <button type="button" data-cur="KRW" class="active">원</button>
+                  <button type="button" data-cur="USD">$</button>
+                </div>
+                <button id="addTxBtn" class="primary-button" type="button">+ 거래 입력</button>
+              </div>
+            </div>
+            <div id="portfolioHero" class="portfolio-hero"></div>
+
+            <div class="overview-tier-label">실행 티켓 · 지금 할 일</div>
+            <section class="panel">
+              <div class="panel-head">
+                <div><h2>리밸런싱 실행 큐</h2><p>모델 목표 비중과 현재 보유 비중의 차이를 주수로 환산한 실행 지시입니다. 실제 주문은 전송되지 않습니다(의사결정 지원 전용).</p></div>
+              </div>
+              <div id="portfolioTickets" class="ticket-list"></div>
+            </section>
+
+            <div class="overview-tier-label">보유 종목</div>
+            <div class="layout-grid">
+              <section class="panel wide">
+                <div class="panel-head"><div><h2>보유 현황</h2><p>종목별 보유 주수·평단·현재가·평가금·비중·수익률과 모델 권고</p></div></div>
+                <div id="portfolioHoldings" class="table-shell"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><div><h2>비중 배분</h2><p>평가금 기준 포트폴리오 비중</p></div></div>
+                <div id="portfolioAllocation" class="alloc-wrap"></div>
+              </section>
+            </div>
+
+            <div class="overview-tier-label">내가 입력한 거래</div>
+            <section class="panel wide">
+              <div class="panel-head"><div><h2>거래 기록</h2><p>직접 기록한 매수·매도 내역 (행을 눌러 수정/삭제)</p></div></div>
+              <div id="portfolioTransactions" class="table-shell"></div>
+            </section>
+            <div id="portfolioSynthesis" class="page-synthesis"></div>
+          </section>
         </main>
+      </div>
+    </div>
+
+    <div id="txModalBackdrop" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="txModalTitle">
+        <div class="modal-head">
+          <h2 id="txModalTitle">거래 입력</h2>
+          <button id="txModalClose" class="modal-close" type="button" aria-label="닫기">×</button>
+        </div>
+        <form id="txForm" class="tx-form">
+          <input type="hidden" name="transaction_id" />
+          <div class="form-row">
+            <label><span>종목</span><select name="symbol" id="txSymbol" required></select></label>
+            <label><span>구분</span><select name="side"><option value="BUY">매수</option><option value="SELL">매도</option></select></label>
+          </div>
+          <div class="form-row">
+            <label><span>거래일</span><input name="trade_date" type="date" required /></label>
+            <label><span>주수 (소수 가능)</span><input name="quantity" type="number" step="any" min="0" required /></label>
+          </div>
+          <div class="form-row">
+            <label><span>체결가</span><input name="price" type="number" step="any" min="0" required /></label>
+            <label><span>통화</span><select name="price_currency"><option value="USD">USD ($)</option><option value="KRW">KRW (원)</option></select></label>
+          </div>
+          <div class="form-row">
+            <label><span>수수료 (선택)</span><input name="fees" type="number" step="any" min="0" value="0" /></label>
+            <label><span>메모 (선택)</span><input name="note" type="text" /></label>
+          </div>
+          <p id="txError" class="tx-error" hidden></p>
+          <div class="button-row">
+            <button id="txSubmitBtn" class="primary-button" type="submit">저장</button>
+            <button id="txDeleteBtn" class="secondary-button danger" type="button" hidden>삭제</button>
+            <button id="txCancelBtn" class="secondary-button" type="button">취소</button>
+          </div>
+        </form>
       </div>
     </div>
 

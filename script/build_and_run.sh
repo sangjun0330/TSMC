@@ -2,8 +2,8 @@
 set -euo pipefail
 
 MODE="${1:-run}"
-APP_NAME="TSMC Dashboard"
-BUNDLE_ID="com.local.tsm-dashboard"
+APP_NAME="Top10+2 Dashboard"
+BUNDLE_ID="com.local.top10-plus-two-dashboard"
 MIN_SYSTEM_VERSION="13.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

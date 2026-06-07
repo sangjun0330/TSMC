@@ -269,6 +269,15 @@ def build_plan_rows(
     walk_forward: pd.DataFrame,
     stress_snapshot: Dict[str, str],
     system_state: Dict[str, str],
+    order_intents: pd.DataFrame | None = None,
+    universe_latest_predictions: pd.DataFrame | None = None,
+    portfolio_targets: pd.DataFrame | None = None,
+    paper_positions: pd.DataFrame | None = None,
+    paper_reconciliation: pd.DataFrame | None = None,
+    order_lifecycle: Dict[str, str] | None = None,
+    execution_feedback: pd.DataFrame | None = None,
+    fill_model_calibration: pd.DataFrame | None = None,
+    automation_plan: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     last = signals.iloc[-1]
     prev_20d_high = signals["high"].shift(1).rolling(20, min_periods=10).max().iloc[-1]
@@ -331,7 +340,7 @@ def build_plan_rows(
                 ("스트레스", "스트레스 상태", stress_snapshot.get("stress_status", "NA"), "", "일봉 기반 시나리오"),
                 ("스트레스", "최악 현재비중 시나리오", stress_snapshot.get("worst_current_weight_scenario", "NA"), "", ""),
                 ("스트레스", "최악 현재비중 손실 추정", pct_string_value(stress_snapshot.get("worst_current_weight_portfolio_impact_pct")), "%", "최종 권장 비중 기준"),
-                ("스트레스", "최악 시나리오 TSMC 가격", f"${as_float(stress_snapshot.get('worst_current_weight_implied_price')):,.2f}", "USD", ""),
+                ("스트레스", "최악 시나리오 기준 가격", f"${as_float(stress_snapshot.get('worst_current_weight_implied_price')):,.2f}", "USD", ""),
             ]
         )
 
@@ -342,6 +351,95 @@ def build_plan_rows(
                 ("시스템", "시스템 준비도 점수", f"{as_float(system_state.get('system_readiness_score')):.1f}", "점", "100점 만점"),
                 ("시스템", "페이퍼 트레이딩 상태", system_state.get("paper_trading_status", "NA"), "", ""),
                 ("시스템", "라이브 트레이딩 상태", system_state.get("live_trading_status", "NA"), "", "현재 주문 기능 없음"),
+            ]
+        )
+
+    if order_intents is not None and not order_intents.empty:
+        intent = order_intents.tail(1).iloc[0]
+        rows.extend(
+            [
+                ("Paper OMS", "최신 Order Intent", intent.get("intent_id", "NA"), "", "broker-free paper intent"),
+                ("Paper OMS", "Intent 상태", intent.get("status", "NA"), "", intent.get("reason", "")),
+                ("Paper OMS", "Intent 목표 비중", pct(as_float(intent.get("target_weight", 0.0))), "%", "portfolio risk gate 전 요청 비중"),
+                ("Paper OMS", "Live 주문 차단", str(intent.get("live_order_blocked", True)), "", intent.get("live_block_reason", "LIVE_TRADING_DISABLED")),
+            ]
+        )
+
+    if universe_latest_predictions is not None and not universe_latest_predictions.empty:
+        candidates = universe_latest_predictions.copy()
+        allowed = candidates[candidates.get("paper_decision_support_allowed", pd.Series(dtype=bool)).astype(str).str.lower().isin(["true", "1", "yes"])]
+        top = candidates.sort_values("paper_decision_score_20d", ascending=False).head(1).iloc[0] if "paper_decision_score_20d" in candidates.columns else candidates.iloc[0]
+        rows.extend(
+            [
+                ("Portfolio Plan", "Universe candidate count", str(len(candidates)), "symbols", "tsm_universe_latest_predictions.csv"),
+                ("Portfolio Plan", "Paper-support candidates", str(len(allowed)), "symbols", "paper_decision_support_allowed=true"),
+                ("Portfolio Plan", "Top ranked candidate", str(top.get("symbol", "NA")), "", f"score={top.get('paper_decision_score_20d', 'NA')}; block={top.get('block_reasons', 'NA')}"),
+            ]
+        )
+
+    if portfolio_targets is not None and not portfolio_targets.empty:
+        approved_weight = pd.to_numeric(portfolio_targets.get("approved_weight", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()
+        symbols = ",".join(portfolio_targets.get("symbol", pd.Series(dtype=str)).dropna().astype(str).head(10))
+        rows.extend(
+            [
+                ("Portfolio Plan", "Approved target count", str(len(portfolio_targets)), "symbols", "tsm_portfolio_targets.csv"),
+                ("Portfolio Plan", "Approved gross weight", pct(float(approved_weight)), "%", symbols),
+            ]
+        )
+
+    if paper_positions is not None and not paper_positions.empty:
+        position = paper_positions.tail(1).iloc[0]
+        rows.extend(
+            [
+                ("Paper OMS", "Paper 포지션 상태", position.get("position_state", "NA"), "", "내부 paper ledger 기준"),
+                ("Paper OMS", "Paper 수량", f"{as_float(position.get('quantity', 0.0)):.4f}", "shares", ""),
+                ("Paper OMS", "Paper 비중", pct(as_float(position.get("weight", 0.0))), "%", ""),
+                ("Paper OMS", "Paper 평가금액", usd(as_float(position.get("market_value", 0.0))), "USD", ""),
+            ]
+        )
+
+    if paper_reconciliation is not None and not paper_reconciliation.empty:
+        rec = paper_reconciliation.tail(1).iloc[0]
+        rows.extend(
+            [
+                ("Paper OMS", "Paper 대조 상태", rec.get("status", "NA"), "", rec.get("details", "")),
+                ("Paper OMS", "Paper 대조 mismatch", str(rec.get("mismatch_count", "NA")), "건", "0이어야 다음 paper order 허용"),
+            ]
+        )
+
+    if order_lifecycle:
+        rows.extend(
+            [
+                ("Paper OMS", "Order lifecycle", order_lifecycle.get("lifecycle_state", "NA"), "", order_lifecycle.get("block_reason", "")),
+                ("Paper OMS", "Lifecycle order", order_lifecycle.get("order_id", "NA"), "", "order_state_machine"),
+            ]
+        )
+
+    if execution_feedback is not None and not execution_feedback.empty:
+        feedback = execution_feedback.tail(1).iloc[0]
+        rows.extend(
+            [
+                ("Paper OMS", "Execution feedback matured", str(feedback.get("label_matured", "NA")), "", "forward horizon availability"),
+                ("Paper OMS", "Execution utility", f"{as_float(feedback.get('execution_adjusted_utility')):.4f}", "", "return minus MAE/slippage penalties"),
+                ("Paper OMS", "Slippage error bps", f"{as_float(feedback.get('slippage_error_bps')):.2f}", "bps", "realized minus expected"),
+            ]
+        )
+
+    if fill_model_calibration is not None and not fill_model_calibration.empty:
+        calibration = fill_model_calibration.tail(1).iloc[0]
+        rows.extend(
+            [
+                ("Paper OMS", "Fill calibration status", calibration.get("calibration_status", "NA"), "", "suggestions only"),
+                ("Paper OMS", "Fill calibration events", str(calibration.get("event_count", "NA")), "건", f"matured={calibration.get('matured_event_count', 'NA')}"),
+                ("Paper OMS", "Suggested half spread", f"{as_float(calibration.get('suggested_half_spread_bps')):.2f}", "bps", ""),
+            ]
+        )
+
+    if automation_plan is not None and not automation_plan.empty:
+        rows.extend(
+            [
+                ("Paper OMS", "Automation plan tasks", str(len(automation_plan)), "개", "broker-free daily plan"),
+                ("Paper OMS", "Automation live status", automation_plan["live_trading_status"].astype(str).iloc[-1], "", "live submit 없음"),
             ]
         )
 
@@ -374,11 +472,11 @@ def build_plan_rows(
                 ("예측", "최종 예측 기반 결정", prediction_snapshot.get("final_trade_decision", "NA"), "", "룰 엔진 후보 위에 얹는 메타 결정"),
                 ("예측", "모델 차단 사유", prediction_snapshot.get("model_quality_block_reasons", "NA"), "", "PASS가 아니면 실전 의사결정 금지"),
                 ("예측", "Pooled 20D 모델", prediction_snapshot.get("pooled_model_name", "NA"), "", "12-symbol pooled trade_ready model"),
-                ("예측", "Pooled 20D 성공확률", pct(as_float(prediction_snapshot.get("pooled_p_success_20d"))), "%", "TSMC 전용 보정 계층 적용"),
+                ("예측", "Pooled 20D 성공확률", pct(as_float(prediction_snapshot.get("pooled_p_success_20d"))), "%", "Top10/Similarity 보정 계층 적용"),
                 ("예측", "Pooled 20D 임계값", pct(as_float(prediction_snapshot.get("pooled_threshold_20d"))), "%", "pooled validation 기준"),
                 ("예측", "Pooled decision support", prediction_snapshot.get("pooled_decision_support_allowed", "NA"), "", "통과해도 live trading은 비활성"),
                 ("예측", "Pooled 모델 차단 사유", prediction_snapshot.get("pooled_model_quality_block_reasons", "NA"), "", "pooled model gate"),
-                ("예측", "Pooled 최신 기준 이하 사유", prediction_snapshot.get("pooled_decision_block_reasons", "NA"), "", "최신 TSMC 게이트"),
+                ("예측", "Pooled 최신 기준 이하 사유", prediction_snapshot.get("pooled_decision_block_reasons", "NA"), "", "최신 Top10 게이트"),
             ]
         )
 
@@ -417,7 +515,7 @@ def write_markdown(outdir: Path, plan: pd.DataFrame, signals: pd.DataFrame) -> N
     prohibition_text = "\n".join([f"- {p}" for p in prohibitions])
 
     lines = [
-        "# TSMC Daily Trading Plan",
+        "# Top10 Daily Trading Plan",
         "",
         f"- 기준일: {last['date'].date().isoformat()}",
         f"- 오늘 행동: {value_of('오늘 행동')}",
@@ -454,7 +552,7 @@ def write_markdown(outdir: Path, plan: pd.DataFrame, signals: pd.DataFrame) -> N
         f"- 스트레스 상태: {value_of('스트레스 상태')}",
         f"- 최악 현재비중 시나리오: {value_of('최악 현재비중 시나리오')}",
         f"- 최악 현재비중 손실 추정: {value_of('최악 현재비중 손실 추정')}",
-        f"- 최악 시나리오 TSMC 가격: {value_of('최악 시나리오 TSMC 가격')}",
+        f"- 최악 시나리오 기준 가격: {value_of('최악 시나리오 기준 가격')}",
         "",
         "## Prediction Overlay",
         "",
@@ -486,6 +584,18 @@ def write_markdown(outdir: Path, plan: pd.DataFrame, signals: pd.DataFrame) -> N
         f"- 페이퍼 트레이딩 상태: {value_of('페이퍼 트레이딩 상태')}",
         f"- 라이브 트레이딩 상태: {value_of('라이브 트레이딩 상태')}",
         "",
+        "## Paper OMS",
+        "",
+        f"- 최신 Order Intent: {value_of('최신 Order Intent')}",
+        f"- Intent 상태: {value_of('Intent 상태')}",
+        f"- Paper 포지션 상태: {value_of('Paper 포지션 상태')}",
+        f"- Paper 비중: {value_of('Paper 비중')}",
+        f"- Paper 대조 상태: {value_of('Paper 대조 상태')}",
+        f"- Order lifecycle: {value_of('Order lifecycle')}",
+        f"- Execution feedback matured: {value_of('Execution feedback matured')}",
+        f"- Fill calibration status: {value_of('Fill calibration status')}",
+        f"- Automation plan tasks: {value_of('Automation plan tasks')}",
+        "",
         "This plan is research tooling, not investment advice.",
     ]
 
@@ -493,7 +603,7 @@ def write_markdown(outdir: Path, plan: pd.DataFrame, signals: pd.DataFrame) -> N
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create the latest TSMC daily trading plan.")
+    parser = argparse.ArgumentParser(description="Create the latest Top10 daily trading plan.")
     parser.add_argument("--latest", default="tsm_price_rule_output/tsm_latest_decision_snapshot.csv")
     parser.add_argument("--signals", default="tsm_price_rule_output/tsm_daily_algorithmic_signals.csv")
     parser.add_argument("--risk", default="tsm_price_rule_output/tsm_latest_risk_snapshot.csv")
@@ -503,6 +613,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stress", default="tsm_price_rule_output/tsm_latest_stress_snapshot.csv")
     parser.add_argument("--system-state", default="tsm_price_rule_output/tsm_latest_system_state.csv")
     parser.add_argument("--prediction", default="tsm_price_rule_output/tsm_latest_prediction_snapshot.csv")
+    parser.add_argument("--order-intents", default="")
+    parser.add_argument("--universe-latest-predictions", default="")
+    parser.add_argument("--portfolio-targets", default="")
+    parser.add_argument("--paper-positions", default="")
+    parser.add_argument("--paper-reconciliation", default="")
+    parser.add_argument("--order-lifecycle", default="")
+    parser.add_argument("--execution-feedback", default="")
+    parser.add_argument("--fill-calibration", default="")
+    parser.add_argument("--automation-plan", default="")
     parser.add_argument("--outdir", default="tsm_price_rule_output")
     return parser.parse_args()
 
@@ -521,6 +640,15 @@ def main() -> None:
     walk_forward = load_optional_csv(Path(args.walk_forward))
     stress_snapshot = load_optional_snapshot(Path(args.stress))
     system_state = load_optional_snapshot(Path(args.system_state))
+    order_intents = load_optional_csv(Path(args.order_intents)) if args.order_intents else pd.DataFrame()
+    universe_latest_predictions = load_optional_csv(Path(args.universe_latest_predictions)) if args.universe_latest_predictions else pd.DataFrame()
+    portfolio_targets = load_optional_csv(Path(args.portfolio_targets)) if args.portfolio_targets else pd.DataFrame()
+    paper_positions = load_optional_csv(Path(args.paper_positions)) if args.paper_positions else pd.DataFrame()
+    paper_reconciliation = load_optional_csv(Path(args.paper_reconciliation)) if args.paper_reconciliation else pd.DataFrame()
+    order_lifecycle = load_optional_snapshot(Path(args.order_lifecycle)) if args.order_lifecycle else {}
+    execution_feedback = load_optional_csv(Path(args.execution_feedback)) if args.execution_feedback else pd.DataFrame()
+    fill_model_calibration = load_optional_csv(Path(args.fill_calibration)) if args.fill_calibration else pd.DataFrame()
+    automation_plan = load_optional_csv(Path(args.automation_plan)) if args.automation_plan else pd.DataFrame()
     plan = build_plan_rows(
         snapshot,
         signals,
@@ -531,6 +659,15 @@ def main() -> None:
         walk_forward,
         stress_snapshot,
         system_state,
+        order_intents,
+        universe_latest_predictions,
+        portfolio_targets,
+        paper_positions,
+        paper_reconciliation,
+        order_lifecycle,
+        execution_feedback,
+        fill_model_calibration,
+        automation_plan,
     )
     plan.to_csv(outdir / "tsm_daily_trading_plan.csv", index=False)
     write_markdown(outdir, plan, signals)

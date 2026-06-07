@@ -412,7 +412,7 @@ def write_report(outdir: Path, ledger: pd.DataFrame, quality: pd.DataFrame) -> N
     latest = ledger.sort_values(["prediction_asof_date", "horizon_days"]).tail(len(HORIZONS)) if not ledger.empty else pd.DataFrame()
     realized = ledger[ledger["realized_status"].eq("LABELED")].copy() if not ledger.empty else pd.DataFrame()
     lines = [
-        "# TSMC Shadow Paper Prediction Report",
+        "# Top10 Shadow Paper Prediction Report",
         "",
         "This ledger records prediction decisions only. It does not place orders.",
         "",
